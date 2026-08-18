@@ -1,0 +1,89 @@
+PhoneBuddy SDK
+Copyright 2026 PhoneBuddy SDK Contributors
+
+This product includes software developed by PhoneBuddy SDK Contributors.
+
+--------------------------------------------------------------------------------
+
+This software contains and is derived from core components of grok-build:
+Copyright 2023-2026 SpaceXAI
+Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+
+The original grok-build project is available at:
+https://github.com/xai-org/grok-build
+
+Modifications made for PhoneBuddy SDK:
+- Dependency decoupling and trimming for iOS/Android mobile sandbox compatibility
+- Replaced system process execution (`std::process` / `tokio::process`) with pure-Rust BusyBox applets & embedded JavaScript engine (Boa)
+- In-memory Tokio task manager for subagent execution
+- Switched to rustls with ring backend for TLS
+- Added C FFI layer (`phone_buddy.h`) for mobile cross-platform integration
+- Created Swift and Kotlin native wrapper SDKs
+
+--------------------------------------------------------------------------------
+
+This software includes the following third-party components:
+
+1. Rust Standard Library and Core Crates
+   - License: MIT OR Apache-2.0
+   - https://www.rust-lang.org/
+
+2. reqwest (HTTP client)
+   - License: MIT OR Apache-2.0
+   - https://github.com/seanmonstar/reqwest
+
+3. tokio (Async runtime)
+   - License: MIT
+   - https://github.com/tokio-rs/tokio
+
+4. rustls + ring (TLS implementation)
+   - rustls License: Apache-2.0 OR ISC OR MIT
+   - ring License: Multiple (OpenSSL-style)
+   - https://github.com/rustls/rustls
+   - https://github.com/briansmith/ring
+
+5. serde + serde_json (Serialization)
+   - License: MIT OR Apache-2.0
+   - https://github.com/serde-rs/serde
+
+6. boa_engine (JavaScript engine)
+   - License: MIT OR Apache-2.0
+   - https://github.com/boa-dev/boa
+
+7. calamine (Excel parser)
+   - License: MIT
+   - https://github.com/tafia/calamine
+
+8. Other dependencies
+   See Cargo.lock for a complete list of transitive dependencies.
+
+--------------------------------------------------------------------------------
+
+For the full license text of Apache License 2.0, see the LICENSE file.
+
+For licenses of third-party components, refer to their respective repositories
+or the LICENSES directory (if present).
+
+--------------------------------------------------------------------------------
+
+ATTRIBUTION REQUIREMENTS:
+
+When distributing this software in binary form (iOS/Android libraries),
+you must include this NOTICE file or reproduce its contents in your
+application's "About" or "Licenses" section.
+
+Example attribution text for mobile apps:
+
+  "This app uses PhoneBuddy SDK, an open-source LLM agent engine.
+   PhoneBuddy SDK is based on grok-build by xAI.
+   Licensed under Apache License 2.0.
+   https://github.com/yourusername/PhoneBuddySDK"
+
+--------------------------------------------------------------------------------
+
+TRADEMARKS:
+
+- "grok" and "xAI" are trademarks of xAI Corp.
+- "PhoneBuddy SDK" is a descriptive name and not a registered trademark.
+
+This software is not officially endorsed by or affiliated with xAI Corp.

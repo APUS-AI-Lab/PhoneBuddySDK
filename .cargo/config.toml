@@ -1,0 +1,20 @@
+[build]
+# No default target: host development uses aarch64-apple-darwin.
+# iOS/Android builds pass --target explicitly via scripts/build-ios-sdk.sh / scripts/build-android-sdk.sh.
+
+# Android NDK linkers (needed for cargo check/build --target <android-triple>).
+# Adjust the NDK version/path to match your local installation.
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android24-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi24-clang"
+
+[target.i686-linux-android]
+linker = "i686-linux-android24-clang"
+
+[net]
+# If you need a proxy to fetch crates.io, set https_proxy/http_proxy in your environment.

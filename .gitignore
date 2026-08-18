@@ -1,0 +1,43 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Generated mobile artifacts (script output directories)
+/dist
+
+# System and editor misc
+.DS_Store
+*.swp
+
+# Demo build artifacts
+examples/c_demo/demo
+examples/c_demo/demo_dylib
+
+# Local configuration files containing sensitive API keys/credentials
+examples/c_demo/config.json
+examples/ios/config.json
+examples/ios/PhoneBuddyDemo/config.json
+examples/android/config.json
+*.local.json
+.env
+.env.*
+!.env.example
+
+# Agent runtime sandbox and session directories
+/workspace/
+examples/c_demo/workspace/
+.phonebuddy/
+
+# Android demo build artifacts
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+*.so
+**/jniLibs/
+
+# iOS demo build artifacts
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+DerivedData/

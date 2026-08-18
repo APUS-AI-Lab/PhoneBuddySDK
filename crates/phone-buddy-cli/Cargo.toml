@@ -1,0 +1,18 @@
+[package]
+name = "phone-buddy-cli"
+description = "Host-side demo for PhoneBuddy SDK: mock (offline) and real-API agent runs, Excel analysis demo."
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "phone-buddy-demo"
+path = "src/main.rs"
+
+[dependencies]
+phone-buddy = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

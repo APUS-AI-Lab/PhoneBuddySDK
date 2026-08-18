@@ -1,0 +1,865 @@
+//! C ABI FFI for PhoneBuddy SDK.
+//!
+//! Exposes the engine as a `cdylib`/`staticlib` for iOS and Android.
+//! The interface is intentionally a thin, stable C surface:
+//! - opaque engine handle;
+//! - configuration and events passed as JSON strings (host parses them);
+//! - streaming delivered through a single C callback receiving event JSON.
+//!
+//! This keeps the ABI robust across Swift / Objective-C++ / Kotlin (JNI) /
+//! React-Native native modules without binding-codegen.
+
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::Arc;
+
+use phone_buddy::engine::PhoneBuddyEngine;
+use phone_buddy::events::{AgentEvent, AgentObserver};
+
+/// Streaming event callback.
+///
+/// `event_json` is a UTF-8 JSON string describing one [`AgentEvent`].
+/// It is valid only for the duration of the call; copy it if you keep it.
+/// The callback may be invoked from a background engine thread.
+pub type PbEventCallback =
+    Option<unsafe extern "C" fn(event_json: *const c_char, user_data: *mut c_void)>;
+
+/// Host LLM request callback.
+///
+/// Fired when the engine needs a completion. `request_id` and `request_json`
+/// are valid only for the duration of the call. Respond with
+/// [`pb_engine_llm_push_chunk`] / [`pb_engine_llm_finish`] /
+/// [`pb_engine_llm_fail`].
+pub type PbLlmRequestCallback = Option<
+    unsafe extern "C" fn(
+        request_id: *const c_char,
+        request_json: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Host tool request callback.
+///
+/// Fired when a host-registered tool must run. Respond with
+/// [`pb_engine_host_tool_result`].
+pub type PbHostToolCallback = Option<
+    unsafe extern "C" fn(
+        call_id: *const c_char,
+        name: *const c_char,
+        arguments_json: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Host system WebView fetch callback.
+///
+/// Fired when `web_search` wants DuckDuckGo Lite loaded in WKWebView /
+/// Android WebView. `request_json` is a [`phone_buddy::tools::WebViewFetchRequest`].
+/// Respond with [`pb_engine_webview_result`]. Desktop / C hosts should leave
+/// this unset so search skips scraping and uses the LLM API.
+pub type PbWebViewFetchCallback = Option<
+    unsafe extern "C" fn(
+        call_id: *const c_char,
+        request_json: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Opaque engine handle.
+pub struct PbEngine {
+    inner: Arc<PhoneBuddyEngine>,
+    /// Kept so C callbacks stay valid while the engine lives.
+    host_user_data: *mut c_void,
+    webview_user_data: *mut c_void,
+}
+
+// user_data is an opaque host pointer; the host owns lifetime/thread safety.
+unsafe impl Send for PbEngine {}
+unsafe impl Sync for PbEngine {}
+
+/// Adapter that forwards [`AgentEvent`]s to the C callback.
+struct FfiObserver {
+    callback: PbEventCallback,
+    user_data: *mut c_void,
+}
+
+// The host guarantees the callback + user_data are safe to use from any
+// thread (events fire on the engine runtime thread).
+unsafe impl Send for FfiObserver {}
+unsafe impl Sync for FfiObserver {}
+
+impl AgentObserver for FfiObserver {
+    fn on_event(&self, event: AgentEvent) {
+        let Some(cb) = self.callback else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
+        let Ok(cstr) = CString::new(json) else {
+            return;
+        };
+        unsafe { cb(cstr.as_ptr(), self.user_data) };
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────
+
+unsafe fn str_from<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    CStr::from_ptr(ptr).to_str().ok()
+}
+
+fn to_cstring(s: String) -> *mut c_char {
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+unsafe fn set_err(err_out: *mut *mut c_char, msg: String) {
+    if !err_out.is_null() {
+        *err_out = to_cstring(msg);
+    }
+}
+
+// ── exported API ─────────────────────────────────────────────────────────
+
+/// Library version string. Do not free.
+#[no_mangle]
+pub extern "C" fn pb_version() -> *const c_char {
+    static VERSION: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    let v = VERSION.get_or_init(|| CString::new(phone_buddy::VERSION).unwrap());
+    v.as_ptr()
+}
+
+/// Create an engine from a JSON configuration.
+///
+/// `config_json` must match [`phone_buddy::config::EngineConfig`].
+/// On success returns a handle and writes null to `err_out`; on failure
+/// returns null and writes an error message to `err_out` (caller frees with
+/// [`pb_string_free`]).
+///
+/// # Safety
+/// `config_json` must be a valid C string. `err_out` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_new(
+    config_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut PbEngine {
+    let cfg_str = match str_from(config_json) {
+        Some(s) => s,
+        None => {
+            set_err(err_out, "config_json is null or invalid UTF-8".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let cfg: phone_buddy::config::EngineConfig = match serde_json::from_str(cfg_str) {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err_out, format!("invalid config JSON: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    match PhoneBuddyEngine::new(cfg) {
+        Ok(engine) => {
+            // Success: write null to err_out as documented.
+            if !err_out.is_null() {
+                *err_out = std::ptr::null_mut();
+            }
+            Box::into_raw(Box::new(PbEngine {
+                inner: engine,
+                host_user_data: std::ptr::null_mut(),
+                webview_user_data: std::ptr::null_mut(),
+            }))
+        }
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Free an engine handle.
+///
+/// # Safety
+/// `engine` must be a handle returned by [`pb_engine_new`], or null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_free(engine: *mut PbEngine) {
+    if !engine.is_null() {
+        drop(Box::from_raw(engine));
+    }
+}
+
+/// Run one chat turn to completion (blocking). Call from a background
+/// thread; streaming events are delivered via `callback` as they happen.
+///
+/// Returns a JSON object `{ "final_text", "turns_used", "usage", "plan" }`
+/// on success, or null on error (with `err_out` set). Caller frees the
+/// result with [`pb_string_free`].
+///
+/// # Safety
+/// All pointers must be valid. `callback` may be null (events discarded).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_chat(
+    engine: *mut PbEngine,
+    session_id: *const c_char,
+    user_input: *const c_char,
+    callback: PbEventCallback,
+    user_data: *mut c_void,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let engine = match engine.as_ref() {
+        Some(e) => e,
+        None => {
+            set_err(err_out, "engine is null".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let session_id = match str_from(session_id) {
+        Some(s) => s.to_string(),
+        None => {
+            set_err(err_out, "session_id is null or invalid".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let user_input = match str_from(user_input) {
+        Some(s) => s.to_string(),
+        None => {
+            set_err(err_out, "user_input is null or invalid".into());
+            return std::ptr::null_mut();
+        }
+    };
+
+    let observer: Option<Arc<dyn AgentObserver>> = if callback.is_some() {
+        Some(Arc::new(FfiObserver { callback, user_data }))
+    } else {
+        None
+    };
+
+    match engine.inner.chat(&session_id, &user_input, observer) {
+        Ok(outcome) => {
+            let plan: serde_json::Value =
+                serde_json::from_str(&outcome.plan_items_json).unwrap_or(serde_json::json!([]));
+            let result = serde_json::json!({
+                "final_text": outcome.final_text,
+                "turns_used": outcome.turns_used,
+                "usage": outcome.usage,
+                "plan": plan,
+            });
+            to_cstring(result.to_string())
+        }
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// List sessions as a JSON array of metadata objects. Caller frees.
+///
+/// # Safety
+/// `engine` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_list_sessions(
+    engine: *mut PbEngine,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let engine = match engine.as_ref() {
+        Some(e) => e,
+        None => {
+            set_err(err_out, "engine is null".into());
+            return std::ptr::null_mut();
+        }
+    };
+    match engine.inner.list_sessions() {
+        Ok(list) => to_cstring(serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())),
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Get full session JSON (including all messages and reasoning) for a given session ID.
+///
+/// Returns a JSON string matching [`phone_buddy::session::StoredSession`] on success,
+/// or null if the session does not exist (with `err_out` set to null), or null on
+/// error (with `err_out` set to an error message). Caller frees the returned JSON string
+/// with [`pb_string_free`].
+///
+/// # Safety
+/// `engine` and `session_id` must be valid. `err_out` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_get_session(
+    engine: *mut PbEngine,
+    session_id: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let engine = match engine.as_ref() {
+        Some(e) => e,
+        None => {
+            set_err(err_out, "engine is null".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let session_id = match str_from(session_id) {
+        Some(s) => s,
+        None => {
+            set_err(err_out, "session_id is null or invalid".into());
+            return std::ptr::null_mut();
+        }
+    };
+    match engine.inner.get_session(session_id) {
+        Ok(Some(session)) => {
+            if !err_out.is_null() {
+                *err_out = std::ptr::null_mut();
+            }
+            match serde_json::to_string(&session) {
+                Ok(json) => to_cstring(json),
+                Err(e) => {
+                    set_err(err_out, format!("failed to serialize session: {e}"));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Ok(None) => {
+            if !err_out.is_null() {
+                *err_out = std::ptr::null_mut();
+            }
+            std::ptr::null_mut()
+        }
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Delete a session. Returns 0 on success, non-zero on error.
+///
+/// # Safety
+/// `engine` and `session_id` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_delete_session(
+    engine: *mut PbEngine,
+    session_id: *const c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        return -1;
+    };
+    let Some(session_id) = str_from(session_id) else {
+        return -2;
+    };
+    match engine.inner.delete_session(session_id) {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// Cancel an in-flight turn for a session.
+///
+/// # Safety
+/// `engine` and `session_id` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_cancel(engine: *mut PbEngine, session_id: *const c_char) {
+    if let Some(engine) = engine.as_ref() {
+        if let Some(session_id) = str_from(session_id) {
+            engine.inner.cancel(session_id);
+        }
+    }
+}
+
+/// Register host LLM + host-tool request callbacks.
+///
+/// Pass null callbacks to clear. `user_data` is passed through to both
+/// callbacks and must remain valid until the engine is freed or callbacks
+/// are cleared.
+///
+/// # Safety
+/// Callbacks may be invoked from engine worker threads.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_set_host_callbacks(
+    engine: *mut PbEngine,
+    llm_cb: PbLlmRequestCallback,
+    tool_cb: PbHostToolCallback,
+    user_data: *mut c_void,
+) {
+    let Some(engine) = engine.as_mut() else {
+        return;
+    };
+    engine.host_user_data = user_data;
+
+    let llm_notify = llm_cb.map(|cb| {
+        let ud = user_data as usize;
+        std::sync::Arc::new(move |request_id: String, request_json: String| {
+            let Ok(id_c) = CString::new(request_id) else {
+                return;
+            };
+            let Ok(json_c) = CString::new(request_json) else {
+                return;
+            };
+            unsafe {
+                cb(
+                    id_c.as_ptr(),
+                    json_c.as_ptr(),
+                    ud as *mut c_void,
+                );
+            }
+        }) as phone_buddy::llm::HostLlmNotify
+    });
+
+    let tool_notify = tool_cb.map(|cb| {
+        let ud = user_data as usize;
+        std::sync::Arc::new(move |call_id: String, name: String, args: String| {
+            let Ok(id_c) = CString::new(call_id) else {
+                return;
+            };
+            let Ok(name_c) = CString::new(name) else {
+                return;
+            };
+            let Ok(args_c) = CString::new(args) else {
+                return;
+            };
+            unsafe {
+                cb(
+                    id_c.as_ptr(),
+                    name_c.as_ptr(),
+                    args_c.as_ptr(),
+                    ud as *mut c_void,
+                );
+            }
+        }) as phone_buddy::tools::HostToolNotify
+    });
+
+    engine.inner.set_host_callbacks(llm_notify, tool_notify);
+}
+
+/// Push one OpenAI-compatible chat-completion chunk for a host LLM request.
+///
+/// Returns 0 on success, non-zero on error (`err_out` set when provided).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_llm_push_chunk(
+    engine: *mut PbEngine,
+    request_id: *const c_char,
+    chunk_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    let Some(chunk_json) = str_from(chunk_json) else {
+        set_err(err_out, "chunk_json is null or invalid".into());
+        return -3;
+    };
+    let chunk: phone_buddy::llm::ChatCompletionChunk = match serde_json::from_str(chunk_json) {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err_out, format!("invalid chunk JSON: {e}"));
+            return -4;
+        }
+    };
+    match engine.inner.host_llm().push_chunk(request_id, chunk) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -5
+        }
+    }
+}
+
+/// Finish a host LLM stream successfully.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_llm_finish(
+    engine: *mut PbEngine,
+    request_id: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    match engine.inner.host_llm().finish(request_id) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+/// Fail a host LLM stream.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_llm_fail(
+    engine: *mut PbEngine,
+    request_id: *const c_char,
+    error_msg: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    let msg = str_from(error_msg).unwrap_or("host LLM failed");
+    match engine.inner.host_llm().fail(request_id, msg) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+/// Register host tools from an OpenAI tools JSON array.
+///
+/// Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_set_host_tools(
+    engine: *mut PbEngine,
+    tools_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(tools_json) = str_from(tools_json) else {
+        set_err(err_out, "tools_json is null or invalid".into());
+        return -2;
+    };
+    match phone_buddy::tools::host::HostToolHub::parse_tool_defs(tools_json) {
+        Ok(specs) => {
+            engine.inner.set_host_tools(specs);
+            0
+        }
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+/// Complete a host tool call. `ok` is non-zero for success.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_host_tool_result(
+    engine: *mut PbEngine,
+    call_id: *const c_char,
+    ok: i32,
+    output: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(call_id) = str_from(call_id) else {
+        set_err(err_out, "call_id is null or invalid".into());
+        return -2;
+    };
+    let output = str_from(output).unwrap_or("");
+    match engine
+        .inner
+        .host_tools()
+        .complete(call_id, ok != 0, output)
+    {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+/// Register a host system WebView fetch callback.
+///
+/// iOS / Android wrappers should set this to drive a hidden WKWebView or
+/// Android WebView. Pass a null callback to clear (desktop / C hosts).
+/// `user_data` must remain valid until the engine is freed or the callback
+/// is cleared.
+///
+/// # Safety
+/// The callback may be invoked from an engine worker thread. The host must
+/// hop to the UI thread before creating or touching a WebView.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_set_webview_callback(
+    engine: *mut PbEngine,
+    callback: PbWebViewFetchCallback,
+    user_data: *mut c_void,
+) {
+    let Some(engine) = engine.as_mut() else {
+        return;
+    };
+    engine.webview_user_data = user_data;
+
+    let notify = callback.map(|cb| {
+        let ud = user_data as usize;
+        std::sync::Arc::new(move |call_id: String, request_json: String| {
+            let Ok(id_c) = CString::new(call_id) else {
+                return;
+            };
+            let Ok(json_c) = CString::new(request_json) else {
+                return;
+            };
+            unsafe {
+                cb(id_c.as_ptr(), json_c.as_ptr(), ud as *mut c_void);
+            }
+        }) as phone_buddy::tools::WebViewFetchNotify
+    });
+
+    engine.inner.set_webview_callback(notify);
+}
+
+/// Complete a host WebView fetch. `ok` is non-zero for success; `output` is
+/// the document HTML on success or an error message on failure.
+///
+/// # Safety
+/// `engine` and `call_id` must be valid. `output` may be null (treated as empty).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_webview_result(
+    engine: *mut PbEngine,
+    call_id: *const c_char,
+    ok: i32,
+    output: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(engine) = engine.as_ref() else {
+        set_err(err_out, "engine is null".into());
+        return -1;
+    };
+    let Some(call_id) = str_from(call_id) else {
+        set_err(err_out, "call_id is null or invalid".into());
+        return -2;
+    };
+    let output = str_from(output).unwrap_or("");
+    match engine.inner.webview_host().complete(call_id, ok != 0, output) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+/// Set or clear the system prompt extra text (Pal persona).
+///
+/// Pass null `extra` to clear.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_set_system_prompt_extra(
+    engine: *mut PbEngine,
+    extra: *const c_char,
+) {
+    let Some(engine) = engine.as_ref() else {
+        return;
+    };
+    let value = if extra.is_null() {
+        None
+    } else {
+        str_from(extra).map(|s| s.to_string())
+    };
+    engine.inner.set_system_prompt_extra(value);
+}
+
+/// Free a string returned by this library.
+///
+/// # Safety
+/// `ptr` must be a string returned by this library, or null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_string_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(CString::from_raw(ptr));
+    }
+}
+
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+pub mod android_jni {
+    use std::ffi::c_void;
+
+    extern "C" {
+        fn pb_jni_on_load(vm: *mut c_void, reserved: *mut c_void) -> i32;
+        fn pb_jni_nativeNewEngine(env: *mut c_void, clazz: *mut c_void, config_json: *mut c_void) -> i64;
+        fn pb_jni_nativeFreeEngine(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
+        fn pb_jni_nativeChat(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            session_id: *mut c_void,
+            user_input: *mut c_void,
+            listener: *mut c_void,
+        ) -> *mut c_void;
+        fn pb_jni_nativeGetSession(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            session_id: *mut c_void,
+        ) -> *mut c_void;
+        fn pb_jni_nativeListSessions(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64) -> *mut c_void;
+        fn pb_jni_nativeDeleteSession(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            session_id: *mut c_void,
+        ) -> i32;
+        fn pb_jni_nativeSetWebViewCallback(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
+        fn pb_jni_nativeClearWebViewCallback(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
+        fn pb_jni_nativeCancel(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64, session_id: *mut c_void);
+        fn pb_jni_nativeSetHostCallbacks(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
+        fn pb_jni_nativeHostToolResult(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            call_id: *mut c_void,
+            ok: i32,
+            output: *mut c_void,
+        ) -> i32;
+        fn pb_jni_nativeWebViewResult(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            call_id: *mut c_void,
+            ok: i32,
+            output: *mut c_void,
+        ) -> i32;
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn JNI_OnLoad(vm: *mut c_void, reserved: *mut c_void) -> i32 {
+        pb_jni_on_load(vm, reserved)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeNewEngine(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        config_json: *mut c_void,
+    ) -> i64 {
+        pb_jni_nativeNewEngine(env, clazz, config_json)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeFreeEngine(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+    ) {
+        pb_jni_nativeFreeEngine(env, clazz, engine_ptr);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeChat(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        session_id: *mut c_void,
+        user_input: *mut c_void,
+        listener: *mut c_void,
+    ) -> *mut c_void {
+        pb_jni_nativeChat(env, clazz, engine_ptr, session_id, user_input, listener)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeGetSession(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        session_id: *mut c_void,
+    ) -> *mut c_void {
+        pb_jni_nativeGetSession(env, clazz, engine_ptr, session_id)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeListSessions(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+    ) -> *mut c_void {
+        pb_jni_nativeListSessions(env, clazz, engine_ptr)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeDeleteSession(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        session_id: *mut c_void,
+    ) -> i32 {
+        pb_jni_nativeDeleteSession(env, clazz, engine_ptr, session_id)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeSetWebViewCallback(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+    ) {
+        pb_jni_nativeSetWebViewCallback(env, clazz, engine_ptr);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeClearWebViewCallback(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+    ) {
+        pb_jni_nativeClearWebViewCallback(env, clazz, engine_ptr);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeCancel(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        session_id: *mut c_void,
+    ) {
+        pb_jni_nativeCancel(env, clazz, engine_ptr, session_id);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeSetHostCallbacks(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+    ) {
+        pb_jni_nativeSetHostCallbacks(env, clazz, engine_ptr);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeHostToolResult(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        call_id: *mut c_void,
+        ok: i32,
+        output: *mut c_void,
+    ) -> i32 {
+        pb_jni_nativeHostToolResult(env, clazz, engine_ptr, call_id, ok, output)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeWebViewResult(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        call_id: *mut c_void,
+        ok: i32,
+        output: *mut c_void,
+    ) -> i32 {
+        pb_jni_nativeWebViewResult(env, clazz, engine_ptr, call_id, ok, output)
+    }
+}
+
+
+

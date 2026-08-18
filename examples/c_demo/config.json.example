@@ -1,0 +1,48 @@
+{
+  // API Key for model inference
+  "api_key": "YOUR_API_KEY",
+
+  // Base URL of the API gateway or endpoint
+  // Examples:
+  // - xAI: "https://api.x.ai/v1"
+  // - OpenAI: "https://api.openai.com/v1"
+  // - Anthropic proxy: "https://api.anthropic.com/v1"
+  // - DeepSeek: "https://api.deepseek.com/v1"
+  // - Local Ollama: "http://localhost:11434/v1"
+  // - Local vLLM: "http://localhost:8000/v1"
+  "base_url": "https://api.x.ai/v1",
+
+  // Model identifier
+  // Examples: "grok-4.6", "gpt-5.6-sol", "claude-fable-5", "deepseek-v4-flash"
+  "model": "grok-4.6",
+
+  // Local sandbox root directory. All file tools are jailed inside this directory.
+  "root_dir": "./workspace",
+
+  // API Backend Protocol (api_backend):
+  // Supported values:
+  // 1. "chat_completions" (Default):
+  //    - Standard OpenAI-compatible `/v1/chat/completions` protocol.
+  //    - Works with OpenAI, xAI, DeepSeek, Groq, Qwen, Ollama, vLLM, and most LLM providers.
+  //
+  // 2. "responses":
+  //    - OpenAI / xAI Responses API `/v1/responses` protocol.
+  //    - Designed for agentic workflows; supports server-side turn state, prompt cache keys,
+  //      and server-side doom loop detection.
+  //
+  // 3. "messages":
+  //    - Anthropic Claude Messages API `/v1/messages` protocol.
+  //    - Used for Anthropic Claude (e.g. Claude 3.5 Sonnet) or Claude-compatible proxies.
+  "api_backend": "responses",
+
+  // Maximum tool loop turns per user message (default: 24)
+  "max_turns": 24,
+
+  // Enable live web search (only effective on search-capable endpoints like xAI Grok)
+  "enable_web_search": true,
+
+  // Extra custom HTTP request headers (Optional)
+  "extra_headers": {
+    "X-Client-Platform": "c_demo"
+  }
+}

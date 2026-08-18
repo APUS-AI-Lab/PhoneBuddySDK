@@ -1,0 +1,58 @@
+[package]
+name = "phone-buddy"
+description = "Mobile-first LLM agent engine: planning, tool execution, search, subagent task execution, report generation."
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "phone_buddy"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+indexmap = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+
+regex = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+walkdir = { workspace = true }
+encoding_rs = { workspace = true }
+infer = { workspace = true }
+htmd = { workspace = true }
+
+csv = { workspace = true }
+quick-xml = { workspace = true }
+
+boa_engine = { workspace = true }
+
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
