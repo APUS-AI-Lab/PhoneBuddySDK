@@ -117,6 +117,7 @@ let config = PhoneBuddyConfig(
     rootDir: PhoneBuddyConfig.sandboxRoot(workspaceName: "workspace"),
     maxTurns: 24,
     enableWebSearch: true,
+    agentName: "小智", // 系统提示词中的身份名；省略则保持 "PhoneBuddy"
     extraHeaders: [
         "X-App-Version": "1.0.0",
         "X-Client-Platform": "iOS"
@@ -125,6 +126,7 @@ let config = PhoneBuddyConfig(
 
 // 2. 创建引擎实例
 let engine = try PhoneBuddyEngine(config: config)
+// engine.setAgentName("小智") // 运行时改名；nil/空字符串回退为 PhoneBuddy
 
 // 3. 发起对话并监听实时流式事件
 let outcome = try await engine.chat(
@@ -161,6 +163,7 @@ val config = JSONObject().apply {
     put("root_dir", context.filesDir.resolve("workspace").absolutePath)
     put("max_turns", 24)
     put("enable_web_search", true)
+    put("agent_name", "小智")
     put("extra_headers", JSONObject().apply {
         put("X-App-Version", "1.0.0")
         put("X-Client-Platform", "Android")
@@ -169,6 +172,7 @@ val config = JSONObject().apply {
 
 // 2. 创建 Native Agent 实例
 val agent = NativeAgent(config.toString(), context)
+// agent.setAgentName("小智") // 运行时改名；null/空白回退为 PhoneBuddy
 
 // 3. 执行任务对话
 val resultJson = agent.chat(
@@ -279,6 +283,7 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 | `temperature` | Float | 否 | `0.2` | 模型采样温度 |
 | `max_output_tokens` | Integer | 否 | `8192` | 单次输出的最大 Token 限制 |
 | `enable_web_search` | Boolean | 否 | `false` | 是否开启联网搜索（移动端走 WebView DuckDuckGo Lite / API 搜索参数） |
+| `agent_name` | String | 否 | `PhoneBuddy` | 系统提示词中的身份名（`You are {agent_name}…`）。空值回退为 `PhoneBuddy` |
 | `system_prompt_extra` | String | 否 | `null` | 追加到 System Prompt 尾部的自定义人设或业务指令 |
 | `stream_idle_timeout_secs`| Integer | 否 | `120` | 流式连接空闲超时时间（秒） |
 | `max_retries` | Integer | 否 | `5` | HTTP 请求发生错误时的指数退避最大重试次数 |

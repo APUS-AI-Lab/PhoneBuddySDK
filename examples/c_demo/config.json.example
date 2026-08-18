@@ -41,6 +41,9 @@
   // Enable live web search (only effective on search-capable endpoints like xAI Grok)
   "enable_web_search": true,
 
+  // Identity in the system prompt ("You are {agent_name}…"). Omit or leave empty for "PhoneBuddy".
+  "agent_name": "PhoneBuddy",
+
   // Extra custom HTTP request headers (Optional)
   "extra_headers": {
     "X-Client-Platform": "c_demo"

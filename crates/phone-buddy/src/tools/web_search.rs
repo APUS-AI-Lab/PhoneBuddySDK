@@ -448,11 +448,12 @@ impl Tool for WebSearchTool {
         ToolSpec {
             name: "web_search".into(),
             description: concat!(
-                "Search the web for real-time information, documentation, news, and current events. ",
-                "Supports optional domain filtering via `allowed_domains` or `blocked_domains`. ",
+                "Search the web for real-time information, documentation, news, and current events ",
+                "beyond training knowledge. ",
+                "Prefer `allowed_domains` (e.g. [\"docs.rs\", \"github.com\"]) when looking up a specific library. ",
+                "After using results, cite relevant URLs as markdown links [Title](URL). ",
                 "On iOS/Android, searches DuckDuckGo Lite through the system WebView; ",
-                "otherwise uses the configured LLM API (Messages, Responses, or ChatCompletions). ",
-                "Returns structured markdown search hits with titles, URLs, and snippets."
+                "otherwise uses the configured LLM API."
             )
             .into(),
             parameters: schema_object(

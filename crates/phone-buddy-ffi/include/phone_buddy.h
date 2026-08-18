@@ -229,6 +229,13 @@ int32_t pb_engine_webview_result(struct PbEngine *engine,
 void pb_engine_set_system_prompt_extra(struct PbEngine *engine, const char *extra);
 
 /**
+ * Set the system-prompt identity (`You are {name}…`).
+ *
+ * Pass null or empty `name` to reset to the default (`PhoneBuddy`).
+ */
+void pb_engine_set_agent_name(struct PbEngine *engine, const char *name);
+
+/**
  * Free a string returned by this library.
  *
  * # Safety

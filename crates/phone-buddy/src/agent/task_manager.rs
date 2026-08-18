@@ -20,6 +20,7 @@ use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
 use crate::llm::types::{ChatCompletionRequest, ChatMessage};
+use crate::prompt::{build_subagent_prompt, PromptRuntime};
 use crate::tools::fs::Sandbox;
 use crate::tools::{ToolCtx, ToolRegistry};
 
@@ -182,6 +183,7 @@ pub struct TaskManager {
     client: Arc<LlmClient>,
     sandbox: Arc<Sandbox>,
     subagent_tools: Arc<ToolRegistry>,
+    prompt: Arc<Mutex<PromptRuntime>>,
     tasks: Arc<Mutex<HashMap<String, TaskRecord>>>,
     counter: Arc<Mutex<u64>>,
 }
@@ -193,14 +195,32 @@ impl TaskManager {
         sandbox: Arc<Sandbox>,
         subagent_tools: Arc<ToolRegistry>,
     ) -> Self {
+        let prompt = Arc::new(Mutex::new(PromptRuntime::from_config(&config)));
+        Self::with_prompt(config, client, sandbox, subagent_tools, prompt)
+    }
+
+    pub fn with_prompt(
+        config: EngineConfig,
+        client: Arc<LlmClient>,
+        sandbox: Arc<Sandbox>,
+        subagent_tools: Arc<ToolRegistry>,
+        prompt: Arc<Mutex<PromptRuntime>>,
+    ) -> Self {
         Self {
             config,
             client,
             sandbox,
             subagent_tools,
+            prompt,
             tasks: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(Mutex::new(1)),
         }
+    }
+
+    fn system_prompt(&self) -> String {
+        let mut cfg = self.config.clone();
+        self.prompt.lock().unwrap().apply_to(&mut cfg);
+        build_subagent_prompt(&cfg)
     }
 
     fn generate_task_id(&self) -> String {
@@ -314,7 +334,7 @@ impl TaskManager {
             None => return,
         };
 
-        let system_prompt = crate::prompt::build_system_prompt(&self.config);
+        let system_prompt = self.system_prompt();
         let max_turns = self.config.max_turns.min(10);
         let mut turns_used = 0u32;
         let mut total_tool_calls = 0u32;

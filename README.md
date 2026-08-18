@@ -117,6 +117,7 @@ let config = PhoneBuddyConfig(
     rootDir: PhoneBuddyConfig.sandboxRoot(workspaceName: "workspace"),
     maxTurns: 24,
     enableWebSearch: true,
+    agentName: "Acme", // system-prompt identity; omit to keep "PhoneBuddy"
     extraHeaders: [
         "X-App-Version": "1.0.0",
         "X-Client-Platform": "iOS"
@@ -125,6 +126,7 @@ let config = PhoneBuddyConfig(
 
 // 2. Instantiate the engine
 let engine = try PhoneBuddyEngine(config: config)
+// engine.setAgentName("Acme") // optional runtime rename; nil/empty resets to PhoneBuddy
 
 // 3. Run agent turn with real-time streaming events
 let outcome = try await engine.chat(
@@ -161,6 +163,7 @@ val config = JSONObject().apply {
     put("root_dir", context.filesDir.resolve("workspace").absolutePath)
     put("max_turns", 24)
     put("enable_web_search", true)
+    put("agent_name", "Acme")
     put("extra_headers", JSONObject().apply {
         put("X-App-Version", "1.0.0")
         put("X-Client-Platform", "Android")
@@ -169,6 +172,7 @@ val config = JSONObject().apply {
 
 // 2. Create agent instance
 val agent = NativeAgent(config.toString(), context)
+// agent.setAgentName("Acme") // optional runtime rename; null/blank resets to PhoneBuddy
 
 // 3. Execute chat turn
 val resultJson = agent.chat(
@@ -281,6 +285,7 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `temperature` | Float | No | `0.2` | Model sampling temperature |
 | `max_output_tokens` | Integer | No | `8192` | Maximum output token generation limit |
 | `enable_web_search` | Boolean | No | `false` | Enable web search tool (WebView DDG Lite on mobile / search parameters) |
+| `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |
 | `system_prompt_extra` | String | No | `null` | Custom persona or product instructions appended to system prompt |
 | `stream_idle_timeout_secs`| Integer | No | `120` | Streaming connection idle timeout in seconds |
 | `max_retries` | Integer | No | `5` | Maximum exponential backoff retry attempts for HTTP requests |

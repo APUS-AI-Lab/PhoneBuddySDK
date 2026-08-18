@@ -124,7 +124,8 @@ data class AppConfig(
     val apiBackend: String = "responses",
     val maxTurns: Int = 24,
     val enableWebSearch: Boolean = true,
-    val workspaceName: String = "workspace"
+    val workspaceName: String = "workspace",
+    val agentName: String = "PhoneBuddy"
 ) {
     fun resolveRootDir(context: Context): String {
         val name = sanitizeWorkspaceName(workspaceName)
@@ -142,6 +143,7 @@ data class AppConfig(
             put("root_dir", rootDir)
             put("max_turns", maxTurns)
             put("enable_web_search", enableWebSearch)
+            put("agent_name", agentName.ifBlank { "PhoneBuddy" })
         }.toString()
     }
 

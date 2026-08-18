@@ -672,6 +672,25 @@ pub unsafe extern "C" fn pb_engine_set_system_prompt_extra(
     engine.inner.set_system_prompt_extra(value);
 }
 
+/// Set the system-prompt identity (`You are {name}…`).
+///
+/// Pass null or empty `name` to reset to the default (`PhoneBuddy`).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_set_agent_name(
+    engine: *mut PbEngine,
+    name: *const c_char,
+) {
+    let Some(engine) = engine.as_ref() else {
+        return;
+    };
+    let value = if name.is_null() {
+        None
+    } else {
+        str_from(name).map(|s| s.to_string())
+    };
+    engine.inner.set_agent_name(value);
+}
+
 /// Free a string returned by this library.
 ///
 /// # Safety
@@ -733,6 +752,18 @@ pub mod android_jni {
             ok: i32,
             output: *mut c_void,
         ) -> i32;
+        fn pb_jni_nativeSetAgentName(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            name: *mut c_void,
+        );
+        fn pb_jni_nativeSetSystemPromptExtra(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            extra: *mut c_void,
+        );
     }
 
     #[no_mangle]
@@ -858,6 +889,26 @@ pub mod android_jni {
         output: *mut c_void,
     ) -> i32 {
         pb_jni_nativeWebViewResult(env, clazz, engine_ptr, call_id, ok, output)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeSetAgentName(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        name: *mut c_void,
+    ) {
+        pb_jni_nativeSetAgentName(env, clazz, engine_ptr, name);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeSetSystemPromptExtra(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        extra: *mut c_void,
+    ) {
+        pb_jni_nativeSetSystemPromptExtra(env, clazz, engine_ptr, extra);
     }
 }
 

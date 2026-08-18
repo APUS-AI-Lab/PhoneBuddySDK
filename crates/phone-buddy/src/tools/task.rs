@@ -28,7 +28,13 @@ impl Tool for TaskTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task".into(),
-            description: "Launch a subagent to execute a task autonomously. Can run synchronously or in background.".into(),
+            description: concat!(
+                "Launch an in-memory subagent for a self-contained subtask or parallel work. ",
+                "Use for independent work you can describe in one prompt; do not nest further subagents. ",
+                "Default is background (`run_in_background=true`); collect results with task_output or wait_tasks. ",
+                "Pass `resume_from` with a prior subagent id to continue that conversation."
+            )
+            .into(),
             parameters: schema_object(
                 vec![
                     ("prompt", s_string(), "The full task prompt for the subagent to execute."),

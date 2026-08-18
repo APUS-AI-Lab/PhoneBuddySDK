@@ -21,7 +21,7 @@ use crate::llm::types::{
     ChatCompletionRequest, ChatMessage, Role, SearchParameters, ToolCall, ToolDefinitionWire,
     Usage,
 };
-use crate::prompt::build_system_prompt;
+use crate::prompt::{build_system_prompt, PromptRuntime};
 use crate::session::{SessionStore, StoredSession};
 use crate::tools::fs::Sandbox;
 use crate::tools::host::{HostToolHub, HostToolNotify};
@@ -57,8 +57,8 @@ const COMPACT_THRESHOLD_TOKENS: usize = 24_000;
 
 pub struct PhoneBuddyEngine {
     config: EngineConfig,
-    /// Runtime override for `system_prompt_extra` (Pal persona per session).
-    system_prompt_extra: Mutex<Option<String>>,
+    /// Runtime identity + extra instructions, shared with subagents.
+    prompt: Arc<Mutex<PromptRuntime>>,
     runtime: tokio::runtime::Runtime,
     tools: Arc<ToolRegistry>,
     sandbox: Arc<Sandbox>,
@@ -122,7 +122,7 @@ impl PhoneBuddyEngine {
     ) -> EngineResult<Arc<Self>> {
         let sessions = SessionStore::new(config.sessions_dir())?;
         let plan_state = PlanState::new();
-        let system_prompt_extra = Mutex::new(config.system_prompt_extra.clone());
+        let prompt = Arc::new(Mutex::new(PromptRuntime::from_config(&config)));
 
         let scheduler_manager = Arc::new(crate::agent::scheduler_manager::SchedulerManager::new(
             sandbox.clone(),
@@ -150,11 +150,12 @@ impl PhoneBuddyEngine {
         ));
         subagent_registry.register(crate::tools::notification::arc(host_tools.clone()));
 
-        let task_manager = Arc::new(crate::agent::task_manager::TaskManager::new(
+        let task_manager = Arc::new(crate::agent::task_manager::TaskManager::with_prompt(
             config.clone(),
             client.clone(),
             sandbox.clone(),
             Arc::new(subagent_registry),
+            prompt.clone(),
         ));
 
         let mut registry = ToolRegistry::new();
@@ -200,7 +201,7 @@ impl PhoneBuddyEngine {
 
         Ok(Arc::new(Self {
             config,
-            system_prompt_extra,
+            prompt,
             runtime,
             tools: registry,
             sandbox,
@@ -284,7 +285,23 @@ impl PhoneBuddyEngine {
 
     /// Update the extra system prompt used on subsequent turns.
     pub fn set_system_prompt_extra(&self, extra: Option<String>) {
-        *self.system_prompt_extra.lock().unwrap() = extra;
+        let extra = extra
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.prompt.lock().unwrap().extra = extra;
+    }
+
+    /// Set the identity used in the system prompt (`You are {name}…`).
+    ///
+    /// Empty or whitespace resets to [`crate::config::DEFAULT_AGENT_NAME`].
+    pub fn set_agent_name(&self, name: Option<String>) {
+        let resolved = crate::config::resolve_agent_name(name.as_deref().unwrap_or(""));
+        self.prompt.lock().unwrap().agent_name = resolved;
+    }
+
+    /// Current system-prompt identity.
+    pub fn agent_name(&self) -> String {
+        self.prompt.lock().unwrap().agent_name.clone()
     }
 
     fn merged_tools_wire(&self) -> Vec<ToolDefinitionWire> {
@@ -295,7 +312,7 @@ impl PhoneBuddyEngine {
 
     fn build_prompt(&self) -> String {
         let mut cfg = self.config.clone();
-        cfg.system_prompt_extra = self.system_prompt_extra.lock().unwrap().clone();
+        self.prompt.lock().unwrap().apply_to(&mut cfg);
         build_system_prompt(&cfg)
     }
 

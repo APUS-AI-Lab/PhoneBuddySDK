@@ -370,3 +370,35 @@ jint pb_jni_nativeWebViewResult(
     }
     return (jint)res;
 }
+
+void pb_jni_nativeSetAgentName(
+    JNIEnv *env, jclass clazz, jlong engine_ptr, jstring name
+) {
+    (void)clazz;
+    if (engine_ptr == 0) {
+        return;
+    }
+    if (name == NULL) {
+        pb_engine_set_agent_name((PbEngine *)engine_ptr, NULL);
+        return;
+    }
+    const char *c_name = (*env)->GetStringUTFChars(env, name, NULL);
+    pb_engine_set_agent_name((PbEngine *)engine_ptr, c_name);
+    (*env)->ReleaseStringUTFChars(env, name, c_name);
+}
+
+void pb_jni_nativeSetSystemPromptExtra(
+    JNIEnv *env, jclass clazz, jlong engine_ptr, jstring extra
+) {
+    (void)clazz;
+    if (engine_ptr == 0) {
+        return;
+    }
+    if (extra == NULL) {
+        pb_engine_set_system_prompt_extra((PbEngine *)engine_ptr, NULL);
+        return;
+    }
+    const char *c_extra = (*env)->GetStringUTFChars(env, extra, NULL);
+    pb_engine_set_system_prompt_extra((PbEngine *)engine_ptr, c_extra);
+    (*env)->ReleaseStringUTFChars(env, extra, c_extra);
+}

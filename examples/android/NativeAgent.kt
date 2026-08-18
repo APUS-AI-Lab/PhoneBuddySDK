@@ -193,6 +193,21 @@ class NativeAgent(configJson: String, context: Context? = null) : AutoCloseable 
         return nativeHostToolResult(enginePtr, callId, if (ok) 1 else 0, output) == 0
     }
 
+    /**
+     * Set the system-prompt identity (`You are {name}…`).
+     * Pass null or blank to reset to `PhoneBuddy`.
+     */
+    fun setAgentName(name: String?) {
+        check(enginePtr != 0L) { "Engine closed" }
+        nativeSetAgentName(enginePtr, name)
+    }
+
+    /** Set or clear extra product instructions appended to the system prompt. */
+    fun setSystemPromptExtra(extra: String?) {
+        check(enginePtr != 0L) { "Engine closed" }
+        nativeSetSystemPromptExtra(enginePtr, extra)
+    }
+
     @Synchronized
     internal fun completeWebView(callId: String, ok: Boolean, output: String) {
         if (enginePtr != 0L) {
@@ -280,6 +295,12 @@ class NativeAgent(configJson: String, context: Context? = null) : AutoCloseable 
             ok: Int,
             output: String
         ): Int
+
+        @JvmStatic
+        private external fun nativeSetAgentName(enginePtr: Long, name: String?)
+
+        @JvmStatic
+        private external fun nativeSetSystemPromptExtra(enginePtr: Long, extra: String?)
     }
 }
 

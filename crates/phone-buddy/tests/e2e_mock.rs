@@ -197,3 +197,27 @@ fn engine_cancel_aborts_inflight_turn() {
     }
 }
 
+#[test]
+fn agent_name_is_configurable_and_resettable() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = EngineConfig {
+        api_key: "mock".into(),
+        base_url: "http://mock.local/v1".into(),
+        model: "mock-model".into(),
+        root_dir: root.path().to_path_buf(),
+        agent_name: "Pal".into(),
+        ..Default::default()
+    };
+    let engine = PhoneBuddyEngine::with_transport(cfg, MockTransport::new(vec![])).unwrap();
+    assert_eq!(engine.agent_name(), "Pal");
+
+    engine.set_agent_name(Some("小智".into()));
+    assert_eq!(engine.agent_name(), "小智");
+
+    engine.set_agent_name(Some(String::new()));
+    assert_eq!(engine.agent_name(), DEFAULT_AGENT_NAME);
+
+    engine.set_agent_name(None);
+    assert_eq!(engine.agent_name(), DEFAULT_AGENT_NAME);
+}
+

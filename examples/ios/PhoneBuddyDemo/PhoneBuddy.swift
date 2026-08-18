@@ -16,6 +16,8 @@ public struct PhoneBuddyConfig: Codable {
     public var rootDir: String
     public var maxTurns: Int
     public var enableWebSearch: Bool
+    /// Identity used in the system prompt (`You are {agentName}…`). Default: PhoneBuddy.
+    public var agentName: String
     public var extraHeaders: [String: String]?
     public var extraBody: [String: String]?
 
@@ -27,6 +29,7 @@ public struct PhoneBuddyConfig: Codable {
         rootDir: String,
         maxTurns: Int = 24,
         enableWebSearch: Bool = true,
+        agentName: String = "PhoneBuddy",
         extraHeaders: [String: String]? = nil,
         extraBody: [String: String]? = nil
     ) {
@@ -37,6 +40,7 @@ public struct PhoneBuddyConfig: Codable {
         self.rootDir = rootDir
         self.maxTurns = maxTurns
         self.enableWebSearch = enableWebSearch
+        self.agentName = agentName
         self.extraHeaders = extraHeaders
         self.extraBody = extraBody
     }
@@ -49,6 +53,7 @@ public struct PhoneBuddyConfig: Codable {
         case rootDir = "root_dir"
         case maxTurns = "max_turns"
         case enableWebSearch = "enable_web_search"
+        case agentName = "agent_name"
         case extraHeaders = "extra_headers"
         case extraBody = "extra_body"
     }
@@ -64,6 +69,7 @@ public struct PhoneBuddyConfig: Codable {
         case enableWebSearch
         case extraHeaders
         case extraBody
+        case agentName
     }
 
     public init(from decoder: Decoder) throws {
@@ -92,6 +98,12 @@ public struct PhoneBuddyConfig: Codable {
         self.enableWebSearch = (try? container.decodeIfPresent(Bool.self, forKey: .enableWebSearch))
             ?? (try? altContainer?.decodeIfPresent(Bool.self, forKey: .enableWebSearch))
             ?? true
+        let decodedName = (try? container.decodeIfPresent(String.self, forKey: .agentName))
+            ?? (try? altContainer?.decodeIfPresent(String.self, forKey: .agentName))
+            ?? "PhoneBuddy"
+        self.agentName = decodedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "PhoneBuddy"
+            : decodedName
         self.extraHeaders = (try? container.decodeIfPresent([String: String].self, forKey: .extraHeaders))
             ?? (try? altContainer?.decodeIfPresent([String: String].self, forKey: .extraHeaders))
         self.extraBody = (try? container.decodeIfPresent([String: String].self, forKey: .extraBody))
@@ -397,6 +409,26 @@ public final class PhoneBuddyEngine {
         self.enginePtr = handle
         self.webViewHost.attach(engine: handle)
         NSLog("[PhoneBuddy] ✓ Engine initialized successfully")
+    }
+
+    /// Set the system-prompt identity (`You are {name}…`). Pass `nil` or empty to reset to `PhoneBuddy`.
+    public func setAgentName(_ name: String?) {
+        guard let ptr = enginePtr else { return }
+        if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pb_engine_set_agent_name(ptr, name)
+        } else {
+            pb_engine_set_agent_name(ptr, nil)
+        }
+    }
+
+    /// Set or clear extra product instructions appended to the system prompt.
+    public func setSystemPromptExtra(_ extra: String?) {
+        guard let ptr = enginePtr else { return }
+        if let extra, !extra.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pb_engine_set_system_prompt_extra(ptr, extra)
+        } else {
+            pb_engine_set_system_prompt_extra(ptr, nil)
+        }
     }
 
     deinit {

@@ -35,10 +35,9 @@ impl Tool for RunScriptTool {
             name: "run_script".into(),
             description: concat!(
                 "Run a JavaScript program (embedded engine, no network). ",
-                "Available: console.log, readFile(path), writeFile(path, text), ",
-                "listDir(path). ",
-                "Use it to analyze data: compute aggregates, filter, ",
-                "then print results or write output files."
+                "Helpers: console.log, readFile(path), writeFile(path, text), listDir(path). ",
+                "Inspect input files first, compute in the script, print key results, ",
+                "write artifacts with writeFile when useful, and sanity-check the numbers."
             )
             .into(),
             parameters: schema_object(

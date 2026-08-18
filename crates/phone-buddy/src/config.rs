@@ -52,6 +52,10 @@ pub struct EngineConfig {
     /// Only effective against xAI endpoints with a search-capable model.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Identity used in the system prompt (`You are {agent_name}…`).
+    /// Empty or whitespace falls back to [`DEFAULT_AGENT_NAME`].
+    #[serde(default = "default_agent_name")]
+    pub agent_name: String,
     /// Extra text appended to the system prompt (product persona etc).
     #[serde(default)]
     pub system_prompt_extra: Option<String>,
@@ -80,6 +84,14 @@ pub struct EngineConfig {
     /// Allow web_fetch to hit explicit loopback hosts only. Default false.
     #[serde(default)]
     pub web_fetch_allow_local: bool,
+}
+
+/// Default system-prompt identity when the host does not set [`EngineConfig::agent_name`].
+pub const DEFAULT_AGENT_NAME: &str = "PhoneBuddy";
+const AGENT_NAME_MAX_CHARS: usize = 80;
+
+fn default_agent_name() -> String {
+    DEFAULT_AGENT_NAME.into()
 }
 
 fn default_locale() -> String {
@@ -116,6 +128,7 @@ impl Default for EngineConfig {
             temperature: default_temperature(),
             max_output_tokens: default_max_tokens(),
             enable_web_search: false,
+            agent_name: default_agent_name(),
             system_prompt_extra: None,
             stream_idle_timeout_secs: default_idle_timeout_secs(),
             max_retries: default_max_retries(),
@@ -129,7 +142,24 @@ impl Default for EngineConfig {
     }
 }
 
+/// Sanitize a host-supplied identity for the system prompt.
+///
+/// Takes the first line, trims it, caps length, and falls back to
+/// [`DEFAULT_AGENT_NAME`] when empty.
+pub fn resolve_agent_name(raw: &str) -> String {
+    let first = raw.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return DEFAULT_AGENT_NAME.to_string();
+    }
+    first.chars().take(AGENT_NAME_MAX_CHARS).collect()
+}
+
 impl EngineConfig {
+    /// Identity interpolated into the system prompt.
+    pub fn resolved_agent_name(&self) -> String {
+        resolve_agent_name(&self.agent_name)
+    }
+
     /// Whether to send the doom-loop opt-in header and act on server signals.
     pub fn doom_loop_check_enabled(&self) -> bool {
         self.enable_doom_loop_check.unwrap_or(matches!(
