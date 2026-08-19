@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "phone-buddy"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "phone-buddy-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "phone-buddy",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "phone-buddy-ffi"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cbindgen",
  "cc",

@@ -243,8 +243,4 @@ void pb_engine_set_agent_name(struct PbEngine *engine, const char *name);
  */
 void pb_string_free(char *ptr);
 
-extern void phone_buddy_jni_link_anchor(void);
-
-const void *__phone_buddy_jni_anchor(void);
-
 #endif  /* PHONE_BUDDY_H */

@@ -26,5 +26,7 @@ fn main() {
             .write_to_file(out);
     }
     println!("cargo::rerun-if-env-changed=PB_BUILD_HEADER");
+    println!("cargo::rerun-if-changed=cbindgen.toml");
 }
+
 

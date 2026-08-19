@@ -136,7 +136,7 @@ impl HttpTransport {
     ) -> EngineResult<Self> {
         // The ring crypto provider is installed by PhoneBuddyEngine::new.
         let client = reqwest::Client::builder()
-            .user_agent("PhoneBuddy/0.1.0 (Mobile SDK; LLM Client)")
+            .user_agent(format!("PhoneBuddy/{} (Mobile SDK; LLM Client)", crate::VERSION))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60 * 10))
             .build()
