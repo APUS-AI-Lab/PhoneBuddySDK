@@ -261,7 +261,7 @@ data class AppConfig(
                     model = obj.optString("model", "grok-4.6"),
                     apiBackend = obj.optString("api_backend", "responses"),
                     maxTurns = obj.optInt("max_turns", 24),
-                    enableWebSearch = obj.optBoolean("enable_web_search", true),
+                    enableWebSearch = obj.optBoolean("enable_web_search", false),
                     workspaceName = sanitizeWorkspaceName(obj.optString("root_dir", DEFAULT_WORKSPACE_NAME))
                 )
             } catch (_: Exception) {

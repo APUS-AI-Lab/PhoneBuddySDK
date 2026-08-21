@@ -329,8 +329,11 @@ pub struct FunctionDefinitionWire {
 
 // ── Request / response ───────────────────────────────────────────────────
 
-/// xAI live-search parameters (xAI `/chat/completions` extension).
-/// Ported from grok sampling-types `SearchParameters`.
+/// xAI Chat Completions live-search extension.
+///
+/// Kept for the type's historical shape. Grok Build never populates this on
+/// `/v1/responses` (conversion hard-codes `None`); PhoneBuddy matches that
+/// and does not send it on any backend.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchParameters {
     /// "off" | "on" | "auto"
@@ -344,6 +347,57 @@ pub struct SearchParameters {
     pub return_citations: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_search_results: Option<i32>,
+}
+
+/// Backend-hosted Responses API tools, matching Grok Build `HostedTool`.
+///
+/// These are spliced into the Responses `tools` array as native types
+/// (e.g. `{ "type": "web_search" }`), not as function tools. The client
+/// `web_search` function tool is dropped from the same request so the
+/// two do not collide (the API rejects duplicates).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostedTool {
+    WebSearch,
+}
+
+impl HostedTool {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            HostedTool::WebSearch => "web_search",
+        }
+    }
+
+    pub fn to_tool_entry(&self) -> serde_json::Value {
+        match self {
+            HostedTool::WebSearch => serde_json::json!({ "type": "web_search" }),
+        }
+    }
+
+    /// Grok Build sends hosted search only on the Responses API when the
+    /// model/gateway supports backend search (`supports_backend_search`).
+    pub fn for_request(enable_web_search: bool, api_backend: ApiBackend) -> Vec<Self> {
+        if enable_web_search && matches!(api_backend, ApiBackend::Responses) {
+            vec![Self::WebSearch]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Drop function tools whose names collide with hosted tools.
+pub fn drop_colliding_function_tools(
+    tools: Vec<ToolDefinitionWire>,
+    hosted: &[HostedTool],
+) -> Option<Vec<ToolDefinitionWire>> {
+    let filtered: Vec<_> = tools
+        .into_iter()
+        .filter(|t| !hosted.iter().any(|h| h.wire_name() == t.function.name))
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,9 +414,12 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// xAI live-search extension; ignored by non-xAI providers.
+    /// Unused on the wire. Grok Build always sets this to `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_parameters: Option<SearchParameters>,
+    /// Responses-only hosted tools. Never serialized on Chat Completions.
+    #[serde(skip)]
+    pub hosted_tools: Vec<HostedTool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

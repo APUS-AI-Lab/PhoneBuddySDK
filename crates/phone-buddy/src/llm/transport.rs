@@ -85,6 +85,8 @@ pub struct HttpTransport {
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     /// Opt into server doom-loop recovery (Responses API).
     doom_loop_enabled: bool,
+    /// HTTP Traffic Dumper for diagnostics
+    dumper: crate::llm::dumper::HttpDumper,
 }
 
 impl HttpTransport {
@@ -95,7 +97,7 @@ impl HttpTransport {
         api_backend: ApiBackend,
         extra_headers: std::collections::HashMap<String, String>,
     ) -> EngineResult<Self> {
-        Self::new_with_doom_loop_and_extra_body(
+        Self::new_with_all_options(
             base_url,
             api_key,
             idle_timeout,
@@ -103,6 +105,10 @@ impl HttpTransport {
             extra_headers,
             std::collections::HashMap::new(),
             false,
+            crate::llm::dumper::HttpDumper::new(
+                crate::llm::dumper::HttpDumpConfig::default(),
+                std::env::temp_dir().join("phone-buddy").join("http_dumps"),
+            ),
         )
     }
 
@@ -114,7 +120,7 @@ impl HttpTransport {
         extra_headers: std::collections::HashMap<String, String>,
         doom_loop_enabled: bool,
     ) -> EngineResult<Self> {
-        Self::new_with_doom_loop_and_extra_body(
+        Self::new_with_all_options(
             base_url,
             api_key,
             idle_timeout,
@@ -122,6 +128,10 @@ impl HttpTransport {
             extra_headers,
             std::collections::HashMap::new(),
             doom_loop_enabled,
+            crate::llm::dumper::HttpDumper::new(
+                crate::llm::dumper::HttpDumpConfig::default(),
+                std::env::temp_dir().join("phone-buddy").join("http_dumps"),
+            ),
         )
     }
 
@@ -133,6 +143,31 @@ impl HttpTransport {
         extra_headers: std::collections::HashMap<String, String>,
         extra_body: std::collections::HashMap<String, serde_json::Value>,
         doom_loop_enabled: bool,
+    ) -> EngineResult<Self> {
+        Self::new_with_all_options(
+            base_url,
+            api_key,
+            idle_timeout,
+            api_backend,
+            extra_headers,
+            extra_body,
+            doom_loop_enabled,
+            crate::llm::dumper::HttpDumper::new(
+                crate::llm::dumper::HttpDumpConfig::default(),
+                std::env::temp_dir().join("phone-buddy").join("http_dumps"),
+            ),
+        )
+    }
+
+    pub fn new_with_all_options(
+        base_url: &str,
+        api_key: &str,
+        idle_timeout: Duration,
+        api_backend: ApiBackend,
+        extra_headers: std::collections::HashMap<String, String>,
+        extra_body: std::collections::HashMap<String, serde_json::Value>,
+        doom_loop_enabled: bool,
+        dumper: crate::llm::dumper::HttpDumper,
     ) -> EngineResult<Self> {
         // The ring crypto provider is installed by PhoneBuddyEngine::new.
         let client = reqwest::Client::builder()
@@ -151,6 +186,7 @@ impl HttpTransport {
             extra_body,
             doom_loop_enabled: doom_loop_enabled
                 && matches!(api_backend, ApiBackend::Responses),
+            dumper,
         })
     }
 
@@ -193,8 +229,16 @@ impl LlmTransport for HttpTransport {
         let endpoint = self.endpoint();
         let mut builder = self.client.post(&endpoint).header("Accept", "text/event-stream");
 
+        let mut req_headers_map = std::collections::BTreeMap::new();
+        req_headers_map.insert("accept".to_string(), "text/event-stream".to_string());
+        req_headers_map.insert(
+            "user-agent".to_string(),
+            format!("PhoneBuddy/{} (Mobile SDK; LLM Client)", crate::VERSION),
+        );
+
         for (k, v) in &self.extra_headers {
             builder = builder.header(k, v);
+            req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
 
         // Opt-in server doom-loop check (Responses API only).
@@ -203,12 +247,20 @@ impl LlmTransport for HttpTransport {
                 crate::llm::doom_loop_wire::DOOM_LOOP_CHECK_HEADER,
                 "1",
             );
+            req_headers_map.insert(
+                crate::llm::doom_loop_wire::DOOM_LOOP_CHECK_HEADER.to_string(),
+                "1".to_string(),
+            );
         }
 
         let mut body = match self.api_backend {
             ApiBackend::ChatCompletions => {
                 if !self.api_key.is_empty() {
                     builder = builder.bearer_auth(&self.api_key);
+                    req_headers_map.insert(
+                        "authorization".to_string(),
+                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
+                    );
                 }
                 let mut val = serde_json::to_value(req)?;
                 val["stream"] = serde_json::Value::Bool(true);
@@ -218,6 +270,10 @@ impl LlmTransport for HttpTransport {
             ApiBackend::Responses => {
                 if !self.api_key.is_empty() {
                     builder = builder.bearer_auth(&self.api_key);
+                    req_headers_map.insert(
+                        "authorization".to_string(),
+                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
+                    );
                 }
                 build_responses_payload(req)
             }
@@ -226,19 +282,61 @@ impl LlmTransport for HttpTransport {
                     builder = builder
                         .header("x-api-key", &self.api_key)
                         .bearer_auth(&self.api_key);
+                    req_headers_map.insert(
+                        "x-api-key".to_string(),
+                        self.dumper.mask_header_value("x-api-key", &self.api_key),
+                    );
+                    req_headers_map.insert(
+                        "authorization".to_string(),
+                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
+                    );
                 }
                 builder = builder.header("anthropic-version", "2023-06-01");
+                req_headers_map.insert("anthropic-version".to_string(), "2023-06-01".to_string());
                 build_messages_payload(req)
             }
         };
 
         merge_extra_body(&mut body, &self.extra_body);
+        req_headers_map.insert("content-type".to_string(), "application/json".to_string());
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| EngineError::Llm(format!("error sending request: {e}")))?;
+        let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+        let start_time = std::time::Instant::now();
+        let timestamp_str = chrono::Utc::now().to_rfc3339();
+
+        let req_dump = crate::llm::dumper::HttpRequestDump {
+            method: "POST".into(),
+            url: endpoint.clone(),
+            headers: req_headers_map,
+            body: body.clone(),
+        };
+
+        let resp_result = builder.json(&body).send().await;
+
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => {
+                let err_msg = format!("error sending request: {e}");
+                let mut dump_path_opt = None;
+                if self.dumper.should_dump_error() {
+                    let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                        schema_version: "1.0".into(),
+                        request_id: req_id,
+                        timestamp: timestamp_str,
+                        duration_ms: start_time.elapsed().as_millis() as u64,
+                        request: req_dump,
+                        response: None,
+                        error: Some(err_msg.clone()),
+                    };
+                    dump_path_opt = self.dumper.dump(&dump_rec);
+                }
+                let mut full_err = err_msg;
+                if let Some(path) = dump_path_opt {
+                    full_err.push_str(&format!(" [HTTP dump: {}]", path.display()));
+                }
+                return Err(EngineError::Llm(full_err));
+            }
+        };
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -254,6 +352,8 @@ impl LlmTransport for HttpTransport {
                 .get("x-should-retry")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            let resp_headers_dump = self.dumper.extract_headers(resp.headers());
+            let status_text = resp.status().canonical_reason().unwrap_or("Unknown").to_string();
             let text = resp.text().await.unwrap_or_default();
             let detail = truncate_for_error(&text);
             let mut msg = format!("status={status}");
@@ -265,7 +365,48 @@ impl LlmTransport for HttpTransport {
             }
             msg.push(' ');
             msg.push_str(&detail);
+
+            if self.dumper.should_dump_error() {
+                let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                    schema_version: "1.0".into(),
+                    request_id: req_id,
+                    timestamp: timestamp_str,
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                    request: req_dump,
+                    response: Some(crate::llm::dumper::HttpResponseDump {
+                        status,
+                        status_text,
+                        headers: resp_headers_dump,
+                        body_text: text,
+                    }),
+                    error: Some(msg.clone()),
+                };
+                if let Some(path) = self.dumper.dump(&dump_rec) {
+                    msg.push_str(&format!(" [HTTP dump: {}]", path.display()));
+                }
+            }
+
             return Err(EngineError::Llm(msg));
+        }
+
+        if self.dumper.should_dump_success() {
+            let resp_headers_dump = self.dumper.extract_headers(resp.headers());
+            let status_text = resp.status().canonical_reason().unwrap_or("OK").to_string();
+            let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                schema_version: "1.0".into(),
+                request_id: req_id,
+                timestamp: timestamp_str,
+                duration_ms: start_time.elapsed().as_millis() as u64,
+                request: req_dump,
+                response: Some(crate::llm::dumper::HttpResponseDump {
+                    status,
+                    status_text,
+                    headers: resp_headers_dump,
+                    body_text: "<streaming SSE response started>".into(),
+                }),
+                error: None,
+            };
+            self.dumper.dump(&dump_rec);
         }
 
         use eventsource_stream::Eventsource as _;
@@ -475,23 +616,33 @@ fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
     if let Some(max_tokens) = req.max_tokens {
         payload["max_output_tokens"] = serde_json::json!(max_tokens);
     }
+    let mut tools_val: Vec<serde_json::Value> = req
+        .hosted_tools
+        .iter()
+        .map(|h| h.to_tool_entry())
+        .collect();
     if let Some(ref tools) = req.tools {
-        let tools_val: Vec<_> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": t.function.name,
-                    "description": t.function.description,
-                    "parameters": t.function.parameters
-                })
-            })
-            .collect();
+        for t in tools {
+            if req
+                .hosted_tools
+                .iter()
+                .any(|h| h.wire_name() == t.function.name)
+            {
+                continue;
+            }
+            tools_val.push(serde_json::json!({
+                "type": "function",
+                "name": t.function.name,
+                "description": t.function.description,
+                "parameters": t.function.parameters
+            }));
+        }
+    }
+    if !tools_val.is_empty() {
         payload["tools"] = serde_json::Value::Array(tools_val);
     }
-    if let Some(ref search) = req.search_parameters {
-        payload["search_parameters"] = serde_json::to_value(search).unwrap_or_default();
-    }
+    // Grok Build never sends Chat Completions `search_parameters` on
+    // `/v1/responses`. Do not copy `req.search_parameters` here.
 
     payload
 }
@@ -1122,7 +1273,9 @@ fn split_half(s: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{ChatMessage, FunctionDefinitionWire, ToolDefinitionWire};
+    use crate::llm::types::{
+        ChatMessage, FunctionDefinitionWire, HostedTool, SearchParameters, ToolDefinitionWire,
+    };
 
     #[test]
     fn test_api_backend_endpoint_resolution() {
@@ -1159,6 +1312,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             search_parameters: None,
+            hosted_tools: vec![],
         };
 
         let payload = build_responses_payload(&req);
@@ -1167,6 +1321,76 @@ mod tests {
         assert_eq!(payload["input"][0]["role"], "user");
         assert_eq!(payload["input"][0]["content"], "Hello!");
         assert_eq!(payload["tools"][0]["name"], "test_tool");
+        assert!(payload.get("search_parameters").is_none());
+    }
+
+    #[test]
+    fn responses_payload_never_sends_search_parameters() {
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![ChatMessage::user("你好")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: Some(SearchParameters {
+                mode: Some("auto".into()),
+                ..Default::default()
+            }),
+            hosted_tools: vec![],
+        };
+        let payload = build_responses_payload(&req);
+        assert!(payload.get("search_parameters").is_none());
+        assert!(payload.get("tools").is_none());
+    }
+
+    #[test]
+    fn responses_payload_splices_hosted_web_search_and_drops_function_collision() {
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![ChatMessage::user("你好")],
+            stream: Some(true),
+            tools: Some(vec![
+                ToolDefinitionWire {
+                    kind: "function".into(),
+                    function: FunctionDefinitionWire {
+                        name: "web_search".into(),
+                        description: Some("client search".into()),
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                },
+                ToolDefinitionWire {
+                    kind: "function".into(),
+                    function: FunctionDefinitionWire {
+                        name: "read_file".into(),
+                        description: Some("read".into()),
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                },
+            ]),
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![HostedTool::WebSearch],
+        };
+        let payload = build_responses_payload(&req);
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "web_search");
+        assert!(tools[0].get("name").is_none());
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "read_file");
+        assert!(payload.get("search_parameters").is_none());
+    }
+
+    #[test]
+    fn hosted_search_tools_only_on_responses() {
+        assert!(HostedTool::for_request(true, ApiBackend::Responses) == vec![HostedTool::WebSearch]);
+        assert!(HostedTool::for_request(true, ApiBackend::ChatCompletions).is_empty());
+        assert!(HostedTool::for_request(true, ApiBackend::Messages).is_empty());
+        assert!(HostedTool::for_request(false, ApiBackend::Responses).is_empty());
     }
 
     #[test]
@@ -1183,6 +1407,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(2048),
             search_parameters: None,
+            hosted_tools: vec![],
         };
 
         let payload = build_messages_payload(&req);
@@ -1237,6 +1462,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             search_parameters: None,
+            hosted_tools: vec![],
         };
 
         let payload = build_responses_payload(&req);
@@ -1403,6 +1629,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             search_parameters: None,
+            hosted_tools: vec![],
         };
 
         let mut extra = std::collections::HashMap::new();
@@ -1425,5 +1652,64 @@ mod tests {
         assert_eq!(msg_payload["client_version"], "1.0.0");
         assert_eq!(msg_payload["user_tier"], "premium");
         assert_eq!(msg_payload["model"], "claude-3-5-sonnet");
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_dump_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump_dir = tmp.path().join("dumps");
+
+        let dumper = crate::llm::dumper::HttpDumper::new(
+            crate::llm::dumper::HttpDumpConfig {
+                mode: crate::llm::dumper::HttpDumpMode::OnError,
+                dump_dir: Some(dump_dir.clone()),
+                mask_sensitive: true,
+                max_files: 10,
+            },
+            dump_dir.clone(),
+        );
+
+        // Point to an invalid local port that will fail connection
+        let transport = HttpTransport::new_with_all_options(
+            "http://127.0.0.1:59999/v1",
+            "test-secret-key-123456",
+            Duration::from_secs(2),
+            ApiBackend::ChatCompletions,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            false,
+            dumper,
+        )
+        .unwrap();
+
+        let req = ChatCompletionRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("Hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+        };
+
+        let res = transport.request_stream(&req).await;
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        let err_str = err.to_string();
+        assert!(err_str.contains("HTTP dump:"));
+
+        // Verify that dump file was created and contains masked auth header
+        let entries: Vec<_> = std::fs::read_dir(&dump_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let dump_content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&dump_content).unwrap();
+        assert_eq!(json["request"]["method"], "POST");
+        assert_eq!(json["request"]["headers"]["authorization"], "Bearer test***3456");
+        assert!(json["error"].is_string());
     }
 }

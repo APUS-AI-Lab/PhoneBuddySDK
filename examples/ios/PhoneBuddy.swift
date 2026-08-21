@@ -7,6 +7,33 @@ import Foundation
 import UIKit
 import WebKit
 
+/// Configuration options for raw HTTP traffic dumps.
+public struct HttpDumpConfig: Codable {
+    public var mode: String // "off", "on_error", "all"
+    public var dumpDir: String?
+    public var maskSensitive: Bool
+    public var maxFiles: Int
+
+    public init(
+        mode: String = "off",
+        dumpDir: String? = nil,
+        maskSensitive: Bool = true,
+        maxFiles: Int = 30
+    ) {
+        self.mode = mode
+        self.dumpDir = dumpDir
+        self.maskSensitive = maskSensitive
+        self.maxFiles = maxFiles
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case dumpDir = "dump_dir"
+        case maskSensitive = "mask_sensitive"
+        case maxFiles = "max_files"
+    }
+}
+
 /// Configuration options for PhoneBuddyEngine.
 public struct PhoneBuddyConfig: Codable {
     public var apiKey: String
@@ -20,6 +47,7 @@ public struct PhoneBuddyConfig: Codable {
     public var agentName: String
     public var extraHeaders: [String: String]?
     public var extraBody: [String: String]?
+    public var httpDump: HttpDumpConfig?
 
     public init(
         apiKey: String = "",
@@ -31,7 +59,8 @@ public struct PhoneBuddyConfig: Codable {
         enableWebSearch: Bool = true,
         agentName: String = "PhoneBuddy",
         extraHeaders: [String: String]? = nil,
-        extraBody: [String: String]? = nil
+        extraBody: [String: String]? = nil,
+        httpDump: HttpDumpConfig? = nil
     ) {
         self.apiKey = apiKey
         self.baseUrl = baseUrl
@@ -43,6 +72,7 @@ public struct PhoneBuddyConfig: Codable {
         self.agentName = agentName
         self.extraHeaders = extraHeaders
         self.extraBody = extraBody
+        self.httpDump = httpDump
     }
 
     enum CodingKeys: String, CodingKey {
@@ -56,6 +86,7 @@ public struct PhoneBuddyConfig: Codable {
         case agentName = "agent_name"
         case extraHeaders = "extra_headers"
         case extraBody = "extra_body"
+        case httpDump = "http_dump"
     }
 
     private enum AltCodingKeys: String, CodingKey {
@@ -70,6 +101,7 @@ public struct PhoneBuddyConfig: Codable {
         case extraHeaders
         case extraBody
         case agentName
+        case httpDump
     }
 
     public init(from decoder: Decoder) throws {
@@ -108,6 +140,8 @@ public struct PhoneBuddyConfig: Codable {
             ?? (try? altContainer?.decodeIfPresent([String: String].self, forKey: .extraHeaders))
         self.extraBody = (try? container.decodeIfPresent([String: String].self, forKey: .extraBody))
             ?? (try? altContainer?.decodeIfPresent([String: String].self, forKey: .extraBody))
+        self.httpDump = (try? container.decodeIfPresent(HttpDumpConfig.self, forKey: .httpDump))
+            ?? (try? altContainer?.decodeIfPresent(HttpDumpConfig.self, forKey: .httpDump))
     }
 
     public static let userDefaultsKey = "phone_buddy_config"

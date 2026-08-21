@@ -165,6 +165,7 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(128),
             search_parameters: None,
+            hosted_tools: vec![],
         }
     }
 

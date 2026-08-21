@@ -115,7 +115,7 @@ val config = JSONObject().apply {
     put("api_backend", "responses") // uses the OpenAI Response API + SSE protocol
     put("root_dir", context.cacheDir.resolve("phone-buddy").absolutePath)
     put("max_turns", 10)
-    put("enable_web_search", true)
+    put("enable_web_search", false)
     put("extra_headers", JSONObject().apply {
         put("X-App-Version", "2.4.0")
         put("X-Client-Platform", "Android")
@@ -349,6 +349,32 @@ Common causes:
 - Calling `chat()` on the main thread
 - Malformed config JSON
 - `root_dir` does not exist or is not writable
+
+### HTTP & API Error Troubleshooting
+
+If you encounter LLM request failures, gateway errors, authentication issues, or unexpected HTTP status codes (e.g. 4xx / 5xx), enable `http_dump` in your configuration:
+
+```kotlin
+val config = JSONObject().apply {
+    put("api_key", userAccessToken)
+    put("base_url", "https://ai-gateway.yourcompany.com/v1")
+    put("model", "grok-4.6")
+    put("root_dir", context.cacheDir.resolve("phone-buddy").absolutePath)
+    put("http_dump", JSONObject().apply {
+        put("mode", "on_error")
+        put("mask_sensitive", true)
+        put("max_files", 30)
+    })
+}
+```
+
+When an error occurs, the SDK error message will include the exact dump path:
+`... [HTTP dump: /data/user/0/your.app.id/cache/phone-buddy/.phonebuddy/http_dumps/dump_20260821_..._500_req_xxx.json]`
+
+You can pull the dump file via ADB to inspect full raw request and response headers/bodies:
+```bash
+adb pull /data/user/0/your.app.id/cache/phone-buddy/.phonebuddy/http_dumps/ .
+```
 
 ### Emulator issues
 

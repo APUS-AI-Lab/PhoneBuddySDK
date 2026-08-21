@@ -97,7 +97,7 @@ Keep replies proportional to the task; do not default to a formal report.
 "#
     );
 
-    if matches!(audience, Audience::Primary) && cfg.enable_web_search {
+    if matches!(audience, Audience::Primary) {
         prompt.push_str(
             "\nUse `web_search` for current events, documentation, or facts beyond training knowledge. Cite used URLs as markdown links.\n",
         );
@@ -155,10 +155,10 @@ mod tests {
     }
 
     #[test]
-    fn web_search_line_is_conditional() {
+    fn web_search_line_is_on_primary_prompt() {
         let mut c = cfg();
         c.enable_web_search = false;
-        assert!(!build_system_prompt(&c).contains("web_search"));
+        assert!(build_system_prompt(&c).contains("web_search"));
         c.enable_web_search = true;
         assert!(build_system_prompt(&c).contains("web_search"));
         assert!(!build_subagent_prompt(&c).contains("web_search"));

@@ -18,8 +18,8 @@ use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
 use crate::llm::types::{
-    ChatCompletionRequest, ChatMessage, Role, SearchParameters, ToolCall, ToolDefinitionWire,
-    Usage,
+    drop_colliding_function_tools, ChatCompletionRequest, ChatMessage, HostedTool, Role, ToolCall,
+    ToolDefinitionWire, Usage,
 };
 use crate::prompt::{build_system_prompt, PromptRuntime};
 use crate::session::{SessionStore, StoredSession};
@@ -310,6 +310,26 @@ impl PhoneBuddyEngine {
         defs
     }
 
+    fn conversation_request(
+        &self,
+        model: String,
+        messages: Vec<ChatMessage>,
+        stream: bool,
+    ) -> ChatCompletionRequest {
+        let hosted = HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
+        ChatCompletionRequest {
+            model,
+            messages,
+            stream: Some(stream),
+            tools: drop_colliding_function_tools(self.merged_tools_wire(), &hosted),
+            tool_choice: Some(serde_json::json!("auto")),
+            temperature: Some(self.config.temperature),
+            max_tokens: Some(self.config.max_output_tokens),
+            search_parameters: None,
+            hosted_tools: hosted,
+        }
+    }
+
     fn build_prompt(&self) -> String {
         let mut cfg = self.config.clone();
         self.prompt.lock().unwrap().apply_to(&mut cfg);
@@ -451,28 +471,7 @@ impl PhoneBuddyEngine {
             self.maybe_compact(&mut session.messages, &system_prompt);
 
             let messages = with_system(&session.messages, &system_prompt);
-            let tool_defs = self.merged_tools_wire();
-            let request = ChatCompletionRequest {
-                model: self.config.model.clone(),
-                messages,
-                stream: Some(true),
-                tools: if tool_defs.is_empty() {
-                    None
-                } else {
-                    Some(tool_defs)
-                },
-                tool_choice: Some(serde_json::json!("auto")),
-                temperature: Some(self.config.temperature),
-                max_tokens: Some(self.config.max_output_tokens),
-                search_parameters: if self.config.enable_web_search {
-                    Some(SearchParameters {
-                        mode: Some("auto".into()),
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                },
-            };
+            let request = self.conversation_request(self.config.model.clone(), messages, true);
 
             let turn = tokio::select! {
                 _ = token.cancelled() => {

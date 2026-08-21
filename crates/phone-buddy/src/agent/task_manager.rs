@@ -19,7 +19,9 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
-use crate::llm::types::{ChatCompletionRequest, ChatMessage};
+use crate::llm::types::{
+    drop_colliding_function_tools, ChatCompletionRequest, ChatMessage, HostedTool,
+};
 use crate::prompt::{build_subagent_prompt, PromptRuntime};
 use crate::tools::fs::Sandbox;
 use crate::tools::{ToolCtx, ToolRegistry};
@@ -371,17 +373,21 @@ impl TaskManager {
             req_messages.extend(messages.clone());
 
             let model = model_override.unwrap_or(&self.config.model).to_string();
-            let tool_defs = self.subagent_tools.wire_definitions();
-
+            let hosted =
+                HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
             let request = ChatCompletionRequest {
                 model,
                 messages: req_messages,
                 stream: Some(false),
-                tools: if tool_defs.is_empty() { None } else { Some(tool_defs) },
+                tools: drop_colliding_function_tools(
+                    self.subagent_tools.wire_definitions(),
+                    &hosted,
+                ),
                 tool_choice: Some(serde_json::json!("auto")),
                 temperature: Some(self.config.temperature),
                 max_tokens: Some(self.config.max_output_tokens),
                 search_parameters: None,
+                hosted_tools: hosted,
             };
 
             let observer = NullObserver;

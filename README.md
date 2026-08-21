@@ -40,7 +40,7 @@ PhoneBuddy SDK's core agent runtime is derived and adapted from xAI's open-sourc
   - System push notifications and UI alerts via host callbacks (`notification`).
   - Interactive user prompts (`ask_user_question`) supporting multi-choice options and freeform write-ins.
 - 🌐 **Web Search & Fetch with SSRF Protection**
-  - Live web search (`web_search`) with multi-engine routing (headless DuckDuckGo Lite via host WebView, direct HTTP, or xAI search parameters).
+  - Live web search (`web_search`) with multi-engine routing (headless DuckDuckGo Lite via host WebView, LLM search API fallback, or Grok hosted `{type: web_search}` on Responses when `enable_web_search` is on).
   - Clean HTML-to-Markdown page conversion via pure-Rust `htmd` (`web_fetch`) with built-in SSRF protection blocking private network / loopback ranges.
 - 🛡️ **Production-Grade Harness Robustness**
   - **Doom-Loop Detection**: Identifies action stationarity (`IdenticalToolCallRun`, 8-turn nudge / 16-turn break) plus server-side check support (`x-grok-doom-loop-check`).
@@ -162,7 +162,7 @@ val config = JSONObject().apply {
     put("api_backend", "responses")
     put("root_dir", context.filesDir.resolve("workspace").absolutePath)
     put("max_turns", 24)
-    put("enable_web_search", true)
+    put("enable_web_search", false)
     put("agent_name", "Acme")
     put("extra_headers", JSONObject().apply {
         put("X-App-Version", "1.0.0")
@@ -284,7 +284,7 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `max_turns` | Integer | No | `24` | Maximum tool loop turns per user turn |
 | `temperature` | Float | No | `0.2` | Model sampling temperature |
 | `max_output_tokens` | Integer | No | `8192` | Maximum output token generation limit |
-| `enable_web_search` | Boolean | No | `false` | Enable web search tool (WebView DDG Lite on mobile / search parameters) |
+| `enable_web_search` | Boolean | No | `false` | Attach Grok hosted `{type: web_search}` on Responses (Grok Build `supports_backend_search`). Client DuckDuckGo/`web_search` function tool stays registered independently. Leave off for gateways that do not implement hosted search (e.g. PackyAPI). |
 | `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |
 | `system_prompt_extra` | String | No | `null` | Custom persona or product instructions appended to system prompt |
 | `stream_idle_timeout_secs`| Integer | No | `120` | Streaming connection idle timeout in seconds |
@@ -293,6 +293,72 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `extra_body` | Object | No | `{}` | Custom JSON fields merged into top level of LLM request payload |
 | `enable_doom_loop_check`| Boolean | No | Auto | Server-side doom loop header (`x-grok-doom-loop-check`) |
 | `web_fetch_allow_local` | Boolean | No | `false` | Allow `web_fetch` to access local loopback addresses (for testing) |
+| `http_dump` | Object | No | `{"mode":"off"}`| Raw HTTP request/response dumper for debugging (e.g. `{"mode":"on_error","max_files":30}`) |
+
+---
+
+## 🩺 HTTP Traffic Diagnostics & Raw Dump (Troubleshooting Network & API Errors)
+
+When troubleshooting network connectivity issues, authentication errors, API gateway failures, or unexpected HTTP response codes (e.g. 4xx / 5xx) on mobile clients, configure `http_dump` to record complete raw HTTP request and response exchanges to disk:
+
+```json
+{
+  "api_key": "your-access-token",
+  "base_url": "https://api.example.com/v1",
+  "model": "grok-4",
+  "http_dump": {
+    "mode": "on_error",
+    "mask_sensitive": true,
+    "max_files": 30
+  }
+}
+```
+
+### `http_dump` Configuration Options:
+* **`mode`**:
+  * `"off"` *(default)*: Traffic dumping disabled.
+  * `"on_error"`: Dumps raw HTTP exchange only when a request fails (non-2xx HTTP status or network timeout/connection error).
+  * `"all"`: Dumps all HTTP exchanges (both 200 OK handshakes and failures).
+* **`dump_dir`**: Custom output directory. Defaults to `<root_dir>/.phonebuddy/http_dumps/`.
+* **`mask_sensitive`**: Mask sensitive headers (`Authorization`, `x-api-key`, `cookie`, etc.). Defaults to `true`.
+* **`max_files`**: Maximum number of dump JSON files retained before automatically rotating out the oldest files (FIFO rotation). Defaults to `30`.
+
+### Error Message and Dump JSON Format:
+When an error occurs, the SDK error message includes the absolute dump path:
+```text
+Completion error: Error: LLM request failed: status=500 { "error": ... } [HTTP dump: /data/user/0/com.example.app/files/sandbox/.phonebuddy/http_dumps/dump_20260821_211530_500_req_a1b2c3.json]
+```
+
+Each dump file captures:
+```json
+{
+  "schema_version": "1.0",
+  "request_id": "req_a1b2c3d4",
+  "timestamp": "2026-08-21T21:15:30.123+08:00",
+  "duration_ms": 352,
+  "request": {
+    "method": "POST",
+    "url": "https://api.example.com/v1/chat/completions",
+    "headers": {
+      "accept": "text/event-stream",
+      "authorization": "Bearer sk-p***3456",
+      "content-type": "application/json"
+    },
+    "body": { "model": "grok-4", "messages": [...], "stream": true }
+  },
+  "response": {
+    "status": 502,
+    "status_text": "Bad Gateway",
+    "headers": {
+      "content-type": "text/html; charset=UTF-8",
+      "server": "nginx/1.22.1",
+      "x-gateway-trace-id": "gw-987654321"
+    },
+    "body_text": "<html><head><title>502 Bad Gateway</title></head><body>...</body></html>"
+  },
+  "error": "status=502 <html><head><title>502 Bad Gateway..."
+}
+```
 
 ---
 

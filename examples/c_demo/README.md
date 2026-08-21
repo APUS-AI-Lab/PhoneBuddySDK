@@ -48,7 +48,7 @@ Example `config.json`:
 }
 ```
 
-C hosts have no system WebView. If `enable_web_search` is true, `web_search` skips DuckDuckGo scraping and uses the configured LLM search API.
+C hosts have no system WebView. The client `web_search` function tool skips DuckDuckGo scraping and uses the configured LLM search API. `enable_web_search` additionally attaches hosted `{type: web_search}` on Responses backends (Grok Build backend search); leave it false unless the gateway implements that tool.
 
 ### 2. Build the Static Library and C Demo
 

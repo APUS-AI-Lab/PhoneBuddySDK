@@ -185,6 +185,18 @@ Check:
 - Whether the `root_dir` path is writable
 - Whether the network connection is working
 
+### HTTP & API Errors
+If you encounter HTTP request failures, API gateway errors, or unexpected response status codes, enable HTTP traffic dumping in your config:
+```json
+{
+  "http_dump": {
+    "mode": "on_error",
+    "max_files": 30
+  }
+}
+```
+The SDK will save full request/response bodies and headers to `<root_dir>/.phonebuddy/http_dumps/` for inspection.
+
 ## Next Steps
 
 - Full documentation: `README.md`

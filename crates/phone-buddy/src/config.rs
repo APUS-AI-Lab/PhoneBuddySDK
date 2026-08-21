@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::llm::dumper::{HttpDumpConfig, HttpDumpMode};
 use crate::llm::types::ApiBackend;
 
 pub use crate::llm::types::ApiBackend as ConfigApiBackend;
@@ -48,8 +49,19 @@ pub struct EngineConfig {
     pub temperature: f32,
     #[serde(default = "default_max_tokens")]
     pub max_output_tokens: u32,
-    /// Enable xAI live web search (`search_parameters` on the request).
-    /// Only effective against xAI endpoints with a search-capable model.
+    /// Attach Grok-style backend-hosted search on the Responses API.
+    ///
+    /// When true and [`api_backend`] is [`ApiBackend::Responses`], the engine
+    /// adds `{ "type": "web_search" }` to the request `tools` array — the same
+    /// wire shape as Grok Build's `supports_backend_search`. The client-side
+    /// `web_search` function tool is then omitted from that request so the
+    /// two do not collide.
+    ///
+    /// This is **not** xAI Chat Completions `search_parameters` (Grok Build
+    /// never sends that field). Gateways that do not implement Grok hosted
+    /// search (for example PackyAPI) must leave this off; the local
+    /// DuckDuckGo / LLM-fallback `web_search` function tool stays registered
+    /// independently.
     #[serde(default)]
     pub enable_web_search: bool,
     /// Identity used in the system prompt (`You are {agent_name}…`).
@@ -84,6 +96,9 @@ pub struct EngineConfig {
     /// Allow web_fetch to hit explicit loopback hosts only. Default false.
     #[serde(default)]
     pub web_fetch_allow_local: bool,
+    /// Configuration for dumping raw HTTP requests and responses to disk for debugging.
+    #[serde(default)]
+    pub http_dump: HttpDumpConfig,
 }
 
 /// Default system-prompt identity when the host does not set [`EngineConfig::agent_name`].
@@ -138,6 +153,7 @@ impl Default for EngineConfig {
             extra_body: std::collections::HashMap::new(),
             enable_doom_loop_check: None,
             web_fetch_allow_local: false,
+            http_dump: HttpDumpConfig::default(),
         }
     }
 }
@@ -155,6 +171,11 @@ pub fn resolve_agent_name(raw: &str) -> String {
 }
 
 impl EngineConfig {
+    /// True when hosted `{type: web_search}` should ride the Responses request.
+    pub fn backend_search_active(&self) -> bool {
+        self.enable_web_search && matches!(self.api_backend, ApiBackend::Responses)
+    }
+
     /// Identity interpolated into the system prompt.
     pub fn resolved_agent_name(&self) -> String {
         resolve_agent_name(&self.agent_name)
@@ -209,7 +230,36 @@ impl EngineConfig {
         self.root_dir.join(".phonebuddy").join("sessions")
     }
 
+    /// Directory where raw HTTP request/response dumps are persisted: `<root>/.phonebuddy/http_dumps`.
+    pub fn http_dumps_dir(&self) -> PathBuf {
+        if let Some(ref d) = self.http_dump.dump_dir {
+            d.clone()
+        } else {
+            self.root_dir.join(".phonebuddy").join("http_dumps")
+        }
+    }
+
     pub fn root_as_path(&self) -> &Path {
         &self.root_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_search_active_only_on_responses() {
+        let mut cfg = EngineConfig::default();
+        assert!(!cfg.backend_search_active());
+
+        cfg.enable_web_search = true;
+        assert!(!cfg.backend_search_active());
+
+        cfg.api_backend = ApiBackend::Responses;
+        assert!(cfg.backend_search_active());
+
+        cfg.api_backend = ApiBackend::Messages;
+        assert!(!cfg.backend_search_active());
     }
 }

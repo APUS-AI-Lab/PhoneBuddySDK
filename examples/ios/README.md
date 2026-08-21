@@ -120,6 +120,14 @@ public struct PhoneBuddyConfig {
     var enableWebSearch: Bool       // whether to enable web search
     var extraHeaders: [String: String]? // custom HTTP headers (e.g. X-App-Version)
     var extraBody: [String: String]?    // optional custom JSON body fields
+    var httpDump: HttpDumpConfig?       // optional raw HTTP request/response dumper for diagnostics
+}
+
+public struct HttpDumpConfig {
+    var mode: String                    // "off", "on_error", "all"
+    var dumpDir: String?                // custom dump directory
+    var maskSensitive: Bool             // whether to mask Authorization headers (default: true)
+    var maxFiles: Int                   // max retained dump files (default: 30)
 }
 ```
 

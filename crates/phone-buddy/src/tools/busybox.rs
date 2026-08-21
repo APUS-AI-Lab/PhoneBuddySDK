@@ -733,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_busybox_misc_applets() {
-        let (dir, ctx) = make_ctx();
+        let (_dir, ctx) = make_ctx();
         let tool = BusyboxTool;
 
         // echo

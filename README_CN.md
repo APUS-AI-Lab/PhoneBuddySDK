@@ -40,7 +40,7 @@ PhoneBuddy SDK 的核心 Agent 运行引擎抽离并移植自 xAI 的开源项�
   - 支持通过宿主回调触发系统 Push 通知与弹窗（`notification`）。
   - 支持交互式人机交互提问（`ask_user_question`），支持单选/多选及自由补充输入。
 - 🌐 **联网搜索与防 SSRF 网页解析**
-  - 支持多源网页搜索（`web_search`）：移动端支持静默调起系统 WebView 抓取 DuckDuckGo Lite、直连 HTTP 搜索或透传 LLM 搜索参数。
+  - 支持多源网页搜索（`web_search`）：移动端静默调起系统 WebView 抓取 DuckDuckGo Lite，失败则走 LLM 搜索 API；`enable_web_search` 为真且协议为 Responses 时，对齐 Grok Build 在主请求 `tools` 中附加 hosted `{ "type": "web_search" }`。
   - 基于纯 Rust `htmd` 引擎将网页 HTML 高保真转换为 Clean Markdown（`web_fetch`），内置 SSRF 防护机制，默认拦截内网与私有 IP。
 - 🛡️ **生产级 Harness 韧性机制**
   - **死循环检测（Doom-Loop Detection）**：工具调用静止性检测（`IdenticalToolCallRun`，8 轮微调提示 / 16 轮强制熔断）及服务端检查支持（`x-grok-doom-loop-check`）。
@@ -162,7 +162,7 @@ val config = JSONObject().apply {
     put("api_backend", "responses")
     put("root_dir", context.filesDir.resolve("workspace").absolutePath)
     put("max_turns", 24)
-    put("enable_web_search", true)
+    put("enable_web_search", false)
     put("agent_name", "小智")
     put("extra_headers", JSONObject().apply {
         put("X-App-Version", "1.0.0")
@@ -282,7 +282,7 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 | `max_turns` | Integer | 否 | `24` | 单轮用户任务的最大工具调用循环轮数 |
 | `temperature` | Float | 否 | `0.2` | 模型采样温度 |
 | `max_output_tokens` | Integer | 否 | `8192` | 单次输出的最大 Token 限制 |
-| `enable_web_search` | Boolean | 否 | `false` | 是否开启联网搜索（移动端走 WebView DuckDuckGo Lite / API 搜索参数） |
+| `enable_web_search` | Boolean | 否 | `false` | Responses 主请求是否附加 Grok hosted `{type: web_search}`（对齐 Grok Build `supports_backend_search`）。客户端 DuckDuckGo / `web_search` function tool 独立注册。PackyAPI 等不支持 hosted search 的网关请保持关闭。 |
 | `agent_name` | String | 否 | `PhoneBuddy` | 系统提示词中的身份名（`You are {agent_name}…`）。空值回退为 `PhoneBuddy` |
 | `system_prompt_extra` | String | 否 | `null` | 追加到 System Prompt 尾部的自定义人设或业务指令 |
 | `stream_idle_timeout_secs`| Integer | 否 | `120` | 流式连接空闲超时时间（秒） |
@@ -291,6 +291,72 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 | `extra_body` | Object | 否 | `{}` | 透传合并到 LLM 请求 JSON 体顶层的自定义字段 |
 | `enable_doom_loop_check`| Boolean | 否 | 自动判定 | 是否开启服务端死循环检测 Header（`x-grok-doom-loop-check`） |
 | `web_fetch_allow_local` | Boolean | 否 | `false` | 是否允许 `web_fetch` 请求本地回环地址（仅供测试） |
+| `http_dump` | Object | 否 | `{"mode":"off"}`| 原始 HTTP 请求/响应报文落盘诊断配置（如 `{"mode":"on_error","max_files":30}`） |
+
+---
+
+## 🩺 HTTP 流量转储与网络排错（诊断 HTTP 异常与网络故障）
+
+当接入客户端遇到网络连通性异常、鉴权失败、网关代理报错或非预期的 HTTP 状态码（如 4xx / 5xx）时，可通过配置 `http_dump` 将完整的底层 HTTP 请求及响应报文保存到本地沙盒，便于快速排查与定位问题：
+
+```json
+{
+  "api_key": "your-access-token",
+  "base_url": "https://api.example.com/v1",
+  "model": "grok-4",
+  "http_dump": {
+    "mode": "on_error",
+    "mask_sensitive": true,
+    "max_files": 30
+  }
+}
+```
+
+### `http_dump` 参数说明：
+* **`mode`**：
+  * `"off"` *(默认)*：关闭报文转储。
+  * `"on_error"`：仅当 HTTP 请求失败（返回非 2xx 状态码或发生连接超时/网络故障）时转储。
+  * `"all"`：转储所有 HTTP 往返交互（包含 200 成功握手与失败报文）。
+* **`dump_dir`**：自定义转储目录。默认路径为 `<root_dir>/.phonebuddy/http_dumps/`。
+* **`mask_sensitive`**：是否对 `Authorization`、`x-api-key`、`cookie` 等敏感 Header 自动脱敏掩码。默认为 `true`。
+* **`max_files`**：保留的最大 Dump JSON 文件数量，超出自动按修改时间删除最旧文件（FIFO 轮转），防止占用手机存储。默认为 `30`。
+
+### 报错提示与 Dump JSON 格式：
+开启后，当触发网络或接口报错时，抛出的错误信息尾部会自动携带对应的 Dump 文件绝对路径：
+```text
+Completion error: Error: LLM request failed: status=500 { "error": ... } [HTTP dump: /data/user/0/com.example.app/files/sandbox/.phonebuddy/http_dumps/dump_20260821_211530_500_req_a1b2c3.json]
+```
+
+生成的 JSON 包含完整的上下文：
+```json
+{
+  "schema_version": "1.0",
+  "request_id": "req_a1b2c3d4",
+  "timestamp": "2026-08-21T21:15:30.123+08:00",
+  "duration_ms": 352,
+  "request": {
+    "method": "POST",
+    "url": "https://api.example.com/v1/chat/completions",
+    "headers": {
+      "accept": "text/event-stream",
+      "authorization": "Bearer sk-p***3456",
+      "content-type": "application/json"
+    },
+    "body": { "model": "grok-4", "messages": [...], "stream": true }
+  },
+  "response": {
+    "status": 502,
+    "status_text": "Bad Gateway",
+    "headers": {
+      "content-type": "text/html; charset=UTF-8",
+      "server": "nginx/1.22.1",
+      "x-gateway-trace-id": "gw-987654321"
+    },
+    "body_text": "<html><head><title>502 Bad Gateway</title></head><body>...</body></html>"
+  },
+  "error": "status=502 <html><head><title>502 Bad Gateway..."
+}
+```
 
 ---
 

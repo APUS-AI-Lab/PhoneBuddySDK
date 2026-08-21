@@ -59,7 +59,11 @@ impl LlmClient {
     }
 
     pub fn from_http(cfg: &EngineConfig) -> EngineResult<Self> {
-        let t = crate::llm::transport::HttpTransport::new_with_doom_loop_and_extra_body(
+        let dumper = crate::llm::dumper::HttpDumper::new(
+            cfg.http_dump.clone(),
+            cfg.http_dumps_dir(),
+        );
+        let t = crate::llm::transport::HttpTransport::new_with_all_options(
             &cfg.base_url,
             &cfg.api_key,
             Duration::from_secs(cfg.stream_idle_timeout_secs),
@@ -67,6 +71,7 @@ impl LlmClient {
             cfg.extra_headers.clone(),
             cfg.extra_body.clone(),
             cfg.doom_loop_check_enabled(),
+            dumper,
         )?;
         Ok(Self::new(Arc::new(t), cfg.max_retries))
     }
