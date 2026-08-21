@@ -10,7 +10,8 @@
 //! 4. Domain filtering (`allowed_domains`, `blocked_domains`).
 //! 5. Markdown hyperlink formatting `[Title](URL)` for easy source citations.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -26,6 +27,8 @@ pub const DDG_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
 pub const MAX_SEARCH_RESULTS: usize = 8;
 pub const MAX_SNIPPET_CHARS: usize = 350;
 pub const MAX_TOTAL_OUTPUT_CHARS: usize = 15_000;
+pub const DDG_COOLDOWN_DURATION: Duration = Duration::from_secs(300);
+pub const DDG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct WebSearchConfig {
@@ -41,6 +44,8 @@ pub struct WebSearchTool {
     client: reqwest::Client,
     config: WebSearchConfig,
     webview: Arc<WebViewHost>,
+    cooldown_until: Arc<Mutex<Option<Instant>>>,
+    probe_enabled: bool,
 }
 
 impl WebSearchTool {
@@ -62,7 +67,14 @@ impl WebSearchTool {
             client,
             config,
             webview,
+            cooldown_until: Arc::new(Mutex::new(None)),
+            probe_enabled: true,
         }
+    }
+
+    pub fn with_probe_enabled(mut self, enabled: bool) -> Self {
+        self.probe_enabled = enabled;
+        self
     }
 
     pub fn from_engine_config(cfg: &crate::config::EngineConfig) -> Self {
@@ -96,6 +108,65 @@ impl WebSearchTool {
             },
             webview,
         )
+    }
+
+    pub fn is_ddg_in_cooldown(&self) -> bool {
+        if let Ok(guard) = self.cooldown_until.lock() {
+            if let Some(until) = *guard {
+                if Instant::now() < until {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn trigger_ddg_cooldown(&self) {
+        if let Ok(mut guard) = self.cooldown_until.lock() {
+            *guard = Some(Instant::now() + DDG_COOLDOWN_DURATION);
+            tracing::info!(
+                "[web_search] DuckDuckGo marked unreachable. Cooldown activated for {} seconds.",
+                DDG_COOLDOWN_DURATION.as_secs()
+            );
+        }
+    }
+
+    pub fn clear_ddg_cooldown(&self) {
+        if let Ok(mut guard) = self.cooldown_until.lock() {
+            if guard.is_some() {
+                *guard = None;
+                tracing::info!("[web_search] DuckDuckGo cooldown cleared.");
+            }
+        }
+    }
+
+    /// Fast probe to test if DuckDuckGo server is reachable at network/TLS level.
+    async fn probe_ddg_connectivity(&self, cancel: &tokio_util::sync::CancellationToken) -> bool {
+        let probe_fut = self
+            .client
+            .get(DDG_LITE_URL)
+            .timeout(DDG_PROBE_TIMEOUT)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+            )
+            .send();
+
+        tokio::select! {
+            _ = cancel.cancelled() => false,
+            res = probe_fut => {
+                match res {
+                    Ok(_) => {
+                        tracing::debug!("[web_search] DuckDuckGo connectivity probe succeeded");
+                        true
+                    }
+                    Err(err) => {
+                        tracing::warn!("[web_search] DuckDuckGo connectivity probe failed: {err}");
+                        false
+                    }
+                }
+            }
+        }
     }
 
     /// Primary search on mobile: DuckDuckGo Lite via the host system WebView.
@@ -493,29 +564,54 @@ impl Tool for WebSearchTool {
         }
 
         // Unified search pipeline:
-        // 1. Mobile: host system WebView (WKWebView / Android WebView).
+        // 1. Mobile: host system WebView (WKWebView / Android WebView) with DuckDuckGo Lite.
+        //    - First checks if DuckDuckGo is in memory cooldown.
+        //    - If not in cooldown, performs a fast connectivity probe (5s) to avoid WebView timeouts.
         // 2. Desktop / C hosts: skip scraping.
         // 3. Fallback: configured LLM search API.
         let webview_err = if self.webview.is_available() {
-            tracing::info!(
-                "[web_search] Attempting search via host Headless WebView (DuckDuckGo Lite): query='{query}'"
-            );
-            match self
-                .search_via_webview(&query, &allowed_domains, &blocked_domains, _ctx)
-                .await
-            {
-                Ok(results) => {
+            if self.is_ddg_in_cooldown() {
+                tracing::info!(
+                    "[web_search] DuckDuckGo is in cooldown (recently unreachable); skipping WebView for query '{query}'"
+                );
+                Some("DuckDuckGo search connection failed".to_string())
+            } else {
+                let reachable = if self.probe_enabled {
                     tracing::info!(
-                        "[web_search] Host Headless WebView DuckDuckGo search succeeded for query='{query}', result_len={}",
-                        results.len()
+                        "[web_search] Probing DuckDuckGo connectivity before WebView search: query='{query}'"
                     );
-                    return Ok(ToolOutput::new(results));
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "[web_search] Host WebView search failed for query '{query}': {err}; attempting LLM API fallback"
+                    self.probe_ddg_connectivity(&_ctx.cancel).await
+                } else {
+                    true
+                };
+
+                if !reachable {
+                    self.trigger_ddg_cooldown();
+                    Some("DuckDuckGo search connection failed".to_string())
+                } else {
+                    tracing::info!(
+                        "[web_search] Attempting search via host Headless WebView (DuckDuckGo Lite): query='{query}'"
                     );
-                    Some(err)
+                    match self
+                        .search_via_webview(&query, &allowed_domains, &blocked_domains, _ctx)
+                        .await
+                    {
+                        Ok(results) => {
+                            self.clear_ddg_cooldown();
+                            tracing::info!(
+                                "[web_search] Host Headless WebView DuckDuckGo search succeeded for query='{query}', result_len={}",
+                                results.len()
+                            );
+                            return Ok(ToolOutput::new(results));
+                        }
+                        Err(err) => {
+                            self.trigger_ddg_cooldown();
+                            tracing::warn!(
+                                "[web_search] Host WebView search failed for query '{query}': {err}; attempting LLM API fallback"
+                            );
+                            Some("DuckDuckGo search connection failed".to_string())
+                        }
+                    }
                 }
             }
         } else {
@@ -543,9 +639,9 @@ impl Tool for WebSearchTool {
                     "[web_search] LLM search fallback ({backend_name}) succeeded for query='{query}', result_len={}",
                     resp_results.len()
                 );
-                if let Some(err) = webview_err {
+                if webview_err.is_some() {
                     let notice = format!(
-                        "[Notice: system WebView search failed ({err}). Retrieved results via LLM {backend_name} fallback]\n\n{resp_results}"
+                        "[Notice: DuckDuckGo search connection failed]\n\n{resp_results}"
                     );
                     Ok(ToolOutput::new(notice))
                 } else {
@@ -557,7 +653,7 @@ impl Tool for WebSearchTool {
                     "[web_search] LLM search fallback ({backend_name}) failed for query='{query}': {resp_err}"
                 );
                 let ddg_line = match webview_err {
-                    Some(err) => format!("1. System WebView: {err}\n"),
+                    Some(err) => format!("1. DuckDuckGo: {err}\n"),
                     None => {
                         "1. System WebView: not available on this host (skipped)\n".to_string()
                     }
@@ -1014,7 +1110,8 @@ mod tests {
             });
         }));
 
-        let tool = WebSearchTool::with_config_and_webview(WebSearchConfig::default(), webview);
+        let tool = WebSearchTool::with_config_and_webview(WebSearchConfig::default(), webview)
+            .with_probe_enabled(false);
         let ctx = ToolCtx {
             sandbox: Arc::new(crate::tools::fs::Sandbox::new(std::path::Path::new("/tmp")).unwrap()),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -1026,5 +1123,58 @@ mod tests {
         assert!(res.text.contains("via DuckDuckGo WebView"));
         assert!(res.text.contains("The Rust Book"));
         assert!(res.text.contains("https://doc.rust-lang.org"));
+        assert!(!tool.is_ddg_in_cooldown());
+    }
+
+    #[tokio::test]
+    async fn test_web_search_cooldown_skips_webview_and_formats_notice() {
+        let webview = WebViewHost::new();
+        let webview_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let webview_called_c = webview_called.clone();
+        webview.set_notify(Arc::new(move |_call_id, _req| {
+            webview_called_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let tool = WebSearchTool::with_config_and_webview(WebSearchConfig::default(), webview)
+            .with_probe_enabled(false);
+
+        // Manually trigger cooldown (e.g. following previous connectivity failure)
+        tool.trigger_ddg_cooldown();
+        assert!(tool.is_ddg_in_cooldown());
+
+        let ctx = ToolCtx {
+            sandbox: Arc::new(crate::tools::fs::Sandbox::new(std::path::Path::new("/tmp")).unwrap()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let res = tool
+            .execute(serde_json::json!({ "query": "latest news" }), &ctx)
+            .await
+            .unwrap();
+
+        // Host WebView should NOT be called during active cooldown
+        assert!(
+            !webview_called.load(std::sync::atomic::Ordering::SeqCst),
+            "WebView should have been skipped during active cooldown"
+        );
+
+        // Fallback error should report DuckDuckGo failure cleanly
+        assert!(res.text.contains("DuckDuckGo: DuckDuckGo search connection failed"));
+
+        // Clear cooldown
+        tool.clear_ddg_cooldown();
+        assert!(!tool.is_ddg_in_cooldown());
+    }
+
+    #[tokio::test]
+    async fn test_web_search_cooldown_lifecycle() {
+        let tool = WebSearchTool::new();
+        assert!(!tool.is_ddg_in_cooldown());
+
+        tool.trigger_ddg_cooldown();
+        assert!(tool.is_ddg_in_cooldown());
+
+        tool.clear_ddg_cooldown();
+        assert!(!tool.is_ddg_in_cooldown());
     }
 }
