@@ -544,11 +544,24 @@ impl PhoneBuddyEngine {
                     return Err(EngineError::Cancelled);
                 }
                 let name = call.function.name.clone();
-                observer.on_event(AgentEvent::ToolCallStart {
-                    call_id: call.id.clone(),
-                    name: name.clone(),
-                    arguments_json: call.function.arguments.clone(),
-                });
+                // ToolCallStart is emitted from collect_stream when the
+                // model first names the call. Re-emitting here doubled
+                // every tool in the UI (and e2e) with the fully assembled
+                // arguments, including any snapshot concatenation bug.
+
+                // Server-side Responses tools (web_search_call, computer_call,
+                // …) already ran in the provider. Surface them to the UI but
+                // do not try to execute them locally or feed a fake result
+                // back to the model.
+                if call.kind == "server" {
+                    observer.on_event(AgentEvent::ToolCallResult {
+                        call_id: call.id.clone(),
+                        name: name.clone(),
+                        ok: true,
+                        output: call.function.arguments.clone(),
+                    });
+                    continue;
+                }
 
                 let output = tokio::select! {
                     _ = token.cancelled() => {

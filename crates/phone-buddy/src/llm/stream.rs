@@ -27,8 +27,12 @@ pub async fn collect_stream(
     let mut turn = CollectedTurn::default();
 
     // Tool-call accumulators keyed by positional index:
-    // (id, name, arguments_buffer). Mirrors grok's `tool_call_acc`.
-    let mut tool_call_acc: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    // (id, name, arguments_buffer, kind). Mirrors grok's `tool_call_acc`.
+    // `id_to_idx` merges Responses events that share `call_id` but
+    // disagree on `output_index` (arguments.delta often omits it).
+    let mut tool_call_acc: BTreeMap<u32, (String, String, String, String)> = BTreeMap::new();
+    let mut id_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(next) = stream.next().await {
         let chunk = next?;
@@ -67,16 +71,52 @@ pub async fn collect_stream(
             }
 
             for tc in &delta.tool_calls {
-                let entry = tool_call_acc.entry(tc.index).or_default();
+                let idx = if let Some(id) = &tc.id {
+                    if !id.is_empty() {
+                        *id_to_idx.entry(id.clone()).or_insert(tc.index)
+                    } else {
+                        tc.index
+                    }
+                } else {
+                    tc.index
+                };
+                let entry = tool_call_acc.entry(idx).or_default();
                 if let Some(id) = &tc.id {
-                    entry.0 = id.clone();
+                    if !id.is_empty() {
+                        entry.0 = id.clone();
+                    }
+                }
+                if let Some(kind) = &tc.kind {
+                    if !kind.is_empty() {
+                        entry.3 = kind.clone();
+                    }
                 }
                 if let Some(f) = &tc.function {
                     if let Some(name) = &f.name {
-                        entry.1 = name.clone();
+                        if !name.is_empty() {
+                            entry.1 = name.clone();
+                        }
                     }
                     if let Some(args) = &f.arguments {
-                        entry.2.push_str(args);
+                        append_tool_argument_fragment(&mut entry.2, args);
+                    }
+                }
+                if !entry.1.is_empty() {
+                    let call_id = if entry.0.is_empty() {
+                        format!("idx_{idx}")
+                    } else {
+                        entry.0.clone()
+                    };
+                    if started.insert(call_id.clone()) {
+                        observer.on_event(AgentEvent::ToolCallStart {
+                            call_id,
+                            name: entry.1.clone(),
+                            arguments_json: if entry.2.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                entry.2.clone()
+                            },
+                        });
                     }
                 }
             }
@@ -84,7 +124,7 @@ pub async fn collect_stream(
     }
 
     // Assemble tool calls in index order.
-    for (id, name, arguments) in tool_call_acc.into_values() {
+    for (id, name, arguments, kind) in tool_call_acc.into_values() {
         if name.is_empty() {
             continue;
         }
@@ -95,7 +135,11 @@ pub async fn collect_stream(
             } else {
                 id
             },
-            kind: "function".to_string(),
+            kind: if kind.is_empty() {
+                "function".to_string()
+            } else {
+                kind
+            },
             function: ToolCallFunction {
                 name,
                 arguments: if arguments.trim().is_empty() {
@@ -122,6 +166,36 @@ pub async fn collect_stream(
     Ok(turn)
 }
 
+fn is_complete_json(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+}
+
+/// Accumulate a tool-call argument fragment.
+///
+/// grok-build streams `function_call_arguments.delta` fragments and
+/// *ignores* the later full snapshot (`function_call_arguments.done` /
+/// `output_item.done`). PhoneBuddy's Responses parser used to feed both
+/// into this buffer; `push_str` of a complete JSON onto a complete JSON
+/// is exactly `{...}{...}`, which then fails with
+/// `invalid JSON arguments: trailing characters`.
+fn append_tool_argument_fragment(buffer: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    if buffer.is_empty() {
+        buffer.push_str(incoming);
+        return;
+    }
+    if is_complete_json(buffer) && is_complete_json(incoming) {
+        return;
+    }
+    buffer.push_str(incoming);
+}
+
 /// Parse one SSE `data:` payload into a chunk. `[DONE]` terminator yields
 /// `None`.
 pub fn parse_chunk(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
@@ -136,6 +210,113 @@ pub fn parse_chunk(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
         return Ok(None);
     }
     Ok(Some(chunk))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::NullObserver;
+    use crate::llm::types::{
+        ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ToolCallDelta,
+        ToolCallFunctionDelta,
+    };
+    use futures_util::stream;
+
+    fn chunk_with_tool(tc: ToolCallDelta) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatChunkDelta {
+                    tool_calls: vec![tc],
+                    ..Default::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    fn tc(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> ToolCallDelta {
+        ToolCallDelta {
+            index,
+            id: id.map(str::to_string),
+            kind: Some("function".into()),
+            function: Some(ToolCallFunctionDelta {
+                name: name.map(str::to_string),
+                arguments: arguments.map(str::to_string),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn argument_fragments_concatenate() {
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("nav"),
+                Some("browser_navigate"),
+                Some("{\"url\":"),
+            ))),
+            Ok(chunk_with_tool(tc(0, None, None, Some("\"https://news.cctv.com/\"}")))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(
+            turn.tool_calls[0].function.arguments,
+            "{\"url\":\"https://news.cctv.com/\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_json_snapshot_is_not_appended_onto_the_same_json() {
+        // Hermes Responses: a complete arguments delta followed by
+        // function_call_arguments.done / output_item.done carrying the
+        // same snapshot. grok-build ignores the snapshot; appending it
+        // produces `{...}{...}` and the tool dies with trailing characters.
+        let json = r#"{"url": "https://news.cctv.com/"}"#;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("nav"),
+                Some("browser_navigate"),
+                Some(json),
+            ))),
+            Ok(chunk_with_tool(tc(0, Some("nav"), Some("browser_navigate"), Some(json)))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
+
+    #[tokio::test]
+    async fn snapshot_fills_buffer_when_no_deltas_arrived() {
+        let json = r#"{"direction": "down"}"#;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("scroll"),
+                Some("browser_scroll"),
+                Some(""),
+            ))),
+            Ok(chunk_with_tool(tc(0, Some("scroll"), None, Some(json)))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
 }
 
 #[allow(dead_code)]

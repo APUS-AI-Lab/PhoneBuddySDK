@@ -602,6 +602,87 @@ fn build_messages_payload(req: &ChatCompletionRequest) -> serde_json::Value {
     payload
 }
 
+fn output_index_of(v: &serde_json::Value) -> u32 {
+    v.get("output_index")
+        .or_else(|| v.get("index"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0) as u32
+}
+
+/// Map a Responses `output_item` that represents a tool (client function
+/// call or a server-side built-in such as `web_search_call`) into a
+/// `ToolCallDelta` so the rest of the engine can surface it to the UI.
+fn tool_delta_from_output_item(
+    item: &serde_json::Value,
+    fallback_index: u32,
+) -> Option<ToolCallDelta> {
+    let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
+    match item_type {
+        "function_call" => {
+            let id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let name = item
+                .get("name")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let args = item
+                .get("arguments")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            Some(ToolCallDelta {
+                index: fallback_index,
+                id,
+                kind: Some("function".to_string()),
+                function: Some(ToolCallFunctionDelta { name, arguments: args }),
+            })
+        }
+        "web_search_call" | "file_search_call" | "computer_call" | "mcp_call"
+        | "image_generation_call" | "code_interpreter_call" => {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let name = match item_type {
+                "web_search_call" => "web_search",
+                "file_search_call" => "file_search",
+                "computer_call" => "computer",
+                "mcp_call" => item
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("mcp"),
+                "image_generation_call" => "image_generation",
+                "code_interpreter_call" => "code_interpreter",
+                other => other,
+            }
+            .to_string();
+            let args = item
+                .get("action")
+                .or_else(|| item.get("arguments"))
+                .map(|a| {
+                    if let Some(s) = a.as_str() {
+                        s.to_string()
+                    } else {
+                        a.to_string()
+                    }
+                });
+            Some(ToolCallDelta {
+                index: fallback_index,
+                id,
+                kind: Some("server".to_string()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some(name),
+                    arguments: args,
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
     let raw = data.trim();
     if raw.is_empty() || raw == "[DONE]" {
@@ -639,21 +720,42 @@ fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<Ch
     } else if type_str.contains("function_call_arguments.delta")
         || json_type.contains("function_call_arguments.delta")
     {
+        // grok-build: only `ResponseFunctionCallArgumentsDelta` is
+        // appended. `.done` is a full-JSON snapshot of the same buffer
+        // and must not be concatenated (that produced `{...}{...}`).
+        // The function *name* lives on `output_item.added`;
+        // `output_index` / `call_id` let collect_stream merge them.
         let id = v.get("call_id").or_else(|| v.get("item_id")).and_then(|s| s.as_str()).map(|s| s.to_string());
         let name = v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
-        let args = v.get("delta").or_else(|| v.get("arguments")).and_then(|s| s.as_str()).map(|s| s.to_string());
+        let args = v.get("delta").and_then(|s| s.as_str()).map(|s| s.to_string());
         delta.tool_calls.push(ToolCallDelta {
-            index: 0,
+            index: output_index_of(&v),
             id,
             kind: Some("function".to_string()),
             function: Some(ToolCallFunctionDelta { name, arguments: args }),
         });
     } else if let Some(item) = v.get("item").or_else(|| v.get("reasoning")) {
-        if item.get("type").and_then(|s| s.as_str()) == Some("reasoning") {
+        let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
+        if item_type == "reasoning" {
             if let Ok(ri) = serde_json::from_value::<crate::llm::types::ReasoningItem>(item.clone()) {
                 delta.encrypted_reasoning = ri.encrypted_content.clone();
                 delta.reasoning_items.push(ri);
             }
+        } else if let Some(mut tc) = tool_delta_from_output_item(item, output_index_of(&v)) {
+            // grok-build: `ResponseOutputItemAdded(FunctionCall)` emits
+            // id+name only (`arguments_delta: None`). Arguments arrive
+            // via `.delta` fragments; `output_item.done` may carry a
+            // snapshot used only if the buffer is still empty.
+            // Server-side tools (`web_search_call`, …) keep `action` on
+            // added — that is the only payload they have.
+            let is_added = type_str.contains("output_item.added")
+                || json_type.contains("output_item.added");
+            if is_added && tc.kind.as_deref() == Some("function") {
+                if let Some(f) = tc.function.as_mut() {
+                    f.arguments = None;
+                }
+            }
+            delta.tool_calls.push(tc);
         }
     } else if let Some(output) = v.get("output").or_else(|| v.get("response").and_then(|r| r.get("output"))).and_then(|o| o.as_array()) {
         for item in output {
@@ -1172,6 +1274,120 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.encrypted_reasoning.as_deref(), Some("enc_secret"));
         assert_eq!(chunk.choices[0].delta.reasoning_items.len(), 1);
         assert_eq!(chunk.choices[0].delta.reasoning_items[0].id, "r_123");
+    }
+
+    #[test]
+    fn test_responses_chunk_parses_function_call_output_item() {
+        let added = r#"{
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "c0",
+                "name": "web_fetch",
+                "arguments": ""
+            }
+        }"#;
+        let chunk = parse_responses_chunk("response.output_item.added", added)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.index, 1);
+        assert_eq!(tc.id.as_deref(), Some("c0"));
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("web_fetch")
+        );
+
+        let done = r#"{
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "c0",
+                "name": "web_fetch",
+                "arguments": "{\"url\":\"https://news.sina.com.cn\"}"
+            }
+        }"#;
+        let chunk = parse_responses_chunk("response.output_item.done", done)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            Some("{\"url\":\"https://news.sina.com.cn\"}")
+        );
+    }
+
+    #[test]
+    fn test_responses_chunk_parses_web_search_call_item() {
+        let added = r#"{
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "action": {"query": "today news"}
+            }
+        }"#;
+        let chunk = parse_responses_chunk("response.output_item.added", added)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.index, 2);
+        assert_eq!(tc.id.as_deref(), Some("ws_1"));
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("web_search")
+        );
+        assert!(tc
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_ref())
+            .unwrap()
+            .contains("today news"));
+    }
+
+    #[test]
+    fn test_responses_function_call_arguments_done_is_ignored() {
+        // grok-build drops ResponseFunctionCallArgumentsDone: the full
+        // JSON is a snapshot of already-streamed deltas. Treating it as
+        // another fragment concatenates `{...}{...}`.
+        let done = r#"{
+            "type": "response.function_call_arguments.done",
+            "output_index": 1,
+            "call_id": "nav",
+            "arguments": "{\"url\": \"https://news.cctv.com/\"}"
+        }"#;
+        let chunk = parse_responses_chunk("response.function_call_arguments.done", done).unwrap();
+        assert!(
+            chunk.is_none()
+                || chunk
+                    .as_ref()
+                    .map(|c| c.choices[0].delta.tool_calls.is_empty())
+                    .unwrap_or(true),
+            "function_call_arguments.done must not be appended as a delta"
+        );
+    }
+
+    #[test]
+    fn test_responses_function_call_arguments_delta_uses_output_index() {
+        let delta = r#"{
+            "type": "response.function_call_arguments.delta",
+            "output_index": 3,
+            "call_id": "c2",
+            "delta": "{\"q\":"
+        }"#;
+        let chunk = parse_responses_chunk("response.function_call_arguments.delta", delta)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.index, 3);
+        assert_eq!(tc.id.as_deref(), Some("c2"));
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            Some("{\"q\":")
+        );
     }
 
     #[test]
