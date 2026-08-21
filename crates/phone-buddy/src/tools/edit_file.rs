@@ -226,3 +226,145 @@ impl Tool for EditFileTool {
 pub fn arc() -> Arc<dyn Tool> {
     Arc::new(EditFileTool)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_ctx() -> (tempfile::TempDir, ToolCtx) {
+        let dir = tempdir().unwrap();
+        let sandbox = Arc::new(crate::tools::fs::Sandbox::new(dir.path()).unwrap());
+        let ctx = ToolCtx {
+            sandbox,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_create_and_exact_replace() {
+        let (dir, ctx) = make_ctx();
+        let tool = EditFileTool;
+
+        // 1. Create file when old_string is empty
+        let res_create = tool
+            .execute(
+                serde_json::json!({
+                    "path": "hello.txt",
+                    "old_string": "",
+                    "new_string": "first line\nsecond line\nthird line\n"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_create.text.contains("Created"));
+        assert!(dir.path().join("hello.txt").exists());
+
+        // 2. Fail if empty old_string targets existing non-empty file
+        let res_exist = tool
+            .execute(
+                serde_json::json!({
+                    "path": "hello.txt",
+                    "old_string": "",
+                    "new_string": "overwrite"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res_exist.is_err());
+
+        // 3. Exact single replacement
+        let res_replace = tool
+            .execute(
+                serde_json::json!({
+                    "path": "hello.txt",
+                    "old_string": "second line",
+                    "new_string": "updated second line"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_replace.text.contains("Replaced 1 occurrence"));
+        let updated = std::fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+        assert!(updated.contains("updated second line"));
+
+        // 4. Reject old_string == new_string
+        let res_same = tool
+            .execute(
+                serde_json::json!({
+                    "path": "hello.txt",
+                    "old_string": "first line",
+                    "new_string": "first line"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res_same.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_replace_all_and_duplicates() {
+        let (dir, ctx) = make_ctx();
+        let tool = EditFileTool;
+
+        std::fs::write(dir.path().join("multi.txt"), "foo\nbar\nfoo\nbaz\n").unwrap();
+
+        // 1. Multiple occurrences without replace_all -> error
+        let res_err = tool
+            .execute(
+                serde_json::json!({
+                    "path": "multi.txt",
+                    "old_string": "foo",
+                    "new_string": "qux"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res_err.is_err());
+
+        // 2. Multiple occurrences with replace_all -> success
+        let res_ok = tool
+            .execute(
+                serde_json::json!({
+                    "path": "multi.txt",
+                    "old_string": "foo",
+                    "new_string": "qux",
+                    "replace_all": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_ok.text.contains("Replaced 2 occurrence(s)"));
+        let content = std::fs::read_to_string(dir.path().join("multi.txt")).unwrap();
+        assert_eq!(content, "qux\nbar\nqux\nbaz\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_confusables_and_whitespace_fallback() {
+        let (dir, ctx) = make_ctx();
+        let tool = EditFileTool;
+
+        // Smart quotes in file
+        std::fs::write(dir.path().join("quote.txt"), "“hello world”").unwrap();
+
+        // Pass ASCII straight quotes "hello world"
+        let res = tool
+            .execute(
+                serde_json::json!({
+                    "path": "quote.txt",
+                    "old_string": "\"hello world\"",
+                    "new_string": "\"greetings\""
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res.text.contains("Replaced 1 occurrence"));
+        let content = std::fs::read_to_string(dir.path().join("quote.txt")).unwrap();
+        assert_eq!(content, "\"greetings\"");
+    }
+}

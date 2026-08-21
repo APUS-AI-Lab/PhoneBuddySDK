@@ -474,3 +474,312 @@ fn applet_du(argv: &[String], ctx: &ToolCtx) -> EngineResult<ToolOutput> {
 pub fn arc() -> Arc<dyn Tool> {
     Arc::new(BusyboxTool)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_ctx() -> (tempfile::TempDir, ToolCtx) {
+        let dir = tempdir().unwrap();
+        let sandbox = Arc::new(crate::tools::fs::Sandbox::new(dir.path()).unwrap());
+        let ctx = ToolCtx {
+            sandbox,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn test_busybox_ls_and_cat() {
+        let (dir, ctx) = make_ctx();
+        let tool = BusyboxTool;
+
+        std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        // ls
+        let res = tool
+            .execute(serde_json::json!({"applet": "ls", "args": ["."]}), &ctx)
+            .await
+            .unwrap();
+        assert!(res.text.contains("a.txt"));
+        assert!(res.text.contains("subdir/"));
+
+        // ls -l
+        let res_l = tool
+            .execute(serde_json::json!({"applet": "ls", "args": ["-l", "."]}), &ctx)
+            .await
+            .unwrap();
+        assert!(res_l.text.contains("a.txt"));
+
+        // cat
+        let res_cat = tool
+            .execute(serde_json::json!({"applet": "cat", "args": ["a.txt"]}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(res_cat.text, "hello world\n");
+
+        // cat binary file error
+        std::fs::write(dir.path().join("bin.dat"), [0, 158, 255, 0]).unwrap();
+        let res_bin = tool
+            .execute(serde_json::json!({"applet": "cat", "args": ["bin.dat"]}), &ctx)
+            .await;
+        assert!(res_bin.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_busybox_head_tail_wc() {
+        let (dir, ctx) = make_ctx();
+        let tool = BusyboxTool;
+
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        std::fs::write(dir.path().join("lines.txt"), content).unwrap();
+
+        // head -n 2
+        let res_head = tool
+            .execute(
+                serde_json::json!({"applet": "head", "args": ["-n", "2", "lines.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_head.text, "line1\nline2");
+
+        // head -n2 attached flag
+        let res_head2 = tool
+            .execute(
+                serde_json::json!({"applet": "head", "args": ["-n2", "lines.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_head2.text, "line1\nline2");
+
+        // tail -n 2
+        let res_tail = tool
+            .execute(
+                serde_json::json!({"applet": "tail", "args": ["-n", "2", "lines.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_tail.text, "line4\nline5");
+
+        // wc
+        let res_wc = tool
+            .execute(
+                serde_json::json!({"applet": "wc", "args": ["-l", "lines.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_wc.text.contains("5"));
+    }
+
+    #[tokio::test]
+    async fn test_busybox_sort_uniq() {
+        let (dir, ctx) = make_ctx();
+        let tool = BusyboxTool;
+
+        let content = "banana\napple\nbanana\ncherry\n";
+        std::fs::write(dir.path().join("fruits.txt"), content).unwrap();
+
+        // sort
+        let res_sort = tool
+            .execute(
+                serde_json::json!({"applet": "sort", "args": ["fruits.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let lines: Vec<&str> = res_sort.text.lines().collect();
+        assert_eq!(lines, vec!["apple", "banana", "banana", "cherry"]);
+
+        // sort -r
+        let res_sort_r = tool
+            .execute(
+                serde_json::json!({"applet": "sort", "args": ["-r", "fruits.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let lines_r: Vec<&str> = res_sort_r.text.lines().collect();
+        assert_eq!(lines_r, vec!["cherry", "banana", "banana", "apple"]);
+
+        // sort -u
+        let res_sort_u = tool
+            .execute(
+                serde_json::json!({"applet": "sort", "args": ["-u", "fruits.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let lines_u: Vec<&str> = res_sort_u.text.lines().collect();
+        assert_eq!(lines_u, vec!["apple", "banana", "cherry"]);
+
+        // uniq
+        let uniq_content = "a\na\nb\nc\nc\n";
+        std::fs::write(dir.path().join("uniq.txt"), uniq_content).unwrap();
+        let res_uniq = tool
+            .execute(
+                serde_json::json!({"applet": "uniq", "args": ["uniq.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_uniq.text, "a\nb\nc");
+
+        // uniq -c
+        let res_uniq_c = tool
+            .execute(
+                serde_json::json!({"applet": "uniq", "args": ["-c", "uniq.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_uniq_c.text.contains("2 a"));
+        assert!(res_uniq_c.text.contains("1 b"));
+        assert!(res_uniq_c.text.contains("2 c"));
+    }
+
+    #[tokio::test]
+    async fn test_busybox_find_mkdir_cp_mv_rm_touch_du() {
+        let (dir, ctx) = make_ctx();
+        let tool = BusyboxTool;
+
+        // mkdir
+        tool.execute(
+            serde_json::json!({"applet": "mkdir", "args": ["nested/dir"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("nested/dir").is_dir());
+
+        // touch
+        tool.execute(
+            serde_json::json!({"applet": "touch", "args": ["nested/dir/file.txt"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("nested/dir/file.txt").is_file());
+
+        // cp
+        tool.execute(
+            serde_json::json!({"applet": "cp", "args": ["nested/dir/file.txt", "copied.txt"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("copied.txt").is_file());
+
+        // mv
+        tool.execute(
+            serde_json::json!({"applet": "mv", "args": ["copied.txt", "moved.txt"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("copied.txt").exists());
+        assert!(dir.path().join("moved.txt").is_file());
+
+        // find
+        let res_find = tool
+            .execute(
+                serde_json::json!({"applet": "find", "args": [".", "-name", "*.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(res_find.text.contains("moved.txt"));
+        assert!(res_find.text.contains("file.txt"));
+
+        // du
+        let res_du = tool
+            .execute(serde_json::json!({"applet": "du", "args": ["."]}), &ctx)
+            .await
+            .unwrap();
+        assert!(res_du.text.contains("(total)"));
+
+        // rm
+        tool.execute(
+            serde_json::json!({"applet": "rm", "args": ["moved.txt"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("moved.txt").exists());
+
+        // rm -r
+        tool.execute(
+            serde_json::json!({"applet": "rm", "args": ["-r", "nested"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("nested").exists());
+
+        // rm sandbox root rejected
+        let rm_root = tool
+            .execute(
+                serde_json::json!({"applet": "rm", "args": ["-r", "."]}),
+                &ctx,
+            )
+            .await;
+        assert!(rm_root.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_busybox_misc_applets() {
+        let (dir, ctx) = make_ctx();
+        let tool = BusyboxTool;
+
+        // echo
+        let res_echo = tool
+            .execute(
+                serde_json::json!({"applet": "echo", "args": ["hello", "world"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_echo.text, "hello world");
+
+        // pwd
+        let res_pwd = tool
+            .execute(serde_json::json!({"applet": "pwd", "args": []}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(res_pwd.text, ctx.sandbox.root().display().to_string());
+
+        // basename
+        let res_base = tool
+            .execute(
+                serde_json::json!({"applet": "basename", "args": ["foo/bar/baz.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_base.text, "baz.txt");
+
+        // dirname
+        let res_dir = tool
+            .execute(
+                serde_json::json!({"applet": "dirname", "args": ["foo/bar/baz.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_dir.text, "foo/bar");
+
+        // unknown applet
+        let res_unknown = tool
+            .execute(
+                serde_json::json!({"applet": "invalid_applet", "args": []}),
+                &ctx,
+            )
+            .await;
+        assert!(res_unknown.is_err());
+    }
+}

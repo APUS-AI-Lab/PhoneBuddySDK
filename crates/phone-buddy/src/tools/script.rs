@@ -304,3 +304,94 @@ fn js_error_msg(msg: String) -> JsError {
 pub fn arc() -> Arc<dyn Tool> {
     Arc::new(RunScriptTool)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_ctx() -> (tempfile::TempDir, ToolCtx) {
+        let dir = tempdir().unwrap();
+        let sandbox = Arc::new(crate::tools::fs::Sandbox::new(dir.path()).unwrap());
+        let ctx = ToolCtx {
+            sandbox,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn test_script_basic_eval_and_console() {
+        let (_dir, ctx) = make_ctx();
+        let tool = RunScriptTool;
+
+        let code = "console.log('computed:', 6 * 7); console.info('info message'); console.warn('warning'); console.error('err'); 42;";
+        let res = tool
+            .execute(serde_json::json!({"code": code}), &ctx)
+            .await
+            .unwrap();
+        assert!(res.text.contains("computed: 42"));
+        assert!(res.text.contains("info message"));
+        assert!(res.text.contains("[warn] warning"));
+        assert!(res.text.contains("[error] err"));
+        assert!(res.text.contains("[result] 42"));
+    }
+
+    #[tokio::test]
+    async fn test_script_sandbox_fs_api() {
+        let (dir, ctx) = make_ctx();
+        let tool = RunScriptTool;
+
+        let code = r#"
+            writeFile('data/out.txt', 'hello from js');
+            let files = listDir('data');
+            let content = readFile('data/out.txt');
+            console.log('read:', content);
+            console.log('files:', JSON.stringify(files));
+        "#;
+        let res = tool
+            .execute(serde_json::json!({"code": code}), &ctx)
+            .await
+            .unwrap();
+        assert!(res.text.contains("read: hello from js"));
+        assert!(res.text.contains("out.txt"));
+        assert!(dir.path().join("data/out.txt").exists());
+
+        // Escape attempt via readFile is blocked
+        let escape_code = "readFile('../../../etc/passwd');";
+        let res_err = tool
+            .execute(serde_json::json!({"code": escape_code}), &ctx)
+            .await;
+        assert!(res_err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_script_errors_and_limits() {
+        let (_dir, ctx) = make_ctx();
+        let tool = RunScriptTool;
+
+        // Syntax error
+        let syntax_err = tool
+            .execute(serde_json::json!({"code": "const a = ;"}), &ctx)
+            .await;
+        assert!(syntax_err.is_err());
+
+        // Runtime exception
+        let runtime_err = tool
+            .execute(serde_json::json!({"code": "throw new Error('boom');"}), &ctx)
+            .await;
+        assert!(runtime_err.is_err());
+        match runtime_err.unwrap_err() {
+            EngineError::Script(msg) => assert!(msg.contains("boom")),
+            other => panic!("expected EngineError::Script, got {other:?}"),
+        }
+
+        // Max output truncation
+        let long_code = "console.log('x'.repeat(40000));";
+        let res_trunc = tool
+            .execute(serde_json::json!({"code": long_code}), &ctx)
+            .await
+            .unwrap();
+        assert!(res_trunc.text.contains("[... truncated"));
+    }
+}

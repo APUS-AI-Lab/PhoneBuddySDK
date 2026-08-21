@@ -912,5 +912,223 @@ pub mod android_jni {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_pb_string_free() {
+        unsafe {
+            // Null pointer is safe
+            pb_string_free(std::ptr::null_mut());
+
+            // Valid pointer is freed safely
+            let s = CString::new("test string").unwrap();
+            let raw = s.into_raw();
+            pb_string_free(raw);
+        }
+    }
+
+    #[test]
+    fn test_pb_engine_lifecycle_and_config() {
+        let dir = tempdir().unwrap();
+        let cfg_json = format!(
+            r#"{{
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+                "model": "gpt-4o",
+                "root_dir": "{}"
+            }}"#,
+            dir.path().display()
+        );
+
+        unsafe {
+            // 1. Null engine free is safe
+            pb_engine_free(std::ptr::null_mut());
+
+            // 2. Null config JSON
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let eng_null = pb_engine_new(std::ptr::null(), &mut err);
+            assert!(eng_null.is_null());
+            assert!(!err.is_null());
+            pb_string_free(err);
+
+            // 3. Invalid config JSON
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let invalid_c = CString::new("{invalid json").unwrap();
+            let eng_invalid = pb_engine_new(invalid_c.as_ptr(), &mut err);
+            assert!(eng_invalid.is_null());
+            assert!(!err.is_null());
+            pb_string_free(err);
+
+            // 4. Valid config JSON
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let valid_c = CString::new(cfg_json).unwrap();
+            let engine = pb_engine_new(valid_c.as_ptr(), &mut err);
+            assert!(!engine.is_null());
+            assert!(err.is_null());
+
+            // 5. Config setters
+            let name_c = CString::new("MobilePal").unwrap();
+            pb_engine_set_agent_name(engine, name_c.as_ptr());
+            pb_engine_set_agent_name(engine, std::ptr::null());
+
+            let extra_c = CString::new("Be extremely concise.").unwrap();
+            pb_engine_set_system_prompt_extra(engine, extra_c.as_ptr());
+            pb_engine_set_system_prompt_extra(engine, std::ptr::null());
+
+            // 6. Session APIs
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let list_ptr = pb_engine_list_sessions(engine, &mut err);
+            assert!(!list_ptr.is_null());
+            assert!(err.is_null());
+            let list_str = CStr::from_ptr(list_ptr).to_str().unwrap();
+            assert_eq!(list_str, "[]");
+            pb_string_free(list_ptr);
+
+            let session_id_c = CString::new("non_existent").unwrap();
+            let sess_ptr = pb_engine_get_session(engine, session_id_c.as_ptr(), &mut err);
+            assert!(sess_ptr.is_null());
+
+            let del_res = pb_engine_delete_session(engine, session_id_c.as_ptr());
+            assert_eq!(del_res, 0);
+
+            // 7. Cancel API
+            pb_engine_cancel(engine, session_id_c.as_ptr());
+
+            // 8. Host tool & WebView result helpers
+            let call_id_c = CString::new("dummy_call").unwrap();
+            let output_c = CString::new("output").unwrap();
+            let tool_res = pb_engine_host_tool_result(
+                engine,
+                call_id_c.as_ptr(),
+                1,
+                output_c.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(tool_res, -3); // Unknown call_id returns -3
+
+            let wv_res = pb_engine_webview_result(
+                engine,
+                call_id_c.as_ptr(),
+                1,
+                output_c.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(wv_res, -3); // Unknown call_id returns -3
+
+            // Free engine
+            pb_engine_free(engine);
+        }
+    }
+
+    struct ChatTestContext {
+        engine_ptr: usize,
+    }
+
+    unsafe extern "C" fn test_llm_cb(
+        request_id: *const c_char,
+        _request_json: *const c_char,
+        user_data: *mut c_void,
+    ) {
+        let ctx = &*(user_data as *const ChatTestContext);
+        let req_id_str = CStr::from_ptr(request_id).to_str().unwrap();
+
+        let engine = ctx.engine_ptr as *mut PbEngine;
+
+        // Push text chunk
+        let chunk_json = serde_json::json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 1000,
+            "model": "mock",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "FFI chat response"
+                },
+                "finish_reason": null
+            }]
+        })
+        .to_string();
+        let chunk_c = CString::new(chunk_json).unwrap();
+        let req_c = CString::new(req_id_str).unwrap();
+
+        let push_res = pb_engine_llm_push_chunk(
+            engine,
+            req_c.as_ptr(),
+            chunk_c.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(push_res, 0);
+
+        let finish_res = pb_engine_llm_finish(engine, req_c.as_ptr(), std::ptr::null_mut());
+        assert_eq!(finish_res, 0);
+    }
+
+    unsafe extern "C" fn test_event_cb(event_json: *const c_char, user_data: *mut c_void) {
+        let events = &mut *(user_data as *mut Vec<String>);
+        let s = CStr::from_ptr(event_json).to_str().unwrap();
+        events.push(s.to_string());
+    }
+
+    #[test]
+    fn test_pb_engine_chat_flow() {
+        let dir = tempdir().unwrap();
+        let cfg_json = format!(
+            r#"{{
+                "llm_mode": "host",
+                "model": "host-model",
+                "root_dir": "{}"
+            }}"#,
+            dir.path().display()
+        );
+
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let valid_c = CString::new(cfg_json).unwrap();
+            let engine = pb_engine_new(valid_c.as_ptr(), &mut err);
+            assert!(!engine.is_null());
+
+            let mut test_ctx = ChatTestContext {
+                engine_ptr: engine as usize,
+            };
+
+            pb_engine_set_host_callbacks(
+                engine,
+                Some(test_llm_cb),
+                None,
+                &mut test_ctx as *mut ChatTestContext as *mut c_void,
+            );
+
+            let mut received_events: Vec<String> = Vec::new();
+            let session_id_c = CString::new("test_ffi_session").unwrap();
+            let user_msg_c = CString::new("Hello from FFI test").unwrap();
+
+            let outcome_ptr = pb_engine_chat(
+                engine,
+                session_id_c.as_ptr(),
+                user_msg_c.as_ptr(),
+                Some(test_event_cb),
+                &mut received_events as *mut Vec<String> as *mut c_void,
+                &mut err,
+            );
+
+            assert!(!outcome_ptr.is_null());
+            assert!(err.is_null());
+
+            let outcome_str = CStr::from_ptr(outcome_ptr).to_str().unwrap();
+            let outcome_json: serde_json::Value = serde_json::from_str(outcome_str).unwrap();
+            assert_eq!(outcome_json["final_text"], "FFI chat response");
+            assert!(!received_events.is_empty());
+
+            pb_string_free(outcome_ptr);
+            pb_engine_free(engine);
+        }
+    }
+}
+
 
 
