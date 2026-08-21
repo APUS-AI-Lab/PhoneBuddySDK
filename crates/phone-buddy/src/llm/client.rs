@@ -68,6 +68,9 @@ impl LlmClient {
             &cfg.api_key,
             Duration::from_secs(cfg.stream_idle_timeout_secs),
             cfg.api_backend,
+            cfg.client_profile,
+            cfg.client_version.clone(),
+            cfg.client_session_id.clone(),
             cfg.extra_headers.clone(),
             cfg.extra_body.clone(),
             cfg.doom_loop_check_enabled(),
@@ -75,6 +78,7 @@ impl LlmClient {
         )?;
         Ok(Self::new(Arc::new(t), cfg.max_retries))
     }
+
 
     /// Run one chat-completion request with retry, streaming deltas to
     /// `observer`, and return the fully collected turn.

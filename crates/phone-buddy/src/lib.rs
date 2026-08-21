@@ -41,13 +41,17 @@ pub mod session;
 pub mod tools;
 
 pub mod prelude {
-    pub use crate::config::{EngineConfig, DEFAULT_AGENT_NAME};
+    pub use crate::config::{
+        ClientProfile, ClientProfileDefinition, EngineConfig, EngineConfigBuilder,
+        DEFAULT_AGENT_NAME,
+    };
     pub use crate::engine::{ChatOutcome, PhoneBuddyEngine};
     pub use crate::error::{EngineError, EngineResult};
     pub use crate::events::{AgentEvent, AgentObserver, NullObserver, RecordingObserver, UsageSummary};
     pub use crate::llm::types::ApiBackend;
     pub use crate::session::SessionMeta;
 }
+
 
 pub use prelude::*;
 

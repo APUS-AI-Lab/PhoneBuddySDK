@@ -169,30 +169,46 @@ fn run_chat(input: &str) -> anyhow::Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("set PHONEBUDDY_API_KEY to use chat mode"))?;
-    let base_url = std::env::var("PHONEBUDDY_BASE_URL")
-        .unwrap_or_else(|_| "https://api.x.ai/v1".into());
+    let base_url = std::env::var("PHONEBUDDY_BASE_URL").ok();
     let model = std::env::var("PHONEBUDDY_MODEL").unwrap_or_else(|_| "grok-3".into());
 
-    let api_backend = match std::env::var("PHONEBUDDY_API_BACKEND").as_deref() {
-        Ok("responses") => ApiBackend::Responses,
-        Ok("messages") => ApiBackend::Messages,
-        _ => ApiBackend::ChatCompletions,
-    };
+    let profile: ClientProfile = std::env::var("PHONEBUDDY_CLIENT_PROFILE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(ClientProfile::Default);
 
-    let cfg = EngineConfig {
-        api_key,
-        base_url,
-        model,
-        root_dir: demo_root(),
-        enable_web_search: std::env::var("PHONEBUDDY_WEB_SEARCH").as_deref() == Ok("1"),
-        api_backend,
-        ..Default::default()
-    };
+    let mut builder = EngineConfig::builder()
+        .client_profile(profile)
+        .api_key(api_key)
+        .model(model)
+        .root_dir(demo_root());
+
+    if let Some(url) = base_url {
+        builder = builder.url(url);
+    }
+
+    if let Ok(backend_str) = std::env::var("PHONEBUDDY_API_BACKEND") {
+        match backend_str.to_ascii_lowercase().as_str() {
+            "responses" => builder = builder.api_backend(ApiBackend::Responses),
+            "messages" => builder = builder.api_backend(ApiBackend::Messages),
+            "chat_completions" | "chatcompletions" => {
+                builder = builder.api_backend(ApiBackend::ChatCompletions)
+            }
+            _ => {}
+        }
+    }
+
+    if std::env::var("PHONEBUDDY_WEB_SEARCH").as_deref() == Ok("1") {
+        builder = builder.enable_web_search(true);
+    }
+
+    let cfg = builder.build().map_err(|e| anyhow::anyhow!(e))?;
     let engine = PhoneBuddyEngine::new(cfg)?;
     let outcome = engine.chat("cli-session", input, Some(Arc::new(PrintObserver)))?;
     println!("\n=== final report ===\n{}", outcome.final_text);
     Ok(())
 }
+
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

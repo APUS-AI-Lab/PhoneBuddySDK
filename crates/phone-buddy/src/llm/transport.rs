@@ -75,12 +75,17 @@ pub fn retry_class_for_error(err: &EngineError) -> RetryClass {
 
 // ── HTTP transport ───────────────────────────────────────────────────────
 
+use crate::llm::profiles::ClientProfile;
+
 pub struct HttpTransport {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
     idle_timeout: Duration,
     api_backend: ApiBackend,
+    client_profile: ClientProfile,
+    client_version: Option<String>,
+    client_session_id: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     /// Opt into server doom-loop recovery (Responses API).
@@ -102,6 +107,9 @@ impl HttpTransport {
             api_key,
             idle_timeout,
             api_backend,
+            ClientProfile::Default,
+            None,
+            None,
             extra_headers,
             std::collections::HashMap::new(),
             false,
@@ -125,6 +133,9 @@ impl HttpTransport {
             api_key,
             idle_timeout,
             api_backend,
+            ClientProfile::Default,
+            None,
+            None,
             extra_headers,
             std::collections::HashMap::new(),
             doom_loop_enabled,
@@ -149,6 +160,9 @@ impl HttpTransport {
             api_key,
             idle_timeout,
             api_backend,
+            ClientProfile::Default,
+            None,
+            None,
             extra_headers,
             extra_body,
             doom_loop_enabled,
@@ -164,6 +178,9 @@ impl HttpTransport {
         api_key: &str,
         idle_timeout: Duration,
         api_backend: ApiBackend,
+        client_profile: ClientProfile,
+        client_version: Option<String>,
+        client_session_id: Option<String>,
         extra_headers: std::collections::HashMap<String, String>,
         extra_body: std::collections::HashMap<String, serde_json::Value>,
         doom_loop_enabled: bool,
@@ -171,7 +188,6 @@ impl HttpTransport {
     ) -> EngineResult<Self> {
         // The ring crypto provider is installed by PhoneBuddyEngine::new.
         let client = reqwest::Client::builder()
-            .user_agent(format!("PhoneBuddy/{} (Mobile SDK; LLM Client)", crate::VERSION))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60 * 10))
             .build()
@@ -182,6 +198,9 @@ impl HttpTransport {
             api_key: api_key.to_string(),
             idle_timeout,
             api_backend,
+            client_profile,
+            client_version,
+            client_session_id,
             extra_headers,
             extra_body,
             doom_loop_enabled: doom_loop_enabled
@@ -227,75 +246,41 @@ impl LlmTransport for HttpTransport {
         req: &ChatCompletionRequest,
     ) -> EngineResult<ChunkStream> {
         let endpoint = self.endpoint();
-        let mut builder = self.client.post(&endpoint).header("Accept", "text/event-stream");
+        let mut builder = self.client.post(&endpoint);
 
         let mut req_headers_map = std::collections::BTreeMap::new();
-        req_headers_map.insert("accept".to_string(), "text/event-stream".to_string());
-        req_headers_map.insert(
-            "user-agent".to_string(),
-            format!("PhoneBuddy/{} (Mobile SDK; LLM Client)", crate::VERSION),
+
+        // 1. Profile default headers (UA, vendor headers, auth)
+        let profile_headers = crate::llm::profiles::build_profile_headers(
+            self.client_profile,
+            &self.api_key,
+            self.client_session_id.as_deref(),
+            self.client_version.as_deref(),
+            self.doom_loop_enabled,
         );
 
+        for (k, v) in profile_headers {
+            builder = builder.header(&k, &v);
+            req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
+        }
+
+        // 2. Extra headers override anything from the profile
         for (k, v) in &self.extra_headers {
             builder = builder.header(k, v);
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
 
-        // Opt-in server doom-loop check (Responses API only).
-        if self.doom_loop_enabled {
-            builder = builder.header(
-                crate::llm::doom_loop_wire::DOOM_LOOP_CHECK_HEADER,
-                "1",
-            );
-            req_headers_map.insert(
-                crate::llm::doom_loop_wire::DOOM_LOOP_CHECK_HEADER.to_string(),
-                "1".to_string(),
-            );
-        }
-
         let mut body = match self.api_backend {
             ApiBackend::ChatCompletions => {
-                if !self.api_key.is_empty() {
-                    builder = builder.bearer_auth(&self.api_key);
-                    req_headers_map.insert(
-                        "authorization".to_string(),
-                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
-                    );
-                }
                 let mut val = serde_json::to_value(req)?;
                 val["stream"] = serde_json::Value::Bool(true);
                 val["stream_options"] = serde_json::json!({ "include_usage": true });
                 val
             }
-            ApiBackend::Responses => {
-                if !self.api_key.is_empty() {
-                    builder = builder.bearer_auth(&self.api_key);
-                    req_headers_map.insert(
-                        "authorization".to_string(),
-                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
-                    );
-                }
-                build_responses_payload(req)
-            }
-            ApiBackend::Messages => {
-                if !self.api_key.is_empty() {
-                    builder = builder
-                        .header("x-api-key", &self.api_key)
-                        .bearer_auth(&self.api_key);
-                    req_headers_map.insert(
-                        "x-api-key".to_string(),
-                        self.dumper.mask_header_value("x-api-key", &self.api_key),
-                    );
-                    req_headers_map.insert(
-                        "authorization".to_string(),
-                        self.dumper.mask_header_value("authorization", &format!("Bearer {}", self.api_key)),
-                    );
-                }
-                builder = builder.header("anthropic-version", "2023-06-01");
-                req_headers_map.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-                build_messages_payload(req)
-            }
+            ApiBackend::Responses => build_responses_payload(req),
+            ApiBackend::Messages => build_messages_payload(req),
         };
+
 
         merge_extra_body(&mut body, &self.extra_body);
         req_headers_map.insert("content-type".to_string(), "application/json".to_string());
@@ -1675,12 +1660,16 @@ mod tests {
             "test-secret-key-123456",
             Duration::from_secs(2),
             ApiBackend::ChatCompletions,
+            ClientProfile::Default,
+            None,
+            None,
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             false,
             dumper,
         )
         .unwrap();
+
 
         let req = ChatCompletionRequest {
             model: "test-model".into(),
@@ -1712,4 +1701,72 @@ mod tests {
         assert_eq!(json["request"]["headers"]["authorization"], "Bearer test***3456");
         assert!(json["error"].is_string());
     }
+
+    #[tokio::test]
+    async fn test_http_transport_claude_code_profile_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump_dir = tmp.path().join("dumps");
+
+        let dumper = crate::llm::dumper::HttpDumper::new(
+            crate::llm::dumper::HttpDumpConfig {
+                mode: crate::llm::dumper::HttpDumpMode::OnError,
+                dump_dir: Some(dump_dir.clone()),
+                mask_sensitive: false,
+                max_files: 10,
+            },
+            dump_dir.clone(),
+        );
+
+        let transport = HttpTransport::new_with_all_options(
+            "http://127.0.0.1:59999/v1",
+            "sk-ant-test-key",
+            Duration::from_secs(2),
+            ApiBackend::Messages,
+            ClientProfile::ClaudeCode,
+            Some("2.1.238".into()),
+            Some("sess-claude-999".into()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            false,
+            dumper,
+        )
+        .unwrap();
+
+        let req = ChatCompletionRequest {
+            model: "claude-opus-5".into(),
+            messages: vec![ChatMessage::user("Hi")],
+
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+        };
+
+        let res = transport.request_stream(&req).await;
+        assert!(res.is_err());
+
+        let entries: Vec<_> = std::fs::read_dir(&dump_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let dump_content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&dump_content).unwrap();
+
+        assert_eq!(json["request"]["headers"]["x-api-key"], "sk-ant-test-key");
+        assert_eq!(json["request"]["headers"]["anthropic-version"], "2023-06-01");
+        assert_eq!(json["request"]["headers"]["x-app"], "cli");
+        assert_eq!(
+            json["request"]["headers"]["x-claude-code-session-id"],
+            "sess-claude-999"
+        );
+        assert_eq!(
+            json["request"]["headers"]["user-agent"],
+            "claude-cli/2.1.238 (external, cli)"
+        );
+    }
 }
+

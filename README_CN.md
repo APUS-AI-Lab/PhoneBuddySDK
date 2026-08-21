@@ -252,6 +252,23 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 
 ---
 
+## 🎯 1:1 官方客户端仿真 (`ClientProfile`)
+
+PhoneBuddy SDK 支持对主流桌面 AI 编程 Agent 客户端（**xAI Grok Build**、**OpenAI Codex**、**Anthropic Claude Code**）进行 **1:1 深度仿真**，严格对齐其 HTTP Headers（`User-Agent`、`anthropic-version`、`anthropic-beta`、`x-grok-*`、`session-id`）、Thinking 思考链签名及 JSON Wire 协议体。
+
+```rust
+use phone_buddy::prelude::*;
+
+// 链式构建 1:1 Claude Code 预设：
+let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
+    .url("https://api.anthropic.com/v1")
+    .build()?;
+```
+
+*完整协议字段矩阵与各语言使用示例请参考：[**docs/client_profiles.md**](docs/client_profiles.md)。*
+
+---
+
 ## 📡 实时流式事件回调
 
 在 Agent 执行过程中，引擎会通过回调接口向宿主实时推送结构化 JSON 事件：
@@ -273,8 +290,12 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 | 参数名 | 类型 | 是否必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `api_key` | String | HTTP 模式必填 | `""` | 用户 API Key 或 Bearer 鉴权 Token |
-| `base_url` | String | HTTP 模式必填 | `https://api.x.ai/v1` | OpenAI / xAI 兼容的 Endpoint URL |
-| `model` | String | 是 | `grok-4` | 目标模型标识（如 `grok-4.6`, `grok-4`, `gpt-4o`） |
+| `base_url` | String | HTTP 模式必填 | `https://api.x.ai/v1` | OpenAI / xAI / Anthropic 兼容的 Endpoint URL |
+| `model` | String | 是 | `grok-4.6` | 目标模型标识（如 `grok-4.6`, `claude-opus-5`, `gpt-4o`） |
+
+| `client_profile` | String | 否 | `default` | 1:1 客户端仿真预设：`grok_build`, `codex`, `claude_code`, `default`。详见 [docs/client_profiles.md](docs/client_profiles.md) |
+| `client_version` | String | 否 | `null` | 自定义 `User-Agent` 报告的客户端版本号 |
+| `client_session_id` | String | 否 | `null` | 自定义厂商会话 UUID（`x-claude-code-session-id`, `session-id`） |
 | `root_dir` | String | 是 | `/tmp/phone-buddy` | 文件沙盒隔离根目录及会话持久化存储路径 |
 | `api_backend` | String | 否 | `chat_completions` | API 协议：`responses` (SSE 流), `chat_completions`, `messages` |
 | `llm_mode` | String | 否 | `http` | 通信模式：`http` (直接网络请求) 或 `host` (宿主 FFI 回调桥接) |
@@ -292,6 +313,7 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析�
 | `enable_doom_loop_check`| Boolean | 否 | 自动判定 | 是否开启服务端死循环检测 Header（`x-grok-doom-loop-check`） |
 | `web_fetch_allow_local` | Boolean | 否 | `false` | 是否允许 `web_fetch` 请求本地回环地址（仅供测试） |
 | `http_dump` | Object | 否 | `{"mode":"off"}`| 原始 HTTP 请求/响应报文落盘诊断配置（如 `{"mode":"on_error","max_files":30}`） |
+
 
 ---
 

@@ -254,6 +254,23 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "Analyze 
 
 ---
 
+## 🎯 1:1 Client Profile Emulation (Grok / Codex / Claude Code)
+
+PhoneBuddy SDK supports 1:1 network request emulation of official desktop AI coding agent clients (**xAI Grok Build**, **OpenAI Codex**, and **Anthropic Claude Code**), replicating exact HTTP Headers (`User-Agent`, `anthropic-version`, `anthropic-beta`, `x-grok-*`, `session-id`), thinking signatures, and JSON wire schemas.
+
+```rust
+use phone_buddy::prelude::*;
+
+// Fluent 1:1 Claude Code configuration:
+let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
+    .url("https://api.anthropic.com/v1")
+    .build()?;
+```
+
+*For complete protocol matrices, headers, and multi-language usage, see [**docs/client_profiles.md**](docs/client_profiles.md).*
+
+---
+
 ## 📡 Real-Time Streaming Events
 
 During execution, `PhoneBuddyEngine` emits structured JSON event objects to the registered callback handler:
@@ -275,8 +292,12 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `api_key` | String | Yes (in HTTP mode) | `""` | User API Key or Bearer Token |
-| `base_url` | String | Yes (in HTTP mode) | `https://api.x.ai/v1` | OpenAI / xAI compatible endpoint URL |
-| `model` | String | Yes | `grok-4` | Model identifier (e.g. `grok-4.6`, `grok-4`, `gpt-4o`) |
+| `base_url` | String | Yes (in HTTP mode) | `https://api.x.ai/v1` | OpenAI / xAI / Anthropic compatible endpoint URL |
+| `model` | String | Yes | `grok-4.6` | Model identifier (e.g. `grok-4.6`, `claude-opus-5`, `gpt-4o`) |
+
+| `client_profile` | String | No | `default` | 1:1 client emulation preset: `grok_build`, `codex`, `claude_code`, `default`. See [docs/client_profiles.md](docs/client_profiles.md) |
+| `client_version` | String | No | `null` | Custom client version string to report in `User-Agent` |
+| `client_session_id` | String | No | `null` | Custom session UUID for vendor headers (`x-claude-code-session-id`, `session-id`) |
 | `root_dir` | String | Yes | `/tmp/phone-buddy` | Root path for jailed file sandbox and session storage |
 | `api_backend` | String | No | `chat_completions` | API protocol: `responses` (SSE stream), `chat_completions`, `messages` |
 | `llm_mode` | String | No | `http` | Transport mode: `http` (direct networking) or `host` (FFI callback bridge) |
@@ -294,6 +315,7 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `enable_doom_loop_check`| Boolean | No | Auto | Server-side doom loop header (`x-grok-doom-loop-check`) |
 | `web_fetch_allow_local` | Boolean | No | `false` | Allow `web_fetch` to access local loopback addresses (for testing) |
 | `http_dump` | Object | No | `{"mode":"off"}`| Raw HTTP request/response dumper for debugging (e.g. `{"mode":"on_error","max_files":30}`) |
+
 
 ---
 

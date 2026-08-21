@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use crate::llm::dumper::{HttpDumpConfig, HttpDumpMode};
+pub use crate::llm::profiles::{
+    build_profile_headers, get_profile_definition, render_user_agent, ClientProfile,
+    ClientProfileDefinition,
+};
 use crate::llm::types::ApiBackend;
 
 pub use crate::llm::types::ApiBackend as ConfigApiBackend;
@@ -27,16 +31,26 @@ pub enum LlmMode {
 /// escape it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    /// API key for the LLM provider (xAI / OpenAI / any compatible endpoint).
+    /// API key for the LLM provider (xAI / OpenAI / Anthropic / any compatible endpoint).
     /// Required when [`llm_mode`] is [`LlmMode::Http`]; ignored for Host.
     #[serde(default)]
     pub api_key: String,
-    /// Base URL of an OpenAI-compatible API, e.g. `https://api.x.ai/v1`.
+    /// Base URL of an API endpoint, e.g. `https://api.x.ai/v1`, `https://api.anthropic.com/v1`.
     /// Required when [`llm_mode`] is [`LlmMode::Http`]; ignored for Host.
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// Model id, e.g. `grok-4` or `gpt-4o`.
+    /// Model id, e.g. `grok-4.6`, `claude-opus-5`, `gpt-4o`.
     pub model: String,
+
+    /// Client profile for 1:1 emulation of official clients (Default, GrokBuild, Codex, ClaudeCode).
+    #[serde(default)]
+    pub client_profile: ClientProfile,
+    /// Optional custom version string for User-Agent (defaults to official client version).
+    #[serde(default)]
+    pub client_version: Option<String>,
+    /// Optional custom session identifier for vendor session tracking headers.
+    #[serde(default)]
+    pub client_session_id: Option<String>,
     /// File sandbox root. All file tools are jailed to this directory.
     pub root_dir: PathBuf,
     /// UI locale; affects the language the agent is told to answer in.
@@ -101,6 +115,7 @@ pub struct EngineConfig {
     pub http_dump: HttpDumpConfig,
 }
 
+
 /// Default system-prompt identity when the host does not set [`EngineConfig::agent_name`].
 pub const DEFAULT_AGENT_NAME: &str = "PhoneBuddy";
 const AGENT_NAME_MAX_CHARS: usize = 80;
@@ -136,7 +151,11 @@ impl Default for EngineConfig {
         Self {
             api_key: String::new(),
             base_url: default_base_url(),
-            model: "grok-4".into(),
+            model: "grok-4.6".into(),
+            client_profile: ClientProfile::Default,
+            client_version: None,
+            client_session_id: None,
+
             root_dir: std::env::temp_dir().join("phone-buddy"),
             locale: default_locale(),
             max_turns: default_max_turns(),
@@ -171,6 +190,41 @@ pub fn resolve_agent_name(raw: &str) -> String {
 }
 
 impl EngineConfig {
+    /// Create a fluent builder for [`EngineConfig`].
+    pub fn builder() -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+    }
+
+    /// Create a builder pre-configured for 1:1 xAI Grok Build (`grok-cli`) emulation.
+    pub fn for_grok(api_key: impl Into<String>, model: impl Into<String>) -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+            .client_profile(ClientProfile::GrokBuild)
+            .url("https://api.x.ai/v1")
+            .api_key(api_key)
+            .model(model)
+    }
+
+    /// Create a builder pre-configured for 1:1 Anthropic Claude Code (`claude-cli`) emulation.
+    pub fn for_claude_code(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+            .client_profile(ClientProfile::ClaudeCode)
+            .url("https://api.anthropic.com/v1")
+            .api_key(api_key)
+            .model(model)
+    }
+
+    /// Create a builder pre-configured for 1:1 OpenAI Codex CLI (`codex-cli`) emulation.
+    pub fn for_codex(api_key: impl Into<String>, model: impl Into<String>) -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+            .client_profile(ClientProfile::Codex)
+            .url("https://api.openai.com/v1")
+            .api_key(api_key)
+            .model(model)
+    }
+
     /// True when hosted `{type: web_search}` should ride the Responses request.
     pub fn backend_search_active(&self) -> bool {
         self.enable_web_search && matches!(self.api_backend, ApiBackend::Responses)
@@ -244,6 +298,207 @@ impl EngineConfig {
     }
 }
 
+/// Fluent builder for creating and configuring [`EngineConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct EngineConfigBuilder {
+    config: EngineConfig,
+}
+
+impl EngineConfigBuilder {
+    /// Create a new builder with default settings.
+    pub fn new() -> Self {
+        Self {
+            config: EngineConfig::default(),
+        }
+    }
+
+    /// Set the LLM API base URL / endpoint URL (e.g. `https://api.anthropic.com/v1`, `https://api.x.ai/v1`).
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.config.base_url = url.into();
+        self
+    }
+
+    /// Alias for [`Self::url`].
+    pub fn base_url(self, url: impl Into<String>) -> Self {
+        self.url(url)
+    }
+
+    /// Set the LLM API key.
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.config.api_key = key.into();
+        self
+    }
+
+    /// Set the LLM model name (e.g. `grok-4.6`, `claude-opus-5`, `gpt-4o`).
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.config.model = model.into();
+        self
+    }
+
+
+    /// Set the client emulation profile (Default, GrokBuild, Codex, ClaudeCode).
+    ///
+    /// Automatically applies the profile's default backend protocol, default endpoint URL
+    /// (if still at default), and standard headers.
+    pub fn client_profile(mut self, profile: ClientProfile) -> Self {
+        self.config.client_profile = profile;
+        let def = crate::llm::profiles::get_profile_definition(profile);
+        if self.config.base_url == default_base_url() {
+            self.config.base_url = def.default_base_url;
+        }
+        self.config.api_backend = def.default_backend;
+        if profile == ClientProfile::GrokBuild {
+            self.config.enable_web_search = true;
+            self.config.enable_doom_loop_check = Some(true);
+        }
+        self
+    }
+
+    /// Set custom client version string to report in User-Agent.
+    pub fn client_version(mut self, version: impl Into<String>) -> Self {
+        self.config.client_version = Some(version.into());
+        self
+    }
+
+    /// Set custom session identifier for vendor session tracking headers.
+    pub fn client_session_id(mut self, id: impl Into<String>) -> Self {
+        self.config.client_session_id = Some(id.into());
+        self
+    }
+
+    /// Set the file sandbox root directory.
+    pub fn root_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.root_dir = dir.into();
+        self
+    }
+
+    /// Set the UI locale (e.g. "zh", "en").
+    pub fn locale(mut self, locale: impl Into<String>) -> Self {
+        self.config.locale = locale.into();
+        self
+    }
+
+    /// Set max tool-loop turns per user message.
+    pub fn max_turns(mut self, turns: u32) -> Self {
+        self.config.max_turns = turns;
+        self
+    }
+
+    /// Set sampling temperature.
+    pub fn temperature(mut self, temp: f32) -> Self {
+        self.config.temperature = temp;
+        self
+    }
+
+    /// Set max output tokens per turn.
+    pub fn max_output_tokens(mut self, tokens: u32) -> Self {
+        self.config.max_output_tokens = tokens;
+        self
+    }
+
+    /// Enable or disable backend-hosted search on Responses API.
+    pub fn enable_web_search(mut self, enable: bool) -> Self {
+        self.config.enable_web_search = enable;
+        self
+    }
+
+    /// Set agent identity name.
+    pub fn agent_name(mut self, name: impl Into<String>) -> Self {
+        self.config.agent_name = name.into();
+        self
+    }
+
+    /// Set extra system prompt instructions.
+    pub fn system_prompt_extra(mut self, extra: impl Into<String>) -> Self {
+        self.config.system_prompt_extra = Some(extra.into());
+        self
+    }
+
+    /// Set streaming idle timeout in seconds.
+    pub fn stream_idle_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.stream_idle_timeout_secs = secs;
+        self
+    }
+
+    /// Set max API retries on transient errors.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.config.max_retries = retries;
+        self
+    }
+
+    /// Set LLM transport mode (Http or Host).
+    pub fn llm_mode(mut self, mode: LlmMode) -> Self {
+        self.config.llm_mode = mode;
+        self
+    }
+
+    /// Set the API backend protocol (ChatCompletions, Responses, Messages).
+    pub fn api_backend(mut self, backend: ApiBackend) -> Self {
+        self.config.api_backend = backend;
+        self
+    }
+
+    /// Add an extra HTTP header.
+    pub fn extra_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.extra_headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Extend extra HTTP headers.
+    pub fn extra_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.config.extra_headers.extend(headers);
+        self
+    }
+
+    /// Add an extra field to merge into the request JSON payload.
+    pub fn extra_body(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.config.extra_body.insert(key.into(), value);
+        self
+    }
+
+    /// Extend extra request JSON payload fields.
+    pub fn extra_body_map(
+        mut self,
+        map: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> Self {
+        self.config.extra_body.extend(map);
+        self
+    }
+
+    /// Opt into or out of server-side doom loop checking.
+    pub fn enable_doom_loop_check(mut self, enable: bool) -> Self {
+        self.config.enable_doom_loop_check = Some(enable);
+        self
+    }
+
+    /// Allow web_fetch to hit explicit loopback addresses.
+    pub fn web_fetch_allow_local(mut self, allow: bool) -> Self {
+        self.config.web_fetch_allow_local = allow;
+        self
+    }
+
+    /// Set HTTP dump configuration for request/response diagnostics.
+    pub fn http_dump(mut self, dump: HttpDumpConfig) -> Self {
+        self.config.http_dump = dump;
+        self
+    }
+
+    /// Validate and build the [`EngineConfig`].
+    pub fn build(self) -> Result<EngineConfig, String> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
+
+    /// Build without running validation.
+    pub fn build_unvalidated(self) -> EngineConfig {
+        self.config
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,4 +517,34 @@ mod tests {
         cfg.api_backend = ApiBackend::Messages;
         assert!(!cfg.backend_search_active());
     }
+
+    #[test]
+    fn test_engine_config_builder_fluent_and_presets() {
+        let grok_cfg = EngineConfig::for_grok("xai-key-123", "grok-4.6")
+            .url("https://custom.x.ai/v1")
+            .extra_header("X-Custom", "Val")
+            .build()
+            .unwrap();
+
+        assert_eq!(grok_cfg.client_profile, ClientProfile::GrokBuild);
+        assert_eq!(grok_cfg.base_url, "https://custom.x.ai/v1");
+        assert_eq!(grok_cfg.api_backend, ApiBackend::Responses);
+        assert_eq!(grok_cfg.api_key, "xai-key-123");
+        assert_eq!(grok_cfg.model, "grok-4.6");
+        assert!(grok_cfg.enable_web_search);
+        assert_eq!(grok_cfg.enable_doom_loop_check, Some(true));
+        assert_eq!(grok_cfg.extra_headers.get("X-Custom").unwrap(), "Val");
+
+        let claude_cfg = EngineConfig::for_claude_code("sk-ant-123", "claude-opus-5")
+            .client_session_id("sess-custom-uuid")
+            .build()
+            .unwrap();
+
+        assert_eq!(claude_cfg.client_profile, ClientProfile::ClaudeCode);
+        assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(claude_cfg.api_backend, ApiBackend::Messages);
+        assert_eq!(claude_cfg.client_session_id.as_deref(), Some("sess-custom-uuid"));
+    }
 }
+
+

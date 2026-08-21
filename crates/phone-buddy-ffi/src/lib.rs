@@ -934,15 +934,6 @@ mod tests {
     #[test]
     fn test_pb_engine_lifecycle_and_config() {
         let dir = tempdir().unwrap();
-        let cfg_json = format!(
-            r#"{{
-                "api_key": "test-key",
-                "base_url": "https://api.openai.com/v1",
-                "model": "gpt-4o",
-                "root_dir": "{}"
-            }}"#,
-            dir.path().display()
-        );
 
         unsafe {
             // 1. Null engine free is safe
@@ -963,9 +954,21 @@ mod tests {
             assert!(!err.is_null());
             pb_string_free(err);
 
-            // 4. Valid config JSON
-            let mut err: *mut c_char = std::ptr::null_mut();
-            let valid_c = CString::new(cfg_json).unwrap();
+            // 4. Valid config JSON with client_profile
+            let cfg_profile_json = format!(
+                r#"{{
+                    "api_key": "sk-ant-test",
+                    "base_url": "https://api.anthropic.com/v1",
+                    "model": "claude-opus-5",
+                    "client_profile": "claude_code",
+
+                    "client_version": "2.1.238",
+                    "client_session_id": "sess-ffi-123",
+                    "root_dir": "{}"
+                }}"#,
+                dir.path().display()
+            );
+            let valid_c = CString::new(cfg_profile_json).unwrap();
             let engine = pb_engine_new(valid_c.as_ptr(), &mut err);
             assert!(!engine.is_null());
             assert!(err.is_null());
@@ -978,6 +981,7 @@ mod tests {
             let extra_c = CString::new("Be extremely concise.").unwrap();
             pb_engine_set_system_prompt_extra(engine, extra_c.as_ptr());
             pb_engine_set_system_prompt_extra(engine, std::ptr::null());
+
 
             // 6. Session APIs
             let mut err: *mut c_char = std::ptr::null_mut();
