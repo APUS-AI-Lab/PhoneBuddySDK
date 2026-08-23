@@ -497,18 +497,44 @@ impl PhoneBuddyEngine {
             let encrypted_reasoning = turn.encrypted_reasoning.clone();
 
             let origin = self.client.origin_fingerprint();
-            if turn.tool_calls.is_empty() {
+            let has_client_tools = turn.tool_calls.iter().any(|tc| tc.kind != "server");
+            if !has_client_tools {
+                // Server-side Responses tools (e.g. server-side web_search) ran inline in the
+                // provider and already contributed to `turn.text`. Surface them to the observer
+                // as completed and exit the turn without executing locally or calling the LLM again.
+                for call in &turn.tool_calls {
+                    observer.on_event(AgentEvent::ToolCallResult {
+                        call_id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        ok: true,
+                        output: call.function.arguments.clone(),
+                    });
+                }
+
+                let assistant_msg = if turn.tool_calls.is_empty() {
+                    ChatMessage::assistant_with_reasoning(
+                        turn.text.clone(),
+                        reasoning_opt,
+                        reasoning_items,
+                        encrypted_reasoning,
+                    )
+                } else {
+                    ChatMessage::assistant_tool_calls_with_reasoning(
+                        turn.tool_calls.clone(),
+                        if turn.text.is_empty() {
+                            None
+                        } else {
+                            Some(turn.text.clone())
+                        },
+                        reasoning_opt,
+                        reasoning_items,
+                        encrypted_reasoning,
+                    )
+                };
+
                 session
                     .messages
-                    .push(
-                        ChatMessage::assistant_with_reasoning(
-                            turn.text.clone(),
-                            reasoning_opt,
-                            reasoning_items,
-                            encrypted_reasoning,
-                        )
-                        .with_origin(origin),
-                    );
+                    .push(assistant_msg.with_origin(origin));
                 let final_text = turn.text.clone();
                 self.sessions.save(&session)?;
                 return Ok(ChatOutcome {

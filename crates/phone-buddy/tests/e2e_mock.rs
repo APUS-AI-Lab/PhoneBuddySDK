@@ -221,3 +221,62 @@ fn agent_name_is_configurable_and_resettable() {
     assert_eq!(engine.agent_name(), DEFAULT_AGENT_NAME);
 }
 
+#[test]
+fn server_tools_complete_in_single_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = EngineConfig {
+        api_key: "mock".into(),
+        base_url: "http://mock.local/v1".into(),
+        model: "mock-model".into(),
+        root_dir: root.path().to_path_buf(),
+        max_turns: 4,
+        ..Default::default()
+    };
+
+    // Provider outputs inline text and server-side web_search in a single response
+    let transport = MockTransport::new(vec![MockTurn::server_calls_and_text(
+        "Here is the latest news for today.",
+        vec![(
+            "call_ws_1".into(),
+            "web_search".into(),
+            serde_json::json!({"query": "today news"}),
+        )],
+    )]);
+
+    let engine = PhoneBuddyEngine::with_transport(cfg, transport).unwrap();
+    let observer = Arc::new(RecordingObserver::new());
+    let outcome = engine
+        .chat("server_tool_test", "what is the news", Some(observer.clone()))
+        .unwrap();
+
+    // Turn should finish in exactly 1 turn without executing locally or calling LLM again
+    assert_eq!(outcome.final_text, "Here is the latest news for today.");
+    assert_eq!(outcome.turns_used, 1);
+
+    // Observer received ToolCallResult event for UI
+    let events = observer.snapshot();
+    let tool_results: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallResult { name, ok, .. } if *ok => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results, vec!["web_search"]);
+
+    // Session persisted assistant message with tool calls
+    let session = engine
+        .get_session("server_tool_test")
+        .unwrap()
+        .expect("session should exist");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].role, phone_buddy::llm::Role::User);
+    assert_eq!(session.messages[1].role, phone_buddy::llm::Role::Assistant);
+    assert_eq!(
+        session.messages[1].content.as_deref(),
+        Some("Here is the latest news for today.")
+    );
+    assert_eq!(session.messages[1].tool_calls.len(), 1);
+    assert_eq!(session.messages[1].tool_calls[0].kind, "server");
+}
+

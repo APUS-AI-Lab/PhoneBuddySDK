@@ -1108,7 +1108,7 @@ fn truncate_for_error(text: &str) -> String {
 #[derive(Clone)]
 pub struct MockTurn {
     pub text: String,
-    pub tool_calls: Vec<(String, String, serde_json::Value)>, // (id, name, args)
+    pub tool_calls: Vec<(String, String, serde_json::Value, String)>, // (id, name, args, kind)
 }
 
 impl MockTurn {
@@ -1121,7 +1121,22 @@ impl MockTurn {
     pub fn calls(calls: Vec<(String, String, serde_json::Value)>) -> Self {
         Self {
             text: String::new(),
-            tool_calls: calls,
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name, args)| (id, name, args, "function".into()))
+                .collect(),
+        }
+    }
+    pub fn server_calls_and_text(
+        text: impl Into<String>,
+        calls: Vec<(String, String, serde_json::Value)>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name, args)| (id, name, args, "server".into()))
+                .collect(),
         }
     }
 }
@@ -1180,7 +1195,7 @@ impl LlmTransport for MockTransport {
             }
 
             // tool calls
-            for (idx, (id, name, args)) in turn.tool_calls.iter().enumerate() {
+            for (idx, (id, name, args, kind)) in turn.tool_calls.iter().enumerate() {
                 let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
                 // first chunk: id + name + first half of arguments
                 let (a, b) = split_half(&args_str);
@@ -1188,7 +1203,7 @@ impl LlmTransport for MockTransport {
                 d.tool_calls.push(ToolCallDelta {
                     index: idx as u32,
                     id: Some(id.clone()),
-                    kind: Some("function".into()),
+                    kind: Some(kind.clone()),
                     function: Some(ToolCallFunctionDelta {
                         name: Some(name.clone()),
                         arguments: Some(a.to_string()),
