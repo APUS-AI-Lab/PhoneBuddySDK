@@ -46,6 +46,27 @@ impl AgentObserver for PrintObserver {
             }
             AgentEvent::Completed { .. } => println!(),
             AgentEvent::Failed { message } => eprintln!("\x1b[31m  ✗ failed: {message}\x1b[0m"),
+            AgentEvent::Retrying {
+                provider,
+                attempt,
+                max_attempts,
+                wait_ms,
+                reason,
+            } => {
+                eprintln!(
+                    "\x1b[33m  ⟳ retry {provider} {attempt}/{max_attempts} wait={wait_ms}ms ({reason})\x1b[0m"
+                );
+            }
+            AgentEvent::ProviderSwitched {
+                from,
+                to,
+                reason,
+                cooldown_ms,
+            } => {
+                eprintln!(
+                    "\x1b[36m  ⇄ switch {from} → {to} cooldown={cooldown_ms}ms ({reason})\x1b[0m"
+                );
+            }
         }
     }
 }
@@ -164,7 +185,7 @@ fn run_self_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_chat(input: &str) -> anyhow::Result<()> {
+fn run_chat(input: &str, fallbacks: Vec<ProviderEndpoint>) -> anyhow::Result<()> {
     let api_key = std::env::var("PHONEBUDDY_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -202,6 +223,10 @@ fn run_chat(input: &str) -> anyhow::Result<()> {
         builder = builder.enable_web_search(true);
     }
 
+    if !fallbacks.is_empty() {
+        builder = builder.fallback_providers(fallbacks);
+    }
+
     let cfg = builder.build().map_err(|e| anyhow::anyhow!(e))?;
     let engine = PhoneBuddyEngine::new(cfg)?;
     let outcome = engine.chat("cli-session", input, Some(Arc::new(PrintObserver)))?;
@@ -216,11 +241,61 @@ fn main() -> anyhow::Result<()> {
         None | Some("mock") => run_mock(),
         Some("self-test") => run_self_test(),
         Some("chat") => {
-            let input = args.collect::<Vec<_>>().join(" ");
-            if input.is_empty() {
-                anyhow::bail!("usage: phone-buddy-demo chat \"<your task>\"");
+            let mut fallbacks = Vec::new();
+            let mut input_parts = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--fallback-url" => {
+                        let url = args.next().ok_or_else(|| {
+                            anyhow::anyhow!("--fallback-url requires a URL")
+                        })?;
+                        let key = std::env::var("PHONEBUDDY_FALLBACK_API_KEY")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| std::env::var("PHONEBUDDY_API_KEY").ok())
+                            .unwrap_or_default();
+                        let model = std::env::var("PHONEBUDDY_FALLBACK_MODEL")
+                            .unwrap_or_else(|_| {
+                                std::env::var("PHONEBUDDY_MODEL")
+                                    .unwrap_or_else(|_| "grok-3".into())
+                            });
+                        fallbacks.push(ProviderEndpoint {
+                            base_url: url,
+                            api_key: key,
+                            model,
+                            ..Default::default()
+                        });
+                    }
+                    "--fallback-model" => {
+                        let model = args.next().ok_or_else(|| {
+                            anyhow::anyhow!("--fallback-model requires a value")
+                        })?;
+                        if let Some(last) = fallbacks.last_mut() {
+                            last.model = model;
+                        } else {
+                            anyhow::bail!("--fallback-model must follow --fallback-url");
+                        }
+                    }
+                    "--fallback-key" => {
+                        let key = args.next().ok_or_else(|| {
+                            anyhow::anyhow!("--fallback-key requires a value")
+                        })?;
+                        if let Some(last) = fallbacks.last_mut() {
+                            last.api_key = key;
+                        } else {
+                            anyhow::bail!("--fallback-key must follow --fallback-url");
+                        }
+                    }
+                    _ => input_parts.push(arg),
+                }
             }
-            run_chat(&input)
+            let input = input_parts.join(" ");
+            if input.is_empty() {
+                anyhow::bail!(
+                    "usage: phone-buddy-demo chat [--fallback-url URL] [--fallback-model MODEL] [--fallback-key KEY] \"<your task>\""
+                );
+            }
+            run_chat(&input, fallbacks)
         }
         Some(other) => anyhow::bail!("unknown subcommand '{other}' (expected mock|self-test|chat)"),
     }

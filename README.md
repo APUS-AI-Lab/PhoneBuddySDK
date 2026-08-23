@@ -45,7 +45,7 @@ PhoneBuddy SDK's core agent runtime is derived and adapted from xAI's open-sourc
 - 🛡️ **Production-Grade Harness Robustness**
   - **Doom-Loop Detection**: Identifies action stationarity (`IdenticalToolCallRun`, 8-turn nudge / 16-turn break) plus server-side check support (`x-grok-doom-loop-check`).
   - **Context Compaction**: Heuristic token estimation with automatic history compaction when surpassing `24,000` tokens.
-  - **Fault Resilience**: Exponential backoff retry logic with jitter handling rate limits (HTTP 429) and server errors (HTTP 5xx).
+  - **Fault Resilience**: Exponential backoff retry with jitter for 429/5xx, plus optional multi-provider failover (fast-fail ~6s per endpoint, cooldown stickiness). See [docs/retry-and-provider-fallback.md](docs/retry-and-provider-fallback.md).
 - 🔌 **Flexible Protocol Support & Extensible Host Bridge**
   - Supports multiple LLM backends: `responses` (OpenAI Response API + SSE streaming), `chat_completions`, and `messages`.
   - Pure-Rust TLS transport via `rustls-ring` with HTTP/2 streaming.
@@ -284,6 +284,8 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `PlanUpdated` | `{"items_json": "..."}` | Emitted whenever the planning tool updates the task step list |
 | `Completed` | `{"final_text": "...", "usage": { ... }}` | Emitted when the turn finishes successfully |
 | `Failed` | `{"message": "..."}` | Emitted when an unrecoverable failure occurs during the turn |
+| `Retrying` | `{"provider": "host/model", "attempt": 2, "max_attempts": 3, "wait_ms": 2000, "reason": "..."}` | Waiting before retrying the current provider. `provider` is a desensitized host/model id |
+| `ProviderSwitched` | `{"from": "...", "to": "...", "reason": "...", "cooldown_ms": 120000}` | Current provider degraded; engine moved to the next fallback endpoint |
 
 ---
 
@@ -309,7 +311,11 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |
 | `system_prompt_extra` | String | No | `null` | Custom persona or product instructions appended to system prompt |
 | `stream_idle_timeout_secs`| Integer | No | `120` | Streaming connection idle timeout in seconds |
-| `max_retries` | Integer | No | `5` | Maximum exponential backoff retry attempts for HTTP requests |
+| `max_retries` | Integer | No | `5` | Maximum exponential backoff retry attempts in single-provider mode. Ignored for failover decisions when `fallback_providers` is set. See [docs/retry-and-provider-fallback.md](docs/retry-and-provider-fallback.md) |
+| `fallback_providers` | Array | No | `[]` | Ordered backup HTTP endpoints. Non-empty enables chain mode (fast-fail ~6s per provider, then switch). Empty keeps historical single-provider behaviour |
+| `failover_max_attempts` | Integer | No | `3` | Chain mode only: total tries per provider per request (initial + 2 retries) |
+| `provider_cooldown_secs` | Integer | No | `120` | Chain mode: seconds a tripped provider sits out before a passive re-probe (doubles on consecutive trips, cap 600) |
+| `provider_group` | String | No | client profile name | Compatibility group for encrypted reasoning. Same group + same model keeps `rs_*` ids and encrypted thinking across host failover. See [docs/retry-and-provider-fallback.md](docs/retry-and-provider-fallback.md) |
 | `extra_headers` | Object | No | `{}` | Custom HTTP headers sent with LLM requests (`X-App-Version`, etc.) |
 | `extra_body` | Object | No | `{}` | Custom JSON fields merged into top level of LLM request payload |
 | `enable_doom_loop_check`| Boolean | No | Auto | Server-side doom loop header (`x-grok-doom-loop-check`) |

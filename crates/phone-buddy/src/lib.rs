@@ -43,7 +43,7 @@ pub mod tools;
 pub mod prelude {
     pub use crate::config::{
         ClientProfile, ClientProfileDefinition, EngineConfig, EngineConfigBuilder,
-        DEFAULT_AGENT_NAME,
+        ProviderEndpoint, DEFAULT_AGENT_NAME,
     };
     pub use crate::engine::{ChatOutcome, PhoneBuddyEngine};
     pub use crate::error::{EngineError, EngineResult};

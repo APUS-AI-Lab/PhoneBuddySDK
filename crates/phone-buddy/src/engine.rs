@@ -496,15 +496,19 @@ impl PhoneBuddyEngine {
             let reasoning_items = turn.reasoning_items.clone();
             let encrypted_reasoning = turn.encrypted_reasoning.clone();
 
+            let origin = self.client.origin_fingerprint();
             if turn.tool_calls.is_empty() {
                 session
                     .messages
-                    .push(ChatMessage::assistant_with_reasoning(
-                        turn.text.clone(),
-                        reasoning_opt,
-                        reasoning_items,
-                        encrypted_reasoning,
-                    ));
+                    .push(
+                        ChatMessage::assistant_with_reasoning(
+                            turn.text.clone(),
+                            reasoning_opt,
+                            reasoning_items,
+                            encrypted_reasoning,
+                        )
+                        .with_origin(origin),
+                    );
                 let final_text = turn.text.clone();
                 self.sessions.save(&session)?;
                 return Ok(ChatOutcome {
@@ -524,17 +528,20 @@ impl PhoneBuddyEngine {
                 .unwrap_or("");
             identical.observe(&sig, step_name);
 
-            session.messages.push(ChatMessage::assistant_tool_calls_with_reasoning(
-                turn.tool_calls.clone(),
-                if turn.text.is_empty() {
-                    None
-                } else {
-                    Some(turn.text.clone())
-                },
-                reasoning_opt,
-                reasoning_items,
-                encrypted_reasoning,
-            ));
+            session.messages.push(
+                ChatMessage::assistant_tool_calls_with_reasoning(
+                    turn.tool_calls.clone(),
+                    if turn.text.is_empty() {
+                        None
+                    } else {
+                        Some(turn.text.clone())
+                    },
+                    reasoning_opt,
+                    reasoning_items,
+                    encrypted_reasoning,
+                )
+                .with_origin(origin),
+            );
 
             // Execute each tool call sequentially (mobile: keep it simple and
             // predictable; parallel dispatch is a future optimization).

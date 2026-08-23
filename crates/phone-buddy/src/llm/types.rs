@@ -160,6 +160,12 @@ pub struct ChatMessage {
     /// Encrypted reasoning tokens / signature for multi-turn continuation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_reasoning: Option<String>,
+    /// Compatibility key (`group/model`) of the provider that produced this
+    /// assistant turn. Missing (legacy sessions) is treated as the primary
+    /// provider. Same group + same model keeps encrypted thinking across
+    /// host failover. Stripped from Chat Completions wire JSON in transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// A provider that validates `function.arguments` rejects the whole request,
@@ -197,6 +203,27 @@ impl ChatMessage {
         out
     }
 
+    /// Drop encrypted thinking when this message's compatibility key
+    /// (`group/model`) differs from `target`. Text, tool calls, and tool
+    /// results are always kept so the new model can continue the turn.
+    /// Same group + same model (grok-build-style full history replay)
+    /// leaves reasoning item ids and encrypted content in place.
+    pub fn sanitized_for_provider(&self, target: &str, primary: &str) -> Self {
+        let mut out = self.sanitized_for_request();
+        if crate::llm::failover::should_strip_origin(out.origin.as_deref(), target, primary)
+        {
+            out.reasoning_items.clear();
+            out.encrypted_reasoning = None;
+            out.reasoning_content = None;
+        }
+        out
+    }
+
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: Role::System,
@@ -206,6 +233,7 @@ impl ChatMessage {
             reasoning_items: Vec::new(),
             reasoning_content: None,
             encrypted_reasoning: None,
+            origin: None,
         }
     }
 
@@ -218,6 +246,7 @@ impl ChatMessage {
             reasoning_items: Vec::new(),
             reasoning_content: None,
             encrypted_reasoning: None,
+            origin: None,
         }
     }
 
@@ -230,6 +259,7 @@ impl ChatMessage {
             reasoning_items: Vec::new(),
             reasoning_content: None,
             encrypted_reasoning: None,
+            origin: None,
         }
     }
 
@@ -247,6 +277,7 @@ impl ChatMessage {
             reasoning_items,
             reasoning_content: reasoning,
             encrypted_reasoning,
+            origin: None,
         }
     }
 
@@ -259,6 +290,7 @@ impl ChatMessage {
             reasoning_items: Vec::new(),
             reasoning_content: None,
             encrypted_reasoning: None,
+            origin: None,
         }
     }
 
@@ -277,6 +309,7 @@ impl ChatMessage {
             reasoning_items,
             reasoning_content: reasoning,
             encrypted_reasoning,
+            origin: None,
         }
     }
 
@@ -289,6 +322,7 @@ impl ChatMessage {
             reasoning_items: Vec::new(),
             reasoning_content: None,
             encrypted_reasoning: None,
+            origin: None,
         }
     }
 }
@@ -436,7 +470,7 @@ pub struct Usage {
 // Shapes ported from grok sampling-types: `ChatCompletionChunk`,
 // `ChatChunkChoice`, `ChatChunkDelta`, `ToolCallDelta`.
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ChatCompletionChunk {
     #[serde(default)]
     pub id: String,
@@ -452,7 +486,7 @@ pub struct ChatCompletionChunk {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ChatChunkChoice {
     #[serde(default)]
     pub index: u32,

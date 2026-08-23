@@ -113,6 +113,54 @@ pub struct EngineConfig {
     /// Configuration for dumping raw HTTP requests and responses to disk for debugging.
     #[serde(default)]
     pub http_dump: HttpDumpConfig,
+    /// Ordered fallback endpoints tried after the primary provider degrades.
+    /// Empty (the default) keeps single-provider behaviour: the full
+    /// [`max_retries`] budget is spent on the primary endpoint.
+    #[serde(default)]
+    pub fallback_providers: Vec<ProviderEndpoint>,
+    /// Chain mode only: total attempts per provider per LLM request before
+    /// failing over (default 3 = initial + 2 retries).
+    #[serde(default = "default_failover_max_attempts")]
+    pub failover_max_attempts: u32,
+    /// Cooldown (secs) a degraded provider sits out before re-probing
+    /// (default 120; doubles on consecutive trips, capped at 600).
+    #[serde(default = "default_provider_cooldown_secs")]
+    pub provider_cooldown_secs: u64,
+    /// Compatibility group for encrypted reasoning / reasoning-item ids.
+    /// Empty falls back to the client-profile name (`grok_build`, `codex`,
+    /// `claude_code`, `default`). Same group + same model keeps those
+    /// artifacts when failing over to another host.
+    #[serde(default)]
+    pub provider_group: Option<String>,
+}
+
+/// One backup LLM HTTP endpoint. Fields mirror the primary EngineConfig
+/// HTTP identity so a fallback can use a different vendor, model, and
+/// client profile.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderEndpoint {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_backend: ApiBackend,
+    #[serde(default)]
+    pub client_profile: ClientProfile,
+    #[serde(default)]
+    pub client_version: Option<String>,
+    #[serde(default)]
+    pub client_session_id: Option<String>,
+    #[serde(default)]
+    pub extra_headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub extra_body: std::collections::HashMap<String, serde_json::Value>,
+    /// Hosted `{type: web_search}` on Responses. Independent of the
+    /// client-side DuckDuckGo function tool.
+    #[serde(default)]
+    pub enable_web_search: bool,
+    /// Compatibility group; empty inherits this endpoint's `client_profile`.
+    #[serde(default)]
+    pub provider_group: Option<String>,
 }
 
 
@@ -145,6 +193,12 @@ fn default_idle_timeout_secs() -> u64 {
 fn default_max_retries() -> u32 {
     5
 }
+fn default_failover_max_attempts() -> u32 {
+    crate::llm::failover::DEFAULT_FAILOVER_MAX_ATTEMPTS
+}
+fn default_provider_cooldown_secs() -> u64 {
+    crate::llm::failover::DEFAULT_PROVIDER_COOLDOWN_SECS
+}
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -173,6 +227,10 @@ impl Default for EngineConfig {
             enable_doom_loop_check: None,
             web_fetch_allow_local: false,
             http_dump: HttpDumpConfig::default(),
+            fallback_providers: Vec::new(),
+            failover_max_attempts: default_failover_max_attempts(),
+            provider_cooldown_secs: default_provider_cooldown_secs(),
+            provider_group: None,
         }
     }
 }
@@ -265,6 +323,21 @@ impl EngineConfig {
             }
             LlmMode::Host => {
                 // Host mode uses FFI callbacks; no HTTP credentials required.
+            }
+        }
+        for (i, ep) in self.fallback_providers.iter().enumerate() {
+            if ep.model.trim().is_empty() {
+                return Err(format!("fallback_providers[{i}].model is empty"));
+            }
+            if ep.api_key.trim().is_empty() {
+                return Err(format!("fallback_providers[{i}].api_key is empty"));
+            }
+            if !ep.base_url.starts_with("http://") && !ep.base_url.starts_with("https://")
+            {
+                return Err(format!(
+                    "fallback_providers[{i}].base_url must be an http(s) URL: {}",
+                    ep.base_url
+                ));
             }
         }
         Ok(())
@@ -486,6 +559,37 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Replace the ordered fallback provider list.
+    pub fn fallback_providers(mut self, providers: Vec<ProviderEndpoint>) -> Self {
+        self.config.fallback_providers = providers;
+        self
+    }
+
+    /// Push one fallback endpoint onto the chain.
+    pub fn fallback_provider(mut self, endpoint: ProviderEndpoint) -> Self {
+        self.config.fallback_providers.push(endpoint);
+        self
+    }
+
+    /// Set per-provider attempt budget used when fallbacks are configured.
+    pub fn failover_max_attempts(mut self, attempts: u32) -> Self {
+        self.config.failover_max_attempts = attempts;
+        self
+    }
+
+    /// Set the starting cooldown (seconds) after a provider trip.
+    pub fn provider_cooldown_secs(mut self, secs: u64) -> Self {
+        self.config.provider_cooldown_secs = secs;
+        self
+    }
+
+    /// Set the encrypted-reasoning compatibility group for the primary
+    /// provider. Fallbacks use [`ProviderEndpoint::provider_group`].
+    pub fn provider_group(mut self, group: impl Into<String>) -> Self {
+        self.config.provider_group = Some(group.into());
+        self
+    }
+
     /// Validate and build the [`EngineConfig`].
     pub fn build(self) -> Result<EngineConfig, String> {
         self.config.validate()?;
@@ -544,6 +648,33 @@ mod tests {
         assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
         assert_eq!(claude_cfg.api_backend, ApiBackend::Messages);
         assert_eq!(claude_cfg.client_session_id.as_deref(), Some("sess-custom-uuid"));
+    }
+
+    #[test]
+    fn fallback_fields_default_and_round_trip() {
+        let json = r#"{
+            "api_key": "k",
+            "base_url": "https://api.example.com/v1",
+            "model": "m",
+            "root_dir": "/tmp/pb"
+        }"#;
+        let cfg: EngineConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.fallback_providers.is_empty());
+        assert_eq!(cfg.failover_max_attempts, 3);
+        assert_eq!(cfg.provider_cooldown_secs, 120);
+
+        let mut cfg2 = EngineConfig::default();
+        cfg2.api_key = "k".into();
+        cfg2.fallback_providers.push(ProviderEndpoint {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        });
+        let encoded = serde_json::to_string(&cfg2).unwrap();
+        let decoded: EngineConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.fallback_providers.len(), 1);
+        assert_eq!(decoded.fallback_providers[0].model, "gpt-4o");
     }
 }
 

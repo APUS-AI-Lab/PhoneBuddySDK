@@ -401,14 +401,18 @@ impl TaskManager {
                     let reasoning_items = turn.reasoning_items.clone();
                     let encrypted_reasoning = turn.encrypted_reasoning.clone();
 
+                    let origin = self.client.origin_fingerprint();
                     if turn.tool_calls.is_empty() {
                         final_text = turn.text.clone();
-                        messages.push(ChatMessage::assistant_with_reasoning(
-                            turn.text,
-                            reasoning_opt,
-                            reasoning_items,
-                            encrypted_reasoning,
-                        ));
+                        messages.push(
+                            ChatMessage::assistant_with_reasoning(
+                                turn.text,
+                                reasoning_opt,
+                                reasoning_items,
+                                encrypted_reasoning,
+                            )
+                            .with_origin(origin.clone()),
+                        );
                         {
                             let mut guard = self.tasks.lock().unwrap();
                             if let Some(record) = guard.get_mut(task_id) {
@@ -421,13 +425,16 @@ impl TaskManager {
                         break;
                     }
 
-                    messages.push(ChatMessage::assistant_tool_calls_with_reasoning(
-                        turn.tool_calls.clone(),
-                        if turn.text.is_empty() { None } else { Some(turn.text.clone()) },
-                        reasoning_opt,
-                        reasoning_items,
-                        encrypted_reasoning,
-                    ));
+                    messages.push(
+                        ChatMessage::assistant_tool_calls_with_reasoning(
+                            turn.tool_calls.clone(),
+                            if turn.text.is_empty() { None } else { Some(turn.text.clone()) },
+                            reasoning_opt,
+                            reasoning_items,
+                            encrypted_reasoning,
+                        )
+                        .with_origin(origin),
+                    );
 
                     for call in &turn.tool_calls {
                         total_tool_calls += 1;

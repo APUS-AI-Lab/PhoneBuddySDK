@@ -275,6 +275,14 @@ impl LlmTransport for HttpTransport {
                 let mut val = serde_json::to_value(req)?;
                 val["stream"] = serde_json::Value::Bool(true);
                 val["stream_options"] = serde_json::json!({ "include_usage": true });
+                // Internal origin tags must never leave the process.
+                if let Some(arr) = val.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                    for m in arr {
+                        if let Some(obj) = m.as_object_mut() {
+                            obj.remove("origin");
+                        }
+                    }
+                }
                 val
             }
             ApiBackend::Responses => build_responses_payload(req),

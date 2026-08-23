@@ -25,6 +25,19 @@ pub enum ClientProfile {
     ClaudeCode,
 }
 
+impl ClientProfile {
+    /// Wire name used as the default provider-group id when the host does
+    /// not set an explicit `provider_group`.
+    pub fn group_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::GrokBuild => "grok_build",
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+}
+
 impl std::str::FromStr for ClientProfile {
     type Err = String;
 

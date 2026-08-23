@@ -36,6 +36,24 @@ pub enum AgentEvent {
     },
     /// Turn failed.
     Failed { message: String },
+    /// The current provider failed and the engine is waiting before retrying
+    /// the same provider. `provider` is a desensitized host/model id.
+    Retrying {
+        provider: String,
+        attempt: u32,
+        max_attempts: u32,
+        wait_ms: u64,
+        reason: String,
+    },
+    /// The current provider was marked degraded and the engine switched to
+    /// the next endpoint in the fallback chain. `from` / `to` are
+    /// desensitized host/model ids; they never carry an API key.
+    ProviderSwitched {
+        from: String,
+        to: String,
+        reason: String,
+        cooldown_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -86,5 +104,41 @@ impl RecordingObserver {
 impl AgentObserver for RecordingObserver {
     fn on_event(&self, event: AgentEvent) {
         self.events.lock().unwrap().push(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrying_and_switched_serialize_externally_tagged() {
+        let retrying = AgentEvent::Retrying {
+            provider: "cf.api.fan/grok-4.6".into(),
+            attempt: 2,
+            max_attempts: 3,
+            wait_ms: 2000,
+            reason: "status=503".into(),
+        };
+        let json = serde_json::to_string(&retrying).unwrap();
+        assert!(json.contains("\"Retrying\""));
+        assert!(json.contains("cf.api.fan/grok-4.6"));
+        assert!(!json.to_ascii_lowercase().contains("sk-"));
+
+        let switched = AgentEvent::ProviderSwitched {
+            from: "cf.api.fan/grok-4.6".into(),
+            to: "api.openai.com/gpt-5.6".into(),
+            reason: "status=503".into(),
+            cooldown_ms: 120_000,
+        };
+        let json = serde_json::to_string(&switched).unwrap();
+        assert!(json.contains("\"ProviderSwitched\""));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::ProviderSwitched { cooldown_ms, .. } => {
+                assert_eq!(cooldown_ms, 120_000);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
