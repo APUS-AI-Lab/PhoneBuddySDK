@@ -669,29 +669,7 @@ fn merge_reasoning_items(
     old: &[crate::llm::types::ReasoningItem],
     new: &[crate::llm::types::ReasoningItem],
 ) -> Vec<crate::llm::types::ReasoningItem> {
-    let mut out = old.to_vec();
-    for n in new {
-        if n.id.is_empty() {
-            if !out.iter().any(|o| o == n) {
-                out.push(n.clone());
-            }
-            continue;
-        }
-        if let Some(existing) = out.iter_mut().find(|o| o.id == n.id) {
-            if n.encrypted_content.is_some() {
-                existing.encrypted_content = n.encrypted_content.clone();
-            }
-            if !n.summary.is_empty() {
-                existing.summary = n.summary.clone();
-            }
-            if n.content.is_some() {
-                existing.content = n.content.clone();
-            }
-        } else {
-            out.push(n.clone());
-        }
-    }
-    out
+    crate::llm::types::merge_reasoning_items(old, new)
 }
 
 fn merge_continued_turn(partial: &CollectedTurn, cont: CollectedTurn) -> CollectedTurn {

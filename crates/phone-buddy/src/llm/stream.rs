@@ -103,8 +103,11 @@ pub async fn collect_stream(
             if let Some(enc) = &delta.encrypted_reasoning {
                 turn.encrypted_reasoning = Some(enc.clone());
             }
-            for ri in &delta.reasoning_items {
-                turn.reasoning_items.push(ri.clone());
+            if !delta.reasoning_items.is_empty() {
+                turn.reasoning_items = crate::llm::types::merge_reasoning_items(
+                    &turn.reasoning_items,
+                    &delta.reasoning_items,
+                );
             }
 
             for tc in &delta.tool_calls {
@@ -214,18 +217,18 @@ fn finalize_turn(
         });
     }
 
-    // If no typed reasoning items arrived but reasoning text or encrypted content was
-    // collected, synthesize a ReasoningItem (matching grok-build `inject_streaming_reasoning_fallback`).
-    if turn.reasoning_items.is_empty()
-        && (!turn.reasoning.is_empty() || turn.encrypted_reasoning.is_some())
-    {
+    // grok-build: after flattening `response.output`, splice streamed
+    // reasoning text into empty-summary items. Encrypted-only items
+    // already arrived via OutputItemDone; only synthesize one if the
+    // stream never produced a typed item.
+    crate::llm::types::inject_streaming_reasoning_fallback(
+        &mut turn.reasoning_items,
+        &turn.reasoning,
+    );
+    if turn.reasoning_items.is_empty() {
         if let Some(item) = crate::llm::types::build_synthetic_reasoning(
             String::new(),
-            if turn.reasoning.is_empty() {
-                None
-            } else {
-                Some(&turn.reasoning)
-            },
+            None,
             turn.encrypted_reasoning.as_deref(),
         ) {
             turn.reasoning_items.push(item);
@@ -511,6 +514,91 @@ mod tests {
             }
             other => panic!("expected IdleTimeout, got {other:?}"),
         }
+    }
+
+    fn reasoning_item(
+        id: &str,
+        summary: Vec<crate::llm::types::SummaryPart>,
+        enc: Option<&str>,
+    ) -> crate::llm::types::ReasoningItem {
+        crate::llm::types::ReasoningItem {
+            id: id.into(),
+            summary,
+            content: None,
+            encrypted_content: enc.map(str::to_string),
+            status: None,
+        }
+    }
+
+    fn chunk_with_reasoning(
+        item: Option<crate::llm::types::ReasoningItem>,
+        reasoning_text: Option<&str>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatChunkDelta {
+                    reasoning_content: reasoning_text.map(str::to_string),
+                    reasoning_items: item.into_iter().collect(),
+                    ..Default::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn merges_reasoning_items_with_the_same_id() {
+        // output_item.added is an empty stub; output_item.done carries
+        // encrypted_content. Pushing both as siblings made the next
+        // turn's input[1] a reasoning item with no summary.
+        let stream = stream::iter(vec![
+            Ok(chunk_with_reasoning(
+                Some(reasoning_item("rs_1", Vec::new(), None)),
+                None,
+            )),
+            Ok(chunk_with_reasoning(
+                Some(reasoning_item("rs_1", Vec::new(), Some("enc"))),
+                None,
+            )),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.reasoning_items.len(), 1);
+        assert_eq!(turn.reasoning_items[0].id, "rs_1");
+        assert_eq!(
+            turn.reasoning_items[0].encrypted_content.as_deref(),
+            Some("enc")
+        );
+    }
+
+    #[tokio::test]
+    async fn fills_empty_reasoning_summary_from_streamed_text() {
+        // grok-build inject_streaming_reasoning_fallback: if a typed
+        // Reasoning sibling arrived with no text, splice streamed
+        // reasoning deltas into its summary so the next-turn payload
+        // is valid.
+        let stream = stream::iter(vec![
+            Ok(chunk_with_reasoning(
+                Some(reasoning_item("rs_1", Vec::new(), None)),
+                None,
+            )),
+            Ok(chunk_with_reasoning(None, Some("thinking about APUS"))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.reasoning_items.len(), 1);
+        assert_eq!(
+            crate::llm::types::reasoning_item_text(&turn.reasoning_items[0]),
+            "thinking about APUS"
+        );
     }
 }
 

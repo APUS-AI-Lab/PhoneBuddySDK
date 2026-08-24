@@ -49,7 +49,12 @@ pub enum Role {
 pub struct ReasoningItem {
     #[serde(default)]
     pub id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Always serialize, even as `[]`. The Responses API rejects
+    // `type: "reasoning"` items that omit `summary` (`missing field
+    // summary` → 422). Matches async-openai `rs::ReasoningItem` /
+    // grok-build `conversation/responses.rs` (empty summary is valid
+    // for encrypted-only `tco_*` blobs).
+    #[serde(default)]
     pub summary: Vec<SummaryPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ReasoningTextContent>>,
@@ -139,6 +144,129 @@ pub fn build_synthetic_reasoning(
     })
 }
 
+/// Merge `new` into `old` by `id`.
+///
+/// grok-build takes a single canonical list from
+/// `ResponseCompleted.response.output`. PhoneBuddy does not keep a
+/// `Response` object, so `output_item.done` and `response.output` can
+/// both emit the same id; merge instead of appending duplicates.
+/// Empty-id items are kept unless they are exact duplicates.
+pub fn merge_reasoning_items(old: &[ReasoningItem], new: &[ReasoningItem]) -> Vec<ReasoningItem> {
+    let mut out = old.to_vec();
+    for n in new {
+        if n.id.is_empty() {
+            if !out.iter().any(|o| o == n) {
+                out.push(n.clone());
+            }
+            continue;
+        }
+        if let Some(existing) = out.iter_mut().find(|o| o.id == n.id) {
+            if n.encrypted_content.is_some() {
+                existing.encrypted_content = n.encrypted_content.clone();
+            }
+            if !n.summary.is_empty() {
+                existing.summary = n.summary.clone();
+            }
+            if n.content.is_some() {
+                existing.content = n.content.clone();
+            }
+        } else {
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
+/// Ported from grok-build `conversation.rs::inject_streaming_reasoning_fallback`.
+///
+/// Called after typed items are collected, when streamed reasoning
+/// deltas were observed but those items have no summary text:
+///
+/// - If any existing item already carries summary text, leave items
+///   untouched (the deltas are redundant).
+/// - Otherwise, if there is an item with no summary text, append a
+///   `SummaryText` part to it (avoids introducing a phantom sibling).
+/// - Otherwise, push a new `synthesized_reasoning_item(text)`.
+///
+/// Grok-build inspects `summary` only (not `content`); encrypted-only
+/// `tco_*` blobs keep `summary: []`.
+pub fn inject_streaming_reasoning_fallback(items: &mut Vec<ReasoningItem>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let any_with_text = items.iter().any(|r| {
+        r.summary.iter().any(|sp| match sp {
+            SummaryPart::SummaryText(t) => !t.text.is_empty(),
+        })
+    });
+    if any_with_text {
+        return;
+    }
+    if let Some(r) = items.first_mut() {
+        r.summary.push(SummaryPart::SummaryText(SummaryTextContent {
+            text: text.to_string(),
+        }));
+        return;
+    }
+    items.push(synthesized_reasoning_item(text));
+}
+
+#[cfg(test)]
+mod inject_fallback_tests {
+    use super::*;
+
+    fn empty_item(id: &str) -> ReasoningItem {
+        ReasoningItem {
+            id: id.into(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn leaves_items_untouched_when_any_summary_has_text() {
+        let mut items = vec![ReasoningItem {
+            id: "rs_1".into(),
+            summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                text: "already there".into(),
+            })],
+            content: None,
+            encrypted_content: None,
+            status: None,
+        }];
+        inject_streaming_reasoning_fallback(&mut items, "streamed");
+        assert_eq!(items.len(), 1);
+        assert_eq!(reasoning_item_text(&items[0]), "already there");
+    }
+
+    #[test]
+    fn appends_summary_to_first_empty_item() {
+        let mut items = vec![empty_item("rs_1")];
+        inject_streaming_reasoning_fallback(&mut items, "streamed");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "rs_1");
+        assert_eq!(reasoning_item_text(&items[0]), "streamed");
+    }
+
+    #[test]
+    fn synthesizes_item_when_none_exist() {
+        let mut items = Vec::new();
+        inject_streaming_reasoning_fallback(&mut items, "streamed");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].id.is_empty());
+        assert_eq!(reasoning_item_text(&items[0]), "streamed");
+    }
+
+    #[test]
+    fn ignores_empty_text() {
+        let mut items: Vec<ReasoningItem> = Vec::new();
+        inject_streaming_reasoning_fallback(&mut items, "");
+        assert!(items.is_empty());
+    }
+}
+
 // ── Messages ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,11 +322,8 @@ impl ChatMessage {
     pub fn sanitized_for_request(&self) -> Self {
         let mut out = self.clone();
         for tc in &mut out.tool_calls {
-            tc.function.arguments = sanitize_tool_arguments(
-                &tc.id,
-                &tc.function.name,
-                &tc.function.arguments,
-            );
+            tc.function.arguments =
+                sanitize_tool_arguments(&tc.id, &tc.function.name, &tc.function.arguments);
         }
         out
     }
@@ -210,8 +335,7 @@ impl ChatMessage {
     /// leaves reasoning item ids and encrypted content in place.
     pub fn sanitized_for_provider(&self, target: &str, primary: &str) -> Self {
         let mut out = self.sanitized_for_request();
-        if crate::llm::failover::should_strip_origin(out.origin.as_deref(), target, primary)
-        {
+        if crate::llm::failover::should_strip_origin(out.origin.as_deref(), target, primary) {
             out.reasoning_items.clear();
             out.encrypted_reasoning = None;
             out.reasoning_content = None;

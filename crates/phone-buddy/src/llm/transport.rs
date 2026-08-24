@@ -533,7 +533,12 @@ fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
                 }
             }
             Role::Assistant => {
-                // Sibling Reasoning items (preserved exactly like grok-build conversation/responses.rs)
+                // Sibling Reasoning items. Mirrors grok-build
+                // `conversation_item_to_input_items`: serialize the
+                // typed item, drop output-only `status`, keep `summary`
+                // even when empty. Do not invent summary from
+                // `reasoning_content` — grok-build fills that at collect
+                // time via `inject_streaming_reasoning_fallback`.
                 for r in &msg.reasoning_items {
                     let mut r_val = serde_json::to_value(r).unwrap_or_default();
                     if let Some(obj) = r_val.as_object_mut() {
@@ -541,10 +546,11 @@ fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
                     }
                     let mut item_obj = serde_json::json!({
                         "type": "reasoning",
+                        "summary": r_val
+                            .get("summary")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([])),
                     });
-                    if let Some(summary) = r_val.get("summary") {
-                        item_obj["summary"] = summary.clone();
-                    }
                     if let Some(content) = r_val.get("content") {
                         if !content.is_null() {
                             item_obj["content"] = content.clone();
@@ -596,6 +602,12 @@ fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
         "model": req.model,
         "input": input,
         "stream": true,
+        // grok-build `From<&ConversationRequest> for rs::CreateResponse`
+        // always requests a concise reasoning summary so the next turn
+        // can round-trip `summary: []` encrypted blobs *and* visible
+        // `summary_text` parts. Effort is optional there; we don't have
+        // a per-request effort field yet.
+        "reasoning": { "summary": "concise" },
     });
     if let Some(ref id) = req.previous_response_id {
         if !id.is_empty() {
@@ -886,9 +898,19 @@ fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<Ch
     } else if let Some(item) = v.get("item").or_else(|| v.get("reasoning")) {
         let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
         if item_type == "reasoning" {
-            if let Ok(ri) = serde_json::from_value::<crate::llm::types::ReasoningItem>(item.clone()) {
-                delta.encrypted_reasoning = ri.encrypted_content.clone();
-                delta.reasoning_items.push(ri);
+            // grok-build `stream/responses.rs`: `ResponseOutputItemAdded`
+            // only handles FunctionCall. Reasoning siblings are taken
+            // from OutputItemDone / ResponseCompleted.output — the added
+            // event is an empty stub (`summary: []`) that 422s if replayed.
+            let is_added = type_str.contains("output_item.added")
+                || json_type.contains("output_item.added");
+            if !is_added {
+                if let Ok(ri) =
+                    serde_json::from_value::<crate::llm::types::ReasoningItem>(item.clone())
+                {
+                    delta.encrypted_reasoning = ri.encrypted_content.clone();
+                    delta.reasoning_items.push(ri);
+                }
             }
         } else if let Some(mut tc) = tool_delta_from_output_item(item, output_index_of(&v)) {
             // grok-build: `ResponseOutputItemAdded` is id+name only.
@@ -1546,6 +1568,111 @@ mod tests {
     }
 
     #[test]
+    fn responses_payload_requests_concise_reasoning_summary() {
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let payload = build_responses_payload(&req);
+        assert_eq!(payload["reasoning"]["summary"], "concise");
+        assert!(payload["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn responses_payload_always_includes_reasoning_summary_field() {
+        // grok-build `test_responses_api_with_only_encrypted_reasoning`:
+        // empty summary is valid and must serialize as `[]`, never omitted.
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![
+                ChatMessage::user("你会做什么"),
+                ChatMessage::assistant_with_reasoning(
+                    "我是 PhoneBuddy",
+                    None,
+                    vec![crate::llm::types::ReasoningItem {
+                        id: "rs_added_stub".into(),
+                        summary: Vec::new(),
+                        content: None,
+                        encrypted_content: Some("enc".into()),
+                        status: None,
+                    }],
+                    Some("enc".into()),
+                ),
+                ChatMessage::user("帮我查一下apus这家公司"),
+            ],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+
+        let payload = build_responses_payload(&req);
+        let input = payload["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_added_stub");
+        assert!(
+            input[1].get("summary").is_some(),
+            "summary must be present, got {}",
+            input[1]
+        );
+        assert_eq!(input[1]["summary"], serde_json::json!([]));
+        assert_eq!(input[1]["encrypted_content"], "enc");
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[3]["role"], "user");
+    }
+
+    #[test]
+    fn responses_payload_does_not_invent_summary_from_reasoning_content() {
+        // grok-build fills summary at collect time via
+        // `inject_streaming_reasoning_fallback`, not at wire build.
+        // An empty-summary sibling stays `summary: []`.
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![
+                ChatMessage::user("hi"),
+                ChatMessage::assistant_with_reasoning(
+                    "hello",
+                    Some("I should greet the user".into()),
+                    vec![crate::llm::types::ReasoningItem {
+                        id: "rs_1".into(),
+                        summary: Vec::new(),
+                        content: None,
+                        encrypted_content: None,
+                        status: None,
+                    }],
+                    None,
+                ),
+            ],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+
+        let payload = build_responses_payload(&req);
+        let input = payload["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["summary"], serde_json::json!([]));
+    }
+
+    #[test]
     fn test_responses_chunk_parsing_reasoning() {
         let reasoning_delta = r#"{"type":"response.reasoning_text.delta","delta":"Analyzing..."}"#;
         let chunk = parse_responses_chunk("response.reasoning_text.delta", reasoning_delta).unwrap().unwrap();
@@ -1564,6 +1691,25 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.encrypted_reasoning.as_deref(), Some("enc_secret"));
         assert_eq!(chunk.choices[0].delta.reasoning_items.len(), 1);
         assert_eq!(chunk.choices[0].delta.reasoning_items[0].id, "r_123");
+
+        // grok-build ignores Reasoning on OutputItemAdded.
+        let added = r#"{
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_stub",
+                "summary": []
+            }
+        }"#;
+        let added_chunk = parse_responses_chunk("response.output_item.added", added).unwrap();
+        assert!(
+            added_chunk.is_none()
+                || added_chunk
+                    .as_ref()
+                    .is_some_and(|c| c.choices[0].delta.reasoning_items.is_empty()),
+            "output_item.added reasoning stub must not be persisted"
+        );
     }
 
     #[test]
