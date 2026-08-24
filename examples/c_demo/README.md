@@ -18,10 +18,10 @@ This example demonstrates a complete, interactive AI Agent application written i
 
 ## Files
 
-- **[main.c](file:///Users/hyattjackson/Projects/PhoneBuddySDK/examples/c_demo/main.c)** - Complete interactive C Agent implementation with built-in lightweight JSON parser and streaming TUI.
-- **[config.json.example](file:///Users/hyattjackson/Projects/PhoneBuddySDK/examples/c_demo/config.json.example)** - Example configuration file template.
-- **[build.sh](file:///Users/hyattjackson/Projects/PhoneBuddySDK/examples/c_demo/build.sh)** - Automated build script with Rust FFI compilation and run support.
-- **[Makefile](file:///Users/hyattjackson/Projects/PhoneBuddySDK/examples/c_demo/Makefile)** - Standard Makefile for macOS and Linux.
+- **[main.c](main.c)** - Complete interactive C Agent implementation with built-in lightweight JSON parser and streaming TUI.
+- **[config.json.example](config.json.example)** - Example configuration file template.
+- **[build.sh](build.sh)** - Automated build script with Rust FFI compilation and run support.
+- **[Makefile](Makefile)** - Standard Makefile for macOS and Linux.
 
 ---
 

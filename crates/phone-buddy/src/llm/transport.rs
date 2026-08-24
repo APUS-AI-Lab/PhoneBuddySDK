@@ -891,15 +891,17 @@ fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<Ch
                 delta.reasoning_items.push(ri);
             }
         } else if let Some(mut tc) = tool_delta_from_output_item(item, output_index_of(&v)) {
-            // grok-build: `ResponseOutputItemAdded(FunctionCall)` emits
-            // id+name only (`arguments_delta: None`). Arguments arrive
-            // via `.delta` fragments; `output_item.done` may carry a
-            // snapshot used only if the buffer is still empty.
-            // Server-side tools (`web_search_call`, …) keep `action` on
-            // added — that is the only payload they have.
+            // grok-build: `ResponseOutputItemAdded` is id+name only.
+            // FunctionCall arguments arrive via `.delta` fragments;
+            // `output_item.done` may carry a snapshot used only if the
+            // buffer is still empty.
+            // Hosted tools (`web_search_call`, …) are the same: added is
+            // not the payload. Grok often sends a placeholder
+            // `{"type":"search","query":"","sources":[]}` on added;
+            // query and sources arrive on OutputItemDone.
             let is_added = type_str.contains("output_item.added")
                 || json_type.contains("output_item.added");
-            if is_added && tc.kind.as_deref() == Some("function") {
+            if is_added {
                 if let Some(f) = tc.function.as_mut() {
                     f.arguments = None;
                 }
@@ -1608,14 +1610,18 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_chunk_parses_web_search_call_item() {
+    fn test_responses_web_search_added_is_id_and_name_only() {
+        // grok-build: OutputItemAdded(WebSearchCall) is not the payload.
+        // Grok often puts a placeholder action
+        // `{"type":"search","query":"","sources":[]}` on added; query and
+        // sources arrive on OutputItemDone.
         let added = r#"{
             "type": "response.output_item.added",
             "output_index": 2,
             "item": {
                 "type": "web_search_call",
                 "id": "ws_1",
-                "action": {"query": "today news"}
+                "action": {"type":"search","query":"","sources":[]}
             }
         }"#;
         let chunk = parse_responses_chunk("response.output_item.added", added)
@@ -1624,16 +1630,53 @@ mod tests {
         let tc = &chunk.choices[0].delta.tool_calls[0];
         assert_eq!(tc.index, 2);
         assert_eq!(tc.id.as_deref(), Some("ws_1"));
+        assert_eq!(tc.kind.as_deref(), Some("server"));
         assert_eq!(
             tc.function.as_ref().and_then(|f| f.name.as_deref()),
             Some("web_search")
         );
-        assert!(tc
+        assert!(
+            tc.function
+                .as_ref()
+                .and_then(|f| f.arguments.as_deref())
+                .is_none_or(|a| a.is_empty()),
+            "added must not carry the placeholder action as arguments: {:?}",
+            tc.function.as_ref().and_then(|f| f.arguments.as_ref())
+        );
+    }
+
+    #[test]
+    fn test_responses_web_search_done_carries_action_query() {
+        let done = r#"{
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "today news",
+                    "sources": [{"type":"url","url":"https://example.com"}]
+                }
+            }
+        }"#;
+        let chunk = parse_responses_chunk("response.output_item.done", done)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.id.as_deref(), Some("ws_1"));
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("web_search")
+        );
+        let args = tc
             .function
             .as_ref()
-            .and_then(|f| f.arguments.as_ref())
-            .unwrap()
-            .contains("today news"));
+            .and_then(|f| f.arguments.as_deref())
+            .unwrap_or("");
+        assert!(args.contains("today news"), "done args: {args}");
+        assert!(args.contains("https://example.com"), "done args: {args}");
     }
 
     #[test]

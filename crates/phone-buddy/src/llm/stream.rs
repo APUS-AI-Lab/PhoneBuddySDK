@@ -9,9 +9,7 @@ use futures_util::StreamExt;
 
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver};
-use crate::llm::types::{
-    ChatCompletionChunk, CollectedTurn, ToolCall, ToolCallFunction, Usage,
-};
+use crate::llm::types::{ChatCompletionChunk, CollectedTurn, ToolCall, ToolCallFunction, Usage};
 
 /// Error from [`collect_stream`]. Idle timeout keeps the partial turn so
 /// the retry layer can prefix-continue; every other stream error is
@@ -153,14 +151,18 @@ pub async fn collect_stream(
                         entry.0.clone()
                     };
                     if started.insert(call_id.clone()) {
+                        // grok-build `BackendToolCallStarted` carries
+                        // name+id only. Hosted search query/sources land
+                        // later on OutputItemDone (ToolCallResult).
+                        let arguments_json = if entry.3 == "server" || entry.2.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            entry.2.clone()
+                        };
                         observer.on_event(AgentEvent::ToolCallStart {
                             call_id,
                             name: entry.1.clone(),
-                            arguments_json: if entry.2.is_empty() {
-                                "{}".to_string()
-                            } else {
-                                entry.2.clone()
-                            },
+                            arguments_json,
                         });
                     }
                 }
@@ -175,9 +177,7 @@ pub async fn collect_stream(
 fn idle_timeout_of(err: &EngineError) -> Option<Duration> {
     match err {
         EngineError::StreamIdleTimeout(d) => Some(*d),
-        EngineError::Stream(msg) if msg.contains("idle timeout") => {
-            Some(Duration::from_secs(120))
-        }
+        EngineError::Stream(msg) if msg.contains("idle timeout") => Some(Duration::from_secs(120)),
         _ => None,
     }
 }
@@ -216,10 +216,16 @@ fn finalize_turn(
 
     // If no typed reasoning items arrived but reasoning text or encrypted content was
     // collected, synthesize a ReasoningItem (matching grok-build `inject_streaming_reasoning_fallback`).
-    if turn.reasoning_items.is_empty() && (!turn.reasoning.is_empty() || turn.encrypted_reasoning.is_some()) {
+    if turn.reasoning_items.is_empty()
+        && (!turn.reasoning.is_empty() || turn.encrypted_reasoning.is_some())
+    {
         if let Some(item) = crate::llm::types::build_synthetic_reasoning(
             String::new(),
-            if turn.reasoning.is_empty() { None } else { Some(&turn.reasoning) },
+            if turn.reasoning.is_empty() {
+                None
+            } else {
+                Some(&turn.reasoning)
+            },
             turn.encrypted_reasoning.as_deref(),
         ) {
             turn.reasoning_items.push(item);
@@ -264,9 +270,8 @@ pub fn parse_chunk(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
     if data.is_empty() || data == "[DONE]" {
         return Ok(None);
     }
-    let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(|e| {
-        EngineError::Stream(format!("failed to parse SSE chunk: {e}: {data:.120}"))
-    })?;
+    let chunk: ChatCompletionChunk = serde_json::from_str(data)
+        .map_err(|e| EngineError::Stream(format!("failed to parse SSE chunk: {e}: {data:.120}")))?;
     if chunk.choices.is_empty() && chunk.usage.is_none() {
         return Ok(None);
     }
@@ -276,10 +281,9 @@ pub fn parse_chunk(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::NullObserver;
+    use crate::events::{AgentEvent, NullObserver, RecordingObserver};
     use crate::llm::types::{
-        ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ToolCallDelta,
-        ToolCallFunctionDelta,
+        ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ToolCallDelta, ToolCallFunctionDelta,
     };
     use futures_util::stream;
 
@@ -307,10 +311,20 @@ mod tests {
         name: Option<&str>,
         arguments: Option<&str>,
     ) -> ToolCallDelta {
+        tc_kind(index, id, name, arguments, "function")
+    }
+
+    fn tc_kind(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+        kind: &str,
+    ) -> ToolCallDelta {
         ToolCallDelta {
             index,
             id: id.map(str::to_string),
-            kind: Some("function".into()),
+            kind: Some(kind.into()),
             function: Some(ToolCallFunctionDelta {
                 name: name.map(str::to_string),
                 arguments: arguments.map(str::to_string),
@@ -327,7 +341,12 @@ mod tests {
                 Some("browser_navigate"),
                 Some("{\"url\":"),
             ))),
-            Ok(chunk_with_tool(tc(0, None, None, Some("\"https://news.cctv.com/\"}")))),
+            Ok(chunk_with_tool(tc(
+                0,
+                None,
+                None,
+                Some("\"https://news.cctv.com/\"}"),
+            ))),
         ]);
         let turn = collect_stream(Box::pin(stream), &NullObserver)
             .await
@@ -352,7 +371,12 @@ mod tests {
                 Some("browser_navigate"),
                 Some(json),
             ))),
-            Ok(chunk_with_tool(tc(0, Some("nav"), Some("browser_navigate"), Some(json)))),
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("nav"),
+                Some("browser_navigate"),
+                Some(json),
+            ))),
         ]);
         let turn = collect_stream(Box::pin(stream), &NullObserver)
             .await
@@ -410,6 +434,60 @@ mod tests {
             }
             other => panic!("expected IdleTimeout, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn server_web_search_start_omits_placeholder_action() {
+        // grok-build BackendToolCallStarted carries name+id only. The
+        // placeholder action on output_item.added must not leak into
+        // ToolCallStart; the assembled turn (and later ToolCallResult)
+        // picks up query/sources from the done snapshot.
+        let observer = RecordingObserver::new();
+        let placeholder = r#"{"type":"search","query":"","sources":[]}"#;
+        let done = r#"{"type":"search","query":"rust async runtime","sources":[{"type":"url","url":"https://example.com"}]}"#;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc_kind(
+                0,
+                Some("ws_1"),
+                Some("web_search"),
+                Some(placeholder),
+                "server",
+            ))),
+            Ok(chunk_with_tool(tc_kind(
+                0,
+                Some("ws_1"),
+                Some("web_search"),
+                Some(done),
+                "server",
+            ))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &observer).await.unwrap();
+
+        let starts: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCallStart {
+                    call_id,
+                    name,
+                    arguments_json,
+                } => Some((call_id, name, arguments_json)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0, "ws_1");
+        assert_eq!(starts[0].1, "web_search");
+        assert_eq!(starts[0].2, "{}");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert!(
+            turn.tool_calls[0]
+                .function
+                .arguments
+                .contains("rust async runtime"),
+            "assembled args: {}",
+            turn.tool_calls[0].function.arguments
+        );
     }
 
     #[tokio::test]
