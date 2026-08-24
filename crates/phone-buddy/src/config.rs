@@ -94,7 +94,7 @@ pub struct EngineConfig {
     /// LLM transport mode. Default: HTTP.
     #[serde(default)]
     pub llm_mode: LlmMode,
-    /// API backend protocol (ChatCompletions, Responses, Messages). Default: ChatCompletions.
+    /// API backend protocol (ChatCompletions, Responses, Messages, Gemini). Default: ChatCompletions.
     #[serde(default)]
     pub api_backend: ApiBackend,
     /// Extra HTTP headers sent with every LLM request (e.g. X-App-Version, X-Client-Platform).
@@ -279,6 +279,15 @@ impl EngineConfig {
         EngineConfigBuilder::new()
             .client_profile(ClientProfile::Codex)
             .url("https://api.openai.com/v1")
+            .api_key(api_key)
+            .model(model)
+    }
+
+    /// Builder pre-configured for the Gemini generateContent protocol.
+    pub fn for_gemini(api_key: impl Into<String>, model: impl Into<String>) -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+            .url("https://generativelanguage.googleapis.com/v1beta")
+            .api_backend(ApiBackend::Gemini)
             .api_key(api_key)
             .model(model)
     }
@@ -648,6 +657,16 @@ mod tests {
         assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
         assert_eq!(claude_cfg.api_backend, ApiBackend::Messages);
         assert_eq!(claude_cfg.client_session_id.as_deref(), Some("sess-custom-uuid"));
+
+        let gemini_cfg = EngineConfig::for_gemini("AIza-test", "gemini-2.5-flash")
+            .build()
+            .unwrap();
+        assert_eq!(gemini_cfg.api_backend, ApiBackend::Gemini);
+        assert_eq!(
+            gemini_cfg.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(gemini_cfg.model, "gemini-2.5-flash");
     }
 
     #[test]

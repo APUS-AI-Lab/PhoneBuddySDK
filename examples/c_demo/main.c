@@ -997,7 +997,8 @@ static bool replay_session_history(PbEngine *engine, const char *session_id) {
 
     const char *title = json_obj_get_str(root, "title");
     const char *updated_at = json_obj_get_str(root, "updated_at");
-    JsonValue *messages_val = json_obj_get(root, "messages");
+    JsonValue *messages_val = json_obj_get(root, "items");
+    if (!messages_val) messages_val = json_obj_get(root, "messages");
 
     printf("\n\x1b[1;36m╭────────────────────────────────────────────────────────────────────────╮\x1b[0m\n");
     printf("\x1b[1;36m│\x1b[0m  \x1b[1;37m📜 Session History Replay\x1b[0m                                             \x1b[1;36m│\x1b[0m\n");
@@ -1015,10 +1016,37 @@ static bool replay_session_history(PbEngine *engine, const char *session_id) {
         for (JsonElement *elem = messages_val->u.arr_head; elem; elem = elem->next) {
             if (!elem->value || elem->value->type != JSON_OBJECT) continue;
             JsonValue *msg = elem->value;
+            const char *item_type = json_obj_get_str(msg, "type");
             const char *role = json_obj_get_str(msg, "role");
             const char *content = json_obj_get_str(msg, "content");
             const char *reasoning = json_obj_get_str(msg, "reasoning_content");
             JsonValue *tool_calls = json_obj_get(msg, "tool_calls");
+
+            if (item_type && strcmp(item_type, "user") == 0) {
+                msg_count++;
+                printf("\x1b[1;32mUser\x1b[0m \x1b[1;34m❯\x1b[0m %s\n\n", content ? content : "");
+                continue;
+            }
+            if (item_type && strcmp(item_type, "assistant") == 0) {
+                role = "assistant";
+            }
+            if (item_type && strcmp(item_type, "tool_result") == 0) {
+                role = "tool";
+            }
+            if (item_type && strcmp(item_type, "reasoning") == 0) {
+                msg_count++;
+                printf("\x1b[2;37m💭 reasoning item\x1b[0m\n\n");
+                continue;
+            }
+            if (item_type && strcmp(item_type, "backend_tool_call") == 0) {
+                const char *bt = json_obj_get_str(msg, "item_type");
+                msg_count++;
+                printf("\x1b[2m  ▶ backend %s\x1b[0m\n\n", bt ? bt : "tool");
+                continue;
+            }
+            if (item_type && strcmp(item_type, "system") == 0) {
+                continue;
+            }
 
             if (!role) continue;
             msg_count++;
@@ -1214,6 +1242,7 @@ static void print_banner(const char *config_path, const JsonValue *config_json, 
     const char *model = config_json ? json_obj_get_str(config_json, "model") : NULL;
     const char *base_url = config_json ? json_obj_get_str(config_json, "base_url") : NULL;
     const char *root_dir = config_json ? json_obj_get_str(config_json, "root_dir") : NULL;
+    const char *api_backend = config_json ? json_obj_get_str(config_json, "api_backend") : NULL;
 
     printf("\n");
     printf("\x1b[1;36m╭────────────────────────────────────────────────────────────────────────╮\x1b[0m\n");
@@ -1221,6 +1250,7 @@ static void print_banner(const char *config_path, const JsonValue *config_json, 
     printf("\x1b[1;36m│\x1b[0m  Config   : \x1b[33m%-57s\x1b[0m\x1b[1;36m│\x1b[0m\n", config_path);
     printf("\x1b[1;36m│\x1b[0m  Model    : \x1b[32m%-57s\x1b[0m\x1b[1;36m│\x1b[0m\n", model ? model : "default");
     printf("\x1b[1;36m│\x1b[0m  Base URL : \x1b[34m%-57s\x1b[0m\x1b[1;36m│\x1b[0m\n", base_url ? base_url : "https://api.x.ai/v1");
+    printf("\x1b[1;36m│\x1b[0m  Backend  : \x1b[34m%-57s\x1b[0m\x1b[1;36m│\x1b[0m\n", api_backend ? api_backend : "chat_completions");
     printf("\x1b[1;36m│\x1b[0m  Sandbox  : \x1b[35m%-57s\x1b[0m\x1b[1;36m│\x1b[0m\n", root_dir ? root_dir : "./workspace");
 
     char session_display[80];

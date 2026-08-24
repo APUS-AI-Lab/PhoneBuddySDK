@@ -11,6 +11,7 @@ pub mod retry;
 pub mod stream;
 pub mod transport;
 pub mod types;
+pub mod wire;
 
 pub use client::{LlmClient, LlmTransportObj};
 pub use dumper::{HttpDumpConfig, HttpDumpMode, HttpDumper};

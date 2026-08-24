@@ -17,9 +17,10 @@ use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
+use crate::conversation::{user_assistant_count, ConversationItem};
 use crate::llm::types::{
-    drop_colliding_function_tools, ChatCompletionRequest, ChatMessage, HostedTool, Role, ToolCall,
-    ToolDefinitionWire, Usage,
+    drop_colliding_function_tools, ConversationRequest, HostedTool, ToolCall, ToolDefinitionWire,
+    Usage,
 };
 use crate::prompt::{build_system_prompt, PromptRuntime};
 use crate::session::{SessionStore, StoredSession};
@@ -40,13 +41,26 @@ pub struct ChatOutcome {
 
 /// Approximate tokens = chars / 4 (same heuristic grok uses for quick
 /// estimates; avoids pulling in a tokenizer).
-fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+fn estimate_tokens(items: &[ConversationItem]) -> usize {
     let mut chars = 0usize;
-    for m in messages {
-        chars += m.content.as_deref().map(str::len).unwrap_or(0);
-        chars += m.reasoning_content.as_deref().map(str::len).unwrap_or(0);
-        for tc in &m.tool_calls {
-            chars += tc.function.name.len() + tc.function.arguments.len();
+    for item in items {
+        match item {
+            ConversationItem::System(s) => chars += s.content.len(),
+            ConversationItem::User(u) => chars += u.content.len(),
+            ConversationItem::Assistant(a) => {
+                chars += a.content.len();
+                chars += a.reasoning_content.as_deref().map(str::len).unwrap_or(0);
+                for tc in &a.tool_calls {
+                    chars += tc.function.name.len() + tc.function.arguments.len();
+                }
+            }
+            ConversationItem::ToolResult(t) => chars += t.content.len(),
+            ConversationItem::Reasoning(r) => {
+                chars += crate::llm::types::reasoning_item_text(r).len();
+            }
+            ConversationItem::BackendToolCall(b) => {
+                chars += crate::conversation::backend_call_summary(b).len();
+            }
         }
     }
     chars / 4
@@ -313,13 +327,13 @@ impl PhoneBuddyEngine {
     fn conversation_request(
         &self,
         model: String,
-        messages: Vec<ChatMessage>,
+        items: Vec<ConversationItem>,
         stream: bool,
-    ) -> ChatCompletionRequest {
+    ) -> ConversationRequest {
         let hosted = HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
-        ChatCompletionRequest {
+        ConversationRequest {
             model,
-            messages,
+            items,
             stream: Some(stream),
             tools: drop_colliding_function_tools(self.merged_tools_wire(), &hosted),
             tool_choice: Some(serde_json::json!("auto")),
@@ -440,10 +454,11 @@ impl PhoneBuddyEngine {
                 title: truncate_title(user_input),
                 created_at: now_iso(),
                 updated_at: now_iso(),
-                messages: Vec::new(),
+                format_version: 2,
+                items: Vec::new(),
             });
 
-        session.messages.push(ChatMessage::user(user_input));
+        session.items.push(ConversationItem::user(user_input));
         session.updated_at = now_iso();
 
         let system_prompt = self.build_prompt();
@@ -469,10 +484,10 @@ impl PhoneBuddyEngine {
             }
 
             // Compaction keeps long sessions inside a token budget.
-            self.maybe_compact(&mut session.messages, &system_prompt);
+            self.maybe_compact(&mut session.items, &system_prompt);
 
-            let messages = with_system(&session.messages, &system_prompt);
-            let request = self.conversation_request(self.config.model.clone(), messages, true);
+            let items = with_system(&session.items, &system_prompt);
+            let request = self.conversation_request(self.config.model.clone(), items, true);
 
             let turn = tokio::select! {
                 _ = token.cancelled() => {
@@ -488,54 +503,33 @@ impl PhoneBuddyEngine {
                 total_usage.total_tokens += u.total_tokens;
             }
 
-            // Record assistant message.
-            let reasoning_opt = if turn.reasoning.is_empty() {
-                None
-            } else {
-                Some(turn.reasoning.clone())
-            };
-            let reasoning_items = turn.reasoning_items.clone();
-            let encrypted_reasoning = turn.encrypted_reasoning.clone();
-
             let origin = self.client.origin_fingerprint();
-            let has_client_tools = turn.tool_calls.iter().any(|tc| tc.kind != "server");
-            if !has_client_tools {
-                // Server-side Responses tools (e.g. server-side web_search) ran inline in the
-                // provider and already contributed to `turn.text`. Surface them to the observer
-                // as completed and exit the turn without executing locally or calling the LLM again.
-                for call in &turn.tool_calls {
-                    observer.on_event(AgentEvent::ToolCallResult {
-                        call_id: call.id.clone(),
-                        name: call.function.name.clone(),
-                        ok: true,
-                        output: call.function.arguments.clone(),
-                    });
+            let mut turn_items = if turn.items.is_empty() {
+                synthesize_turn_items(&turn)
+            } else {
+                turn.items.clone()
+            };
+            stamp_origin(&mut turn_items, &origin);
+
+            let client_calls: Vec<ToolCall> = turn_items
+                .iter()
+                .rev()
+                .find_map(|i| i.as_assistant().map(|a| a.tool_calls.clone()))
+                .unwrap_or_default();
+
+            // Backend-only (or empty-call) turns: surface hosted calls and stop.
+            if client_calls.is_empty() {
+                for item in &turn_items {
+                    if let ConversationItem::BackendToolCall(b) = item {
+                        observer.on_event(AgentEvent::ToolCallResult {
+                            call_id: b.id.clone(),
+                            name: crate::conversation::server_tool_function_name(&b.item_type),
+                            ok: true,
+                            output: b.payload.to_string(),
+                        });
+                    }
                 }
-
-                let assistant_msg = if turn.tool_calls.is_empty() {
-                    ChatMessage::assistant_with_reasoning(
-                        turn.text.clone(),
-                        reasoning_opt,
-                        reasoning_items,
-                        encrypted_reasoning,
-                    )
-                } else {
-                    ChatMessage::assistant_tool_calls_with_reasoning(
-                        turn.tool_calls.clone(),
-                        if turn.text.is_empty() {
-                            None
-                        } else {
-                            Some(turn.text.clone())
-                        },
-                        reasoning_opt,
-                        reasoning_items,
-                        encrypted_reasoning,
-                    )
-                };
-
-                session
-                    .messages
-                    .push(assistant_msg.with_origin(origin));
+                session.items.extend(turn_items);
                 let final_text = turn.text.clone();
                 self.sessions.save(&session)?;
                 return Ok(ChatOutcome {
@@ -547,54 +541,20 @@ impl PhoneBuddyEngine {
             }
 
             // Observe step signature once per tool batch (upstream shell).
-            let sig = step_signature(&turn.tool_calls);
-            let step_name = turn
-                .tool_calls
+            let sig = step_signature(&client_calls);
+            let step_name = client_calls
                 .first()
                 .map(|c| c.function.name.as_str())
                 .unwrap_or("");
             identical.observe(&sig, step_name);
 
-            session.messages.push(
-                ChatMessage::assistant_tool_calls_with_reasoning(
-                    turn.tool_calls.clone(),
-                    if turn.text.is_empty() {
-                        None
-                    } else {
-                        Some(turn.text.clone())
-                    },
-                    reasoning_opt,
-                    reasoning_items,
-                    encrypted_reasoning,
-                )
-                .with_origin(origin),
-            );
+            session.items.extend(turn_items);
 
-            // Execute each tool call sequentially (mobile: keep it simple and
-            // predictable; parallel dispatch is a future optimization).
-            for call in &turn.tool_calls {
+            for call in &client_calls {
                 if token.is_cancelled() {
                     return Err(EngineError::Cancelled);
                 }
                 let name = call.function.name.clone();
-                // ToolCallStart is emitted from collect_stream when the
-                // model first names the call. Re-emitting here doubled
-                // every tool in the UI (and e2e) with the fully assembled
-                // arguments, including any snapshot concatenation bug.
-
-                // Server-side Responses tools (web_search_call, computer_call,
-                // …) already ran in the provider. Surface them to the UI but
-                // do not try to execute them locally or feed a fake result
-                // back to the model.
-                if call.kind == "server" {
-                    observer.on_event(AgentEvent::ToolCallResult {
-                        call_id: call.id.clone(),
-                        name: name.clone(),
-                        ok: true,
-                        output: call.function.arguments.clone(),
-                    });
-                    continue;
-                }
 
                 let output = tokio::select! {
                     _ = token.cancelled() => {
@@ -615,15 +575,15 @@ impl PhoneBuddyEngine {
                     output: truncate_tool_event(&text),
                 });
                 session
-                    .messages
-                    .push(ChatMessage::tool_result(call.id.clone(), text));
+                    .items
+                    .push(ConversationItem::tool_result(call.id.clone(), text));
             }
 
             // Once-per-run nudge after results are committed (upstream latch).
             if identical.take_nudge() {
                 let nudge =
                     stationarity_nudge_message(&identical.tool_name, identical.run_len);
-                session.messages.push(ChatMessage::system(nudge));
+                session.items.push(ConversationItem::system(nudge));
             }
 
             session.updated_at = now_iso();
@@ -698,71 +658,111 @@ impl PhoneBuddyEngine {
     /// recent window and leave a marker. Keeps mobile memory/context small.
     /// Ensures the cut point never leaves orphan tool messages without their
     /// corresponding assistant tool_calls.
-    fn maybe_compact(&self, messages: &mut Vec<ChatMessage>, system_prompt: &str) {
-        if estimate_tokens(messages) < COMPACT_THRESHOLD_TOKENS {
+    fn maybe_compact(&self, items: &mut Vec<ConversationItem>, system_prompt: &str) {
+        if estimate_tokens(items) < COMPACT_THRESHOLD_TOKENS {
             return;
         }
-        let keep = 12usize.min(messages.len());
-        if messages.len() <= keep {
+        let keep = 12usize.min(user_assistant_count(items).max(1));
+        if items.len() <= keep {
             return;
         }
-        let mut cut_point = messages.len() - keep;
-
-        // Walk backwards from cut_point to find a safe boundary (user or
-        // assistant message). Tool messages must stay with their assistant
-        // tool_calls message to preserve history validity.
-        while cut_point > 0 && messages[cut_point].role == Role::Tool {
-            cut_point -= 1;
-        }
-
-        // Now walk backwards to ensure we don't cut right after an assistant
-        // message with tool_calls (which would orphan the tool results).
-        if cut_point > 0 && cut_point < messages.len() {
-            if let Some(prev) = messages.get(cut_point - 1) {
-                if prev.role == Role::Assistant && !prev.tool_calls.is_empty() {
-                    // Find the next user/assistant-without-calls boundary.
-                    while cut_point < messages.len() {
-                        if messages[cut_point].role == Role::User {
+        let mut cut_point = items.len().saturating_sub(keep);
+        while cut_point > 0 {
+            match &items[cut_point] {
+                ConversationItem::User(_) => break,
+                ConversationItem::ToolResult(_)
+                | ConversationItem::Reasoning(_)
+                | ConversationItem::BackendToolCall(_) => {
+                    cut_point -= 1;
+                }
+                ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => {
+                    cut_point += 1;
+                    while cut_point < items.len() {
+                        if matches!(items[cut_point], ConversationItem::User(_)) {
                             break;
                         }
-                        if messages[cut_point].role == Role::Assistant && messages[cut_point].tool_calls.is_empty() {
+                        if matches!(&items[cut_point], ConversationItem::Assistant(a) if a.tool_calls.is_empty())
+                        {
                             break;
                         }
                         cut_point += 1;
                     }
+                    break;
                 }
+                _ => break,
             }
         }
 
-        if cut_point >= messages.len() {
-            // Safety valve: if we can't find a safe cut point, don't compact.
+        if cut_point >= items.len() {
             return;
         }
 
         let dropped = cut_point;
-        let tail: Vec<ChatMessage> = messages.split_off(cut_point);
-        *messages = tail;
+        let tail: Vec<ConversationItem> = items.split_off(cut_point);
+        *items = tail;
 
-        // Ensure we still start from a user message to satisfy providers.
-        if messages.first().map(|m| m.role) != Some(Role::User) {
+        if !matches!(items.first(), Some(ConversationItem::User(_))) {
             let note = format!(
                 "(Earlier conversation was compacted to save context. System capabilities unchanged. {} messages were summarized away.)",
                 dropped
             );
-            messages.insert(0, ChatMessage::user(note));
+            items.insert(0, ConversationItem::user(note));
         }
         let _ = system_prompt;
     }
 }
 
-fn with_system(messages: &[ChatMessage], system_prompt: &str) -> Vec<ChatMessage> {
-    let mut out = Vec::with_capacity(messages.len() + 1);
-    out.push(ChatMessage::system(system_prompt));
-    // Sanitize tool-call arguments on the outbound path so a single
-    // malformed historical call cannot 400 every subsequent turn
-    // (grok `sanitize_tool_arguments`).
-    out.extend(messages.iter().map(ChatMessage::sanitized_for_request));
+fn with_system(items: &[ConversationItem], system_prompt: &str) -> Vec<ConversationItem> {
+    let mut out = Vec::with_capacity(items.len() + 1);
+    out.push(ConversationItem::system(system_prompt));
+    out.extend(items.iter().cloned());
     out
+}
+
+fn stamp_origin(items: &mut [ConversationItem], origin: &str) {
+    for item in items.iter_mut().rev() {
+        if let Some(a) = item.as_assistant_mut() {
+            a.origin = Some(origin.to_string());
+            break;
+        }
+    }
+}
+
+fn synthesize_turn_items(turn: &crate::llm::types::CollectedTurn) -> Vec<ConversationItem> {
+    use crate::conversation::{AssistantItem, BackendToolCallItem};
+    let mut items = Vec::new();
+    for r in &turn.reasoning_items {
+        items.push(ConversationItem::Reasoning(r.clone()));
+    }
+    let mut client_calls = Vec::new();
+    for tc in &turn.tool_calls {
+        if tc.kind == "server" {
+            let item_type = crate::conversation::server_tool_item_type(&tc.function.name);
+            items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                item_type: item_type.clone(),
+                id: tc.id.clone(),
+                payload: crate::conversation::reconstruct_backend_payload(
+                    &item_type,
+                    &tc.id,
+                    &tc.function.arguments,
+                ),
+            }));
+        } else {
+            client_calls.push(tc.clone());
+        }
+    }
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: turn.text.clone(),
+        tool_calls: client_calls,
+        reasoning_content: if turn.reasoning.is_empty() {
+            None
+        } else {
+            Some(turn.reasoning.clone())
+        },
+        encrypted_reasoning: turn.encrypted_reasoning.clone(),
+        origin: None,
+    }));
+    items
 }
 
 fn truncate_title(input: &str) -> String {

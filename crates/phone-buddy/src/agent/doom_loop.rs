@@ -125,6 +125,7 @@ mod tests {
                 name: name.into(),
                 arguments: args.into(),
             },
+            thought_signature: None,
         }
     }
 

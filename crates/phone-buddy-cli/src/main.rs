@@ -212,6 +212,7 @@ fn run_chat(input: &str, fallbacks: Vec<ProviderEndpoint>) -> anyhow::Result<()>
         match backend_str.to_ascii_lowercase().as_str() {
             "responses" => builder = builder.api_backend(ApiBackend::Responses),
             "messages" => builder = builder.api_backend(ApiBackend::Messages),
+            "gemini" => builder = builder.api_backend(ApiBackend::Gemini),
             "chat_completions" | "chatcompletions" => {
                 builder = builder.api_backend(ApiBackend::ChatCompletions)
             }
@@ -297,6 +298,29 @@ fn main() -> anyhow::Result<()> {
             }
             run_chat(&input, fallbacks)
         }
-        Some(other) => anyhow::bail!("unknown subcommand '{other}' (expected mock|self-test|chat)"),
+        Some("dump-items") => {
+            let session_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: phone-buddy-demo dump-items <session-id>"))?;
+            let root = demo_root();
+            let cfg = EngineConfig {
+                api_key: "dump".into(),
+                model: "dump".into(),
+                root_dir: root,
+                llm_mode: phone_buddy::config::LlmMode::Host,
+                ..Default::default()
+            };
+            let engine = PhoneBuddyEngine::new(cfg)?;
+            match engine.get_session(&session_id)? {
+                Some(s) => {
+                    println!("{}", serde_json::to_string_pretty(&s.items)?);
+                    Ok(())
+                }
+                None => anyhow::bail!("session '{session_id}' not found"),
+            }
+        }
+        Some(other) => {
+            anyhow::bail!("unknown subcommand '{other}' (expected mock|self-test|chat|dump-items)")
+        }
     }
 }

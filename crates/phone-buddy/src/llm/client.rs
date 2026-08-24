@@ -30,7 +30,7 @@ use crate::llm::retry::{
 use crate::llm::stream::{collect_stream, CollectStreamError};
 use crate::llm::transport::{retry_class_for_error, LlmTransport};
 use crate::llm::types::{
-    drop_colliding_function_tools, ChatCompletionRequest, CollectedTurn, HostedTool,
+    drop_colliding_function_tools, CollectedTurn, ConversationRequest, HostedTool,
 };
 
 pub struct LlmClient {
@@ -62,7 +62,7 @@ struct ProviderSlot {
 pub trait LlmTransportObj: Send + Sync {
     fn request_stream_boxed<'a>(
         &'a self,
-        req: &'a ChatCompletionRequest,
+        req: &'a ConversationRequest,
     ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>>;
     fn name(&self) -> &str;
 }
@@ -70,7 +70,7 @@ pub trait LlmTransportObj: Send + Sync {
 impl<T: LlmTransport> LlmTransportObj for T {
     fn request_stream_boxed<'a>(
         &'a self,
-        req: &'a ChatCompletionRequest,
+        req: &'a ConversationRequest,
     ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>> {
         Box::pin(self.request_stream(req))
     }
@@ -224,9 +224,9 @@ impl LlmClient {
 
     fn rewrite_request_for(
         &self,
-        req: &ChatCompletionRequest,
+        req: &ConversationRequest,
         slot: &ProviderSlot,
-    ) -> ChatCompletionRequest {
+    ) -> ConversationRequest {
         let mut out = req.clone();
         if !slot.model.is_empty() {
             out.model = slot.model.clone();
@@ -236,11 +236,7 @@ impl LlmClient {
         out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
         let primary = self.primary_compat_key();
         let target = slot.compat_key.as_str();
-        out.messages = out
-            .messages
-            .iter()
-            .map(|m| m.sanitized_for_provider(target, primary))
-            .collect();
+        out.items = crate::llm::failover::sanitize_items_for_provider(&out.items, target, primary);
         out
     }
 
@@ -248,7 +244,7 @@ impl LlmClient {
     /// deltas to `observer`, and return the fully collected turn.
     pub async fn complete(
         &self,
-        req: &ChatCompletionRequest,
+        req: &ConversationRequest,
         observer: &dyn AgentObserver,
     ) -> EngineResult<CollectedTurn> {
         let chain_mode = self.chain_mode();
@@ -343,7 +339,7 @@ impl LlmClient {
     async fn try_provider(
         &self,
         slot: &ProviderSlot,
-        req: &ChatCompletionRequest,
+        req: &ConversationRequest,
         observer: &PrefixSkippingObserver<'_>,
         chain_mode: bool,
     ) -> Result<CollectedTurn, ProviderAttemptError> {
@@ -636,10 +632,10 @@ fn can_prefix_continue(turn: &CollectedTurn) -> bool {
 }
 
 fn prefix_continue_request(
-    req: &ChatCompletionRequest,
+    req: &ConversationRequest,
     partial: &CollectedTurn,
     keep_response_id: bool,
-) -> ChatCompletionRequest {
+) -> ConversationRequest {
     let mut out = req.clone();
     if keep_response_id {
         out.previous_response_id = partial
@@ -650,19 +646,34 @@ fn prefix_continue_request(
     } else {
         out.previous_response_id = None;
     }
-    let reasoning_opt = if partial.reasoning.is_empty() {
-        None
-    } else {
-        Some(partial.reasoning.clone())
-    };
-    let msg = crate::llm::types::ChatMessage::assistant_with_reasoning(
-        partial.text.clone(),
-        reasoning_opt,
-        partial.reasoning_items.clone(),
-        partial.encrypted_reasoning.clone(),
-    );
-    out.messages.push(msg);
+    let mut prefix_items = partial.items.clone();
+    if prefix_items.is_empty() {
+        prefix_items = synthesize_partial_items(partial);
+    }
+    out.items.extend(prefix_items);
     out
+}
+
+fn synthesize_partial_items(
+    partial: &CollectedTurn,
+) -> Vec<crate::conversation::ConversationItem> {
+    use crate::conversation::{AssistantItem, ConversationItem};
+    let mut items = Vec::new();
+    for r in &partial.reasoning_items {
+        items.push(ConversationItem::Reasoning(r.clone()));
+    }
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: partial.text.clone(),
+        tool_calls: Vec::new(),
+        reasoning_content: if partial.reasoning.is_empty() {
+            None
+        } else {
+            Some(partial.reasoning.clone())
+        },
+        encrypted_reasoning: partial.encrypted_reasoning.clone(),
+        origin: None,
+    }));
+    items
 }
 
 fn merge_reasoning_items(
@@ -691,7 +702,8 @@ fn merge_continued_turn(partial: &CollectedTurn, cont: CollectedTurn) -> Collect
     } else {
         format!("{}{}", partial.reasoning, cont.reasoning)
     };
-    CollectedTurn {
+    let mut merged = CollectedTurn {
+        items: merge_continued_items(&partial.items, &cont.items, &text, &reasoning),
         text,
         reasoning,
         reasoning_items: merge_reasoning_items(&partial.reasoning_items, &cont.reasoning_items),
@@ -711,7 +723,73 @@ fn merge_continued_turn(partial: &CollectedTurn, cont: CollectedTurn) -> Collect
             cont.model
         },
         response_id: cont.response_id.or_else(|| partial.response_id.clone()),
+        final_output: None,
+    };
+    if merged.items.is_empty() {
+        merged.items = synthesize_partial_items(&merged);
     }
+    merged.sync_derived_views();
+    merged
+}
+
+fn merge_continued_items(
+    partial: &[crate::conversation::ConversationItem],
+    cont: &[crate::conversation::ConversationItem],
+    text: &str,
+    reasoning: &str,
+) -> Vec<crate::conversation::ConversationItem> {
+    use crate::conversation::ConversationItem;
+    let mut out = if partial.is_empty() {
+        cont.to_vec()
+    } else {
+        partial.to_vec()
+    };
+    // Drop trailing assistant from partial so we can replace it.
+    while matches!(out.last(), Some(ConversationItem::Assistant(_))) {
+        out.pop();
+    }
+    // Merge reasoning by id from continuation.
+    for item in cont {
+        match item {
+            ConversationItem::Reasoning(r) => {
+                if r.id.is_empty() {
+                    if !out.iter().any(|o| matches!(o, ConversationItem::Reasoning(x) if x == r)) {
+                        out.push(item.clone());
+                    }
+                } else if let Some(ConversationItem::Reasoning(existing)) = out.iter_mut().find(|o| {
+                    matches!(o, ConversationItem::Reasoning(x) if x.id == r.id)
+                }) {
+                    if r.encrypted_content.is_some() {
+                        existing.encrypted_content = r.encrypted_content.clone();
+                    }
+                    if !r.summary.is_empty() {
+                        existing.summary = r.summary.clone();
+                    }
+                    if r.content.is_some() {
+                        existing.content = r.content.clone();
+                    }
+                } else {
+                    out.push(item.clone());
+                }
+            }
+            ConversationItem::BackendToolCall(_) => {
+                out.push(item.clone());
+            }
+            ConversationItem::Assistant(a) => {
+                let mut merged_a = a.clone();
+                merged_a.content = text.to_string();
+                if merged_a.reasoning_content.is_none() && !reasoning.is_empty() {
+                    merged_a.reasoning_content = Some(reasoning.to_string());
+                }
+                out.push(ConversationItem::Assistant(merged_a));
+            }
+            _ => {}
+        }
+    }
+    if !out.iter().any(|i| matches!(i, ConversationItem::Assistant(_))) {
+        out.push(crate::conversation::ConversationItem::assistant(text));
+    }
+    out
 }
 
 fn emit_retrying(
@@ -872,7 +950,7 @@ mod tests {
     impl LlmTransport for ScriptedTransport {
         async fn request_stream(
             &self,
-            _req: &ChatCompletionRequest,
+            _req: &ConversationRequest,
         ) -> EngineResult<crate::llm::transport::ChunkStream> {
             self.hits.fetch_add(1, Ordering::SeqCst);
             let left = self.remaining_fails.load(Ordering::SeqCst);
@@ -901,10 +979,10 @@ mod tests {
         }
     }
 
-    fn req() -> ChatCompletionRequest {
-        ChatCompletionRequest {
+    fn req() -> ConversationRequest {
+        ConversationRequest {
             model: "m".into(),
-            messages: vec![crate::llm::types::ChatMessage::user("hi")],
+            items: vec![crate::conversation::ConversationItem::user("hi")],
             stream: Some(true),
             tools: None,
             tool_choice: None,
@@ -1094,7 +1172,7 @@ mod tests {
     impl LlmTransport for EmptyTransport {
         async fn request_stream(
             &self,
-            _req: &ChatCompletionRequest,
+            _req: &ConversationRequest,
         ) -> EngineResult<crate::llm::transport::ChunkStream> {
             self.hits.fetch_add(1, Ordering::SeqCst);
             // Return a stream that yields a stop chunk with no content,
@@ -1216,13 +1294,13 @@ mod tests {
     struct IdleContinueTransport {
         name: String,
         hits: Arc<AtomicU32>,
-        captured: Arc<Mutex<Option<ChatCompletionRequest>>>,
+        captured: Arc<Mutex<Option<ConversationRequest>>>,
     }
 
     impl LlmTransport for IdleContinueTransport {
         async fn request_stream(
             &self,
-            req: &ChatCompletionRequest,
+            req: &ConversationRequest,
         ) -> EngineResult<crate::llm::transport::ChunkStream> {
             let n = self.hits.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
@@ -1287,15 +1365,24 @@ mod tests {
 
         let cont = captured.lock().unwrap().clone().expect("continuation request");
         assert_eq!(cont.previous_response_id.as_deref(), Some("resp_abc"));
-        let last = cont.messages.last().expect("prefix assistant");
-        assert_eq!(last.role, Role::Assistant);
-        assert_eq!(last.content.as_deref(), Some("Hello "));
-        assert_eq!(last.reasoning_items.len(), 1);
-        assert_eq!(last.reasoning_items[0].id, "rs_1");
-        assert_eq!(
-            last.reasoning_items[0].encrypted_content.as_deref(),
-            Some("enc")
-        );
+        let last = cont.items.last().expect("prefix assistant");
+        match last {
+            crate::conversation::ConversationItem::Assistant(a) => {
+                assert_eq!(a.content, "Hello ");
+            }
+            other => panic!("expected assistant prefix, got {other:?}"),
+        }
+        let reasoning: Vec<_> = cont
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::conversation::ConversationItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].id, "rs_1");
+        assert_eq!(reasoning[0].encrypted_content.as_deref(), Some("enc"));
 
         let texts: Vec<_> = observer
             .snapshot()
@@ -1317,7 +1404,7 @@ mod tests {
     impl LlmTransport for AlwaysIdleAfterText {
         async fn request_stream(
             &self,
-            _req: &ChatCompletionRequest,
+            _req: &ConversationRequest,
         ) -> EngineResult<crate::llm::transport::ChunkStream> {
             self.hits.fetch_add(1, Ordering::SeqCst);
             let text = self.text.clone();
@@ -1380,7 +1467,7 @@ mod tests {
     impl LlmTransport for IncompleteToolIdle {
         async fn request_stream(
             &self,
-            _req: &ChatCompletionRequest,
+            _req: &ConversationRequest,
         ) -> EngineResult<crate::llm::transport::ChunkStream> {
             self.hits.fetch_add(1, Ordering::SeqCst);
             let stream = async_stream::stream! {
@@ -1393,6 +1480,7 @@ mod tests {
                         name: Some("web_search".into()),
                         arguments: Some("{\"q\":".into()),
                     }),
+                    thought_signature: None,
                 });
                 yield Ok(ChatCompletionChunk {
                     choices: vec![ChatChunkChoice {

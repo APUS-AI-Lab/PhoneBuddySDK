@@ -144,6 +144,61 @@ pub fn should_strip_origin(origin: Option<&str>, target: &str, primary: &str) ->
     origin != target
 }
 
+/// Drop foreign-origin reasoning, signatures, and backend tool calls.
+///
+/// Scans turn groups (`[Reasoning|BackendToolCall]* Assistant`). When the
+/// group's `Assistant.origin` fails [`should_strip_origin`], drop its
+/// Reasoning siblings, clear `encrypted_reasoning` / `thought_signature`,
+/// and fold `BackendToolCall` siblings into a synthetic text prefix on the
+/// assistant so context survives without foreign ids (I4).
+pub fn sanitize_items_for_provider(
+    items: &[crate::conversation::ConversationItem],
+    target: &str,
+    primary: &str,
+) -> Vec<crate::conversation::ConversationItem> {
+    use crate::conversation::{backend_call_summary, turn_groups, ConversationItem};
+
+    let mut out = Vec::with_capacity(items.len());
+    for group in turn_groups(items) {
+        let assistant = group.iter().rev().find_map(|i| i.as_assistant());
+        let origin = assistant.and_then(|a| a.origin.as_deref());
+        let strip = assistant.is_some() && should_strip_origin(origin, target, primary);
+        if !strip {
+            out.extend(group.iter().cloned());
+            continue;
+        }
+
+        let mut summaries = Vec::new();
+        for item in group {
+            match item {
+                ConversationItem::Reasoning(_) => {}
+                ConversationItem::BackendToolCall(b) => {
+                    summaries.push(backend_call_summary(b));
+                }
+                ConversationItem::Assistant(a) => {
+                    let mut a = a.clone();
+                    a.encrypted_reasoning = None;
+                    a.reasoning_content = None;
+                    for tc in &mut a.tool_calls {
+                        tc.thought_signature = None;
+                    }
+                    if !summaries.is_empty() {
+                        let prefix = summaries.join("\n");
+                        if a.content.is_empty() {
+                            a.content = prefix;
+                        } else {
+                            a.content = format!("{prefix}\n{}", a.content);
+                        }
+                    }
+                    out.push(ConversationItem::Assistant(a));
+                }
+                other => out.push(other.clone()),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +316,87 @@ mod tests {
             resolve_provider_group(Some("  "), crate::llm::profiles::ClientProfile::Codex),
             "codex"
         );
+    }
+
+    #[test]
+    fn failover_strip_is_turn_scoped() {
+        use crate::conversation::{
+            AssistantItem, BackendToolCallItem, ConversationItem, ToolResultItem,
+        };
+        use crate::llm::types::{ReasoningItem, ToolCall, ToolCallFunction};
+
+        let reasoning = |id: &str| {
+            crate::conversation::ConversationItem::Reasoning(ReasoningItem {
+                id: id.into(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: Some("enc".into()),
+                status: None,
+            })
+        };
+        let items = vec![
+            ConversationItem::user("hi"),
+            reasoning("rs_keep"),
+            ConversationItem::Assistant(AssistantItem {
+                content: "same origin".into(),
+                tool_calls: vec![],
+                reasoning_content: Some("think".into()),
+                encrypted_reasoning: Some("sig".into()),
+                origin: Some("openai/gpt-5".into()),
+            }),
+            ConversationItem::user("again"),
+            reasoning("rs_drop"),
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                item_type: "web_search_call".into(),
+                id: "ws_1".into(),
+                payload: serde_json::json!({"type":"web_search_call","id":"ws_1"}),
+            }),
+            ConversationItem::Assistant(AssistantItem {
+                content: "foreign".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    thought_signature: Some("gemini-sig".into()),
+                }],
+                reasoning_content: Some("foreign think".into()),
+                encrypted_reasoning: Some("anth-sig".into()),
+                origin: Some("google/gemini".into()),
+            }),
+            ConversationItem::ToolResult(ToolResultItem {
+                tool_call_id: "c1".into(),
+                content: "ok".into(),
+            }),
+        ];
+        let out = sanitize_items_for_provider(&items, "openai/gpt-5", "openai/gpt-5");
+        // Same-origin reasoning kept.
+        assert!(out.iter().any(|i| matches!(
+            i,
+            ConversationItem::Reasoning(r) if r.id == "rs_keep"
+        )));
+        // Foreign reasoning and backend call stripped.
+        assert!(!out.iter().any(|i| matches!(
+            i,
+            ConversationItem::Reasoning(r) if r.id == "rs_drop"
+        )));
+        assert!(!out
+            .iter()
+            .any(|i| matches!(i, ConversationItem::BackendToolCall(_))));
+        let foreign = out
+            .iter()
+            .find_map(|i| i.as_assistant().filter(|a| a.content.contains("foreign")))
+            .unwrap();
+        assert!(foreign.encrypted_reasoning.is_none());
+        assert!(foreign.reasoning_content.is_none());
+        assert!(foreign.tool_calls[0].thought_signature.is_none());
+        assert!(foreign.content.contains("web_search_call"));
+        // Tool result always survives.
+        assert!(out.iter().any(|i| matches!(
+            i,
+            ConversationItem::ToolResult(t) if t.tool_call_id == "c1"
+        )));
     }
 }

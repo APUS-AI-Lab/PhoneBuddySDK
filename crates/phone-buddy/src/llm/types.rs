@@ -15,11 +15,16 @@ pub enum ApiBackend {
     Responses,
     /// Anthropic Messages protocol (/v1/messages)
     Messages,
+    /// Google Gemini generateContent / streamGenerateContent protocol
+    Gemini,
 }
 
 impl ApiBackend {
     pub fn supports_native_schema(&self) -> bool {
-        matches!(self, Self::ChatCompletions | Self::Responses)
+        matches!(
+            self,
+            Self::ChatCompletions | Self::Responses | Self::Gemini
+        )
     }
 
     pub fn requires_reasoning_strip(&self) -> bool {
@@ -453,15 +458,32 @@ impl ChatMessage {
 
 // ── Tool calls ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String, // "function"
     pub function: ToolCallFunction,
+    /// Gemini per-part thought signature; never serialized on other wires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for ToolCall {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: String::new(),
+                arguments: "{}".into(),
+            },
+            thought_signature: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
     /// JSON-encoded arguments.
@@ -585,6 +607,60 @@ pub struct ChatCompletionRequest {
     pub previous_response_id: Option<String>,
 }
 
+/// Internal LLM request: canonical items plus sampling / tool config.
+///
+/// This is the type transports and adapters consume. The host-transport
+/// contract still serializes a [`ChatCompletionRequest`] (Chat Completions
+/// shape) via `chat_messages_from_items`.
+#[derive(Debug, Clone)]
+pub struct ConversationRequest {
+    pub model: String,
+    pub items: Vec<crate::conversation::ConversationItem>,
+    pub stream: Option<bool>,
+    pub tools: Option<Vec<ToolDefinitionWire>>,
+    pub tool_choice: Option<serde_json::Value>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    /// Unused on the wire. Kept so historical tests and extra-body merges
+    /// continue to compile.
+    pub search_parameters: Option<SearchParameters>,
+    pub hosted_tools: Vec<HostedTool>,
+    pub previous_response_id: Option<String>,
+}
+
+impl ConversationRequest {
+    pub fn from_chat(req: ChatCompletionRequest) -> Self {
+        Self {
+            model: req.model,
+            items: crate::conversation::items_from_chat_messages(&req.messages),
+            stream: req.stream,
+            tools: req.tools,
+            tool_choice: req.tool_choice,
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            search_parameters: req.search_parameters,
+            hosted_tools: req.hosted_tools,
+            previous_response_id: req.previous_response_id,
+        }
+    }
+
+    /// Frozen host-transport contract: Chat Completions JSON, no item types.
+    pub fn to_host_chat_request(&self) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: self.model.clone(),
+            messages: crate::conversation::chat_messages_from_items(&self.items),
+            stream: self.stream,
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            search_parameters: self.search_parameters.clone(),
+            hosted_tools: self.hosted_tools.clone(),
+            previous_response_id: self.previous_response_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     #[serde(default)]
@@ -644,6 +720,9 @@ pub struct ToolCallDelta {
     /// The function name and/or argument fragment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function: Option<ToolCallFunctionDelta>,
+    /// Gemini per-part thought signature, captured on the complete call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -671,6 +750,104 @@ pub struct ChatChunkDelta {
     /// Tool call deltas. Handles `null` in JSON as empty vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDelta>,
+    /// Terminal Responses `response.output` snapshot. Not a wire field of
+    /// Chat Completions chunks; adapters attach it so `finalize_turn` can
+    /// treat the completed output as the canonical turn source.
+    #[serde(skip)]
+    pub final_output: Option<Vec<OutputItemWire>>,
+}
+
+/// Typed subset of Responses `response.output[]`. Anything unknown stays
+/// raw and becomes a BackendToolCall — never dropped, never guessed at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputItemWire {
+    Message { id: String, text: String },
+    Reasoning(ReasoningItem),
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    Backend {
+        item_type: String,
+        id: String,
+        payload: serde_json::Value,
+    },
+}
+
+/// Parse one Responses `response.output[]` element by `"type"`.
+pub fn parse_output_item(v: &serde_json::Value) -> Option<OutputItemWire> {
+    let ty = v.get("type").and_then(|s| s.as_str())?;
+    match ty {
+        "message" => {
+            let id = v
+                .get("id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut text = String::new();
+            if let Some(parts) = v.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    let part_ty = part.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                    if part_ty == "output_text" || part_ty == "text" || part_ty.is_empty() {
+                        if let Some(t) = part.get("text").and_then(|s| s.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                }
+            } else if let Some(t) = v.get("content").and_then(|s| s.as_str()) {
+                text = t.to_string();
+            }
+            Some(OutputItemWire::Message { id, text })
+        }
+        "reasoning" => serde_json::from_value::<ReasoningItem>(v.clone())
+            .ok()
+            .map(OutputItemWire::Reasoning),
+        "function_call" => {
+            let call_id = v
+                .get("call_id")
+                .or_else(|| v.get("id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = v
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = v
+                .get("arguments")
+                .map(|a| {
+                    if let Some(s) = a.as_str() {
+                        s.to_string()
+                    } else {
+                        a.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            Some(OutputItemWire::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            })
+        }
+        _ => {
+            let id = v
+                .get("id")
+                .or_else(|| v.get("call_id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(OutputItemWire::Backend {
+                item_type: ty.to_string(),
+                id,
+                payload: v.clone(),
+            })
+        }
+    }
 }
 
 // ── Collected (non-streaming view) ───────────────────────────────────────
@@ -678,6 +855,11 @@ pub struct ChatChunkDelta {
 /// Result of accumulating one streamed assistant turn.
 #[derive(Debug, Clone, Default)]
 pub struct CollectedTurn {
+    /// Canonical ordered items for this assistant turn
+    /// (`[Reasoning | BackendToolCall]* Assistant`).
+    pub items: Vec<crate::conversation::ConversationItem>,
+    /// Derived views filled from `items` at `finalize_turn`. Kept during
+    /// the dual-representation window so existing call sites compile.
     pub text: String,
     pub reasoning: String,
     pub reasoning_items: Vec<ReasoningItem>,
@@ -688,11 +870,162 @@ pub struct CollectedTurn {
     pub model: String,
     /// Responses `resp_*` id captured from `response.created` / chunk `id`.
     pub response_id: Option<String>,
+    /// Terminal `response.output` snapshot, consumed by `finalize_turn`.
+    pub final_output: Option<Vec<OutputItemWire>>,
 }
 
 impl CollectedTurn {
     /// True when the model emitted no text and no tool calls.
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.tool_calls.is_empty()
+    }
+
+    /// Concatenated assistant text from `items`.
+    pub fn text_from_items(&self) -> String {
+        self.items
+            .iter()
+            .filter_map(|i| i.as_assistant().map(|a| a.content.as_str()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Client function calls from the trailing assistant item.
+    pub fn client_tool_calls(&self) -> Vec<ToolCall> {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|i| i.as_assistant().map(|a| a.tool_calls.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Reasoning siblings from `items`.
+    pub fn reasoning_from_items(&self) -> Vec<ReasoningItem> {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                crate::conversation::ConversationItem::Reasoning(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Refresh derived views from `items` (test 1.5 invariant).
+    pub fn sync_derived_views(&mut self) {
+        self.text = self.text_from_items();
+        let mut calls: Vec<ToolCall> = self
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::conversation::ConversationItem::BackendToolCall(b) => {
+                    Some(crate::conversation::backend_to_legacy_tool_call(b))
+                }
+                _ => None,
+            })
+            .collect();
+        calls.extend(self.client_tool_calls());
+        self.tool_calls = calls;
+        self.reasoning_items = self.reasoning_from_items();
+        if self.encrypted_reasoning.is_none() {
+            self.encrypted_reasoning = self
+                .reasoning_items
+                .iter()
+                .find_map(|r| r.encrypted_content.clone())
+                .or_else(|| {
+                    self.items.iter().find_map(|i| {
+                        i.as_assistant()
+                            .and_then(|a| a.encrypted_reasoning.clone())
+                    })
+                });
+        }
+        if self.reasoning.is_empty() {
+            self.reasoning = self
+                .reasoning_items
+                .iter()
+                .map(reasoning_item_text)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_item_tests {
+    use super::*;
+
+    #[test]
+    fn parse_output_item_known_types() {
+        let message = serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "output_text", "text": "world"}
+            ]
+        });
+        match parse_output_item(&message) {
+            Some(OutputItemWire::Message { id, text }) => {
+                assert_eq!(id, "msg_1");
+                assert_eq!(text, "hello\nworld");
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+
+        let reasoning = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "think"}],
+            "encrypted_content": "enc"
+        });
+        match parse_output_item(&reasoning) {
+            Some(OutputItemWire::Reasoning(r)) => {
+                assert_eq!(r.id, "rs_1");
+                assert_eq!(r.encrypted_content.as_deref(), Some("enc"));
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+
+        let fc = serde_json::json!({
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"a\"}"
+        });
+        match parse_output_item(&fc) {
+            Some(OutputItemWire::FunctionCall { call_id, name, arguments }) => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments, "{\"path\":\"a\"}");
+            }
+            other => panic!("expected function_call, got {other:?}"),
+        }
+
+        let ws = serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "query": "apus"}
+        });
+        match parse_output_item(&ws) {
+            Some(OutputItemWire::Backend { item_type, id, payload }) => {
+                assert_eq!(item_type, "web_search_call");
+                assert_eq!(id, "ws_1");
+                assert_eq!(payload, ws);
+            }
+            other => panic!("expected backend, got {other:?}"),
+        }
+
+        let future = serde_json::json!({
+            "type": "future_call",
+            "id": "fut_1",
+            "foo": "bar"
+        });
+        match parse_output_item(&future) {
+            Some(OutputItemWire::Backend { item_type, id, payload }) => {
+                assert_eq!(item_type, "future_call");
+                assert_eq!(id, "fut_1");
+                assert_eq!(payload, future);
+            }
+            other => panic!("expected backend future_call, got {other:?}"),
+        }
     }
 }

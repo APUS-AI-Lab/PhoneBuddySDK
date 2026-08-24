@@ -48,6 +48,19 @@ Example `config.json`:
 }
 ```
 
+Gemini (`api_backend: "gemini"`) uses `streamGenerateContent?alt=sse` and the `x-goog-api-key` header:
+
+```json
+{
+  "api_key": "AIza-your-gemini-api-key",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "model": "gemini-2.5-flash",
+  "root_dir": "./workspace",
+  "api_backend": "gemini",
+  "max_turns": 24
+}
+```
+
 C hosts have no system WebView. The client `web_search` function tool skips DuckDuckGo scraping and uses the configured LLM search API. `enable_web_search` additionally attaches hosted `{type: web_search}` on Responses backends (Grok Build backend search); leave it false unless the gateway implements that tool.
 
 ### 2. Build the Static Library and C Demo

@@ -82,12 +82,20 @@ class NativeAgent(configJson: String, context: Context? = null) : AutoCloseable 
             val title = root.optString("title", "")
             val createdAt = root.optString("created_at", "")
             val updatedAt = root.optString("updated_at", "")
-            val msgsArray = root.optJSONArray("messages") ?: JSONArray()
+            val msgsArray = root.optJSONArray("items") ?: root.optJSONArray("messages") ?: JSONArray()
             val messages = mutableListOf<StoredChatMessage>()
 
             for (i in 0 until msgsArray.length()) {
                 val m = msgsArray.getJSONObject(i)
-                val role = m.optString("role", "")
+                val itemType = m.optString("type", "")
+                val role = when (itemType) {
+                    "user" -> "user"
+                    "assistant" -> "assistant"
+                    "tool_result" -> "tool"
+                    "system" -> "system"
+                    "reasoning", "backend_tool_call" -> continue
+                    else -> m.optString("role", "")
+                }
                 val content = if (m.has("content") && !m.isNull("content")) m.getString("content") else null
                 val reasoning = if (m.has("reasoning_content") && !m.isNull("reasoning_content")) m.getString("reasoning_content") else null
                 val toolCallId = if (m.has("tool_call_id") && !m.isNull("tool_call_id")) m.getString("tool_call_id") else null

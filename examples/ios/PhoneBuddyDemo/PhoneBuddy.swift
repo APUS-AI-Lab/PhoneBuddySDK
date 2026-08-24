@@ -363,6 +363,65 @@ public struct StoredSession: Codable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case messages
+        case items
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        updatedAt = try c.decode(String.self, forKey: .updatedAt)
+        if let items = try c.decodeIfPresent([StoredSessionItem].self, forKey: .items) {
+            messages = items.compactMap { $0.toMessage() }
+        } else {
+            messages = try c.decodeIfPresent([StoredChatMessage].self, forKey: .messages) ?? []
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encode(messages, forKey: .messages)
+    }
+}
+
+struct StoredSessionItem: Codable {
+    let type: String?
+    let role: String?
+    let content: String?
+    let toolCalls: [StoredToolCall]?
+    let toolCallId: String?
+    let reasoningContent: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, role, content
+        case toolCalls = "tool_calls"
+        case toolCallId = "tool_call_id"
+        case reasoningContent = "reasoning_content"
+    }
+
+    func toMessage() -> StoredChatMessage? {
+        let resolvedRole: String?
+        switch type {
+        case "user": resolvedRole = "user"
+        case "assistant": resolvedRole = "assistant"
+        case "tool_result": resolvedRole = "tool"
+        case "system": resolvedRole = "system"
+        case "reasoning", "backend_tool_call": return nil
+        default: resolvedRole = role
+        }
+        guard let resolvedRole else { return nil }
+        return StoredChatMessage(
+            role: resolvedRole,
+            content: content,
+            reasoningContent: reasoningContent,
+            toolCalls: toolCalls,
+            toolCallId: toolCallId
+        )
     }
 }
 

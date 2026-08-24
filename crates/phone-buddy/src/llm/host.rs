@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::error::{EngineError, EngineResult};
 use crate::llm::transport::{ChunkStream, LlmTransport};
-use crate::llm::types::{ChatCompletionChunk, ChatCompletionRequest};
+use crate::llm::types::{ChatCompletionChunk, ConversationRequest};
 
 /// Notifies the host that a new LLM request is ready.
 /// Arguments: `(request_id, request_json)`.
@@ -49,7 +49,7 @@ impl HostLlmHub {
     /// receiver the transport will stream from.
     fn begin(
         &self,
-        req: &ChatCompletionRequest,
+        req: &ConversationRequest,
     ) -> EngineResult<mpsc::UnboundedReceiver<Result<ChatCompletionChunk, EngineError>>> {
         let notify = self
             .notify
@@ -59,7 +59,7 @@ impl HostLlmHub {
             .ok_or_else(|| EngineError::Llm("host LLM notify callback is not set".into()))?;
 
         let request_id = Uuid::new_v4().to_string();
-        let request_json = serde_json::to_string(req)
+        let request_json = crate::llm::wire::chat_completions::host_request_json(req)
             .map_err(|e| EngineError::Llm(format!("serialize request: {e}")))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -128,7 +128,7 @@ impl HostLlmTransport {
 }
 
 impl LlmTransport for HostLlmTransport {
-    async fn request_stream(&self, req: &ChatCompletionRequest) -> EngineResult<ChunkStream> {
+    async fn request_stream(&self, req: &ConversationRequest) -> EngineResult<ChunkStream> {
         let mut rx = self.hub.begin(req)?;
         let stream = async_stream::stream! {
             while let Some(item) = rx.recv().await {
@@ -152,13 +152,13 @@ impl LlmTransport for HostLlmTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{ChatChunkChoice, ChatChunkDelta, Role};
+    use crate::llm::types::{ChatChunkChoice, ChatChunkDelta, ConversationRequest, Role};
     use futures_util::StreamExt;
 
-    fn sample_req() -> ChatCompletionRequest {
-        ChatCompletionRequest {
+    fn sample_req() -> ConversationRequest {
+        ConversationRequest {
             model: "local".into(),
-            messages: vec![crate::llm::types::ChatMessage::user("hi")],
+            items: vec![crate::conversation::ConversationItem::user("hi")],
             stream: Some(true),
             tools: None,
             tool_choice: None,
@@ -213,6 +213,48 @@ mod tests {
             }
         }
         assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn host_contract_unchanged() {
+        use std::sync::Mutex;
+        let hub = HostLlmHub::new();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let cap = captured.clone();
+        hub.set_notify(Arc::new(move |_id, json| {
+            *cap.lock().unwrap() = json;
+        }));
+        let req = ConversationRequest {
+            model: "local".into(),
+            items: vec![
+                crate::conversation::ConversationItem::user("hi"),
+                crate::conversation::ConversationItem::Reasoning(
+                    crate::llm::types::ReasoningItem {
+                        id: "rs_1".into(),
+                        summary: Vec::new(),
+                        content: None,
+                        encrypted_content: Some("enc".into()),
+                        status: None,
+                    },
+                ),
+                crate::conversation::ConversationItem::assistant("hello"),
+            ],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: Some(0.2),
+            max_tokens: Some(128),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let _ = hub.begin(&req).unwrap();
+        let json = captured.lock().unwrap().clone();
+        let parsed: crate::llm::types::ChatCompletionRequest =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model, "local");
+        assert!(!json.contains("\"type\":\"reasoning\""));
+        assert!(!json.contains("backend_tool_call"));
     }
 
     #[tokio::test]

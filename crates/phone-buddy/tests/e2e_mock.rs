@@ -85,9 +85,13 @@ fn agent_loop_executes_tools_and_reports() {
 
     let session = engine.get_session("e2e").unwrap().expect("session should exist");
     assert_eq!(session.id, "e2e");
-    assert!(!session.messages.is_empty());
-    assert_eq!(session.messages[0].role, phone_buddy::llm::Role::User);
-    assert_eq!(session.messages[0].content.as_deref(), Some("compute the sum"));
+    assert!(!session.items.is_empty());
+    match &session.items[0] {
+        phone_buddy::conversation::ConversationItem::User(u) => {
+            assert_eq!(u.content, "compute the sum");
+        }
+        other => panic!("expected user item, got {other:?}"),
+    }
 }
 
 #[test]
@@ -269,14 +273,24 @@ fn server_tools_complete_in_single_turn() {
         .get_session("server_tool_test")
         .unwrap()
         .expect("session should exist");
-    assert_eq!(session.messages.len(), 2);
-    assert_eq!(session.messages[0].role, phone_buddy::llm::Role::User);
-    assert_eq!(session.messages[1].role, phone_buddy::llm::Role::Assistant);
-    assert_eq!(
-        session.messages[1].content.as_deref(),
-        Some("Here is the latest news for today.")
-    );
-    assert_eq!(session.messages[1].tool_calls.len(), 1);
-    assert_eq!(session.messages[1].tool_calls[0].kind, "server");
+    assert!(session.items.len() >= 2);
+    assert!(matches!(
+        session.items[0],
+        phone_buddy::conversation::ConversationItem::User(_)
+    ));
+    let has_backend = session.items.iter().any(|i| {
+        matches!(
+            i,
+            phone_buddy::conversation::ConversationItem::BackendToolCall(_)
+        )
+    });
+    assert!(has_backend, "server-only turn should store a BackendToolCall");
+    let assistant = session
+        .items
+        .iter()
+        .find_map(|i| i.as_assistant())
+        .expect("assistant item");
+    assert_eq!(assistant.content, "Here is the latest news for today.");
+    assert!(assistant.tool_calls.is_empty());
 }
 
