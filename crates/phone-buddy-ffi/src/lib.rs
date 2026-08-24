@@ -64,6 +64,90 @@ pub type PbWebViewFetchCallback = Option<
     ),
 >;
 
+/// Native logging callback.
+/// `level`: 1 = ERROR, 2 = WARN, 3 = INFO, 4 = DEBUG, 5 = TRACE.
+/// `target`: Logger target / module name (C-string).
+/// `message`: Formatted log text (C-string).
+pub type PbLogCallback =
+    Option<unsafe extern "C" fn(level: i32, target: *const c_char, message: *const c_char)>;
+
+static GLOBAL_LOG_CALLBACK: std::sync::RwLock<PbLogCallback> = std::sync::RwLock::new(None);
+static LOG_INIT: std::sync::Once = std::sync::Once::new();
+
+struct HostLogLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HostLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let cb_opt = if let Ok(guard) = GLOBAL_LOG_CALLBACK.read() {
+            *guard
+        } else {
+            None
+        };
+        let Some(cb) = cb_opt else {
+            return;
+        };
+
+        let meta = event.metadata();
+        let level: i32 = match *meta.level() {
+            tracing::Level::ERROR => 1,
+            tracing::Level::WARN => 2,
+            tracing::Level::INFO => 3,
+            tracing::Level::DEBUG => 4,
+            tracing::Level::TRACE => 5,
+        };
+
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{:?}", value);
+                } else {
+                    if !self.0.is_empty() {
+                        self.0.push(' ');
+                    }
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={:?}", field.name(), value);
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0.push_str(value);
+                } else {
+                    if !self.0.is_empty() {
+                        self.0.push(' ');
+                    }
+                    self.0.push_str(field.name());
+                    self.0.push('=');
+                    self.0.push_str(value);
+                }
+            }
+        }
+
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+
+        let Ok(target_c) = CString::new(meta.target()) else {
+            return;
+        };
+        let Ok(msg_c) = CString::new(visitor.0) else {
+            return;
+        };
+
+        unsafe {
+            cb(level, target_c.as_ptr(), msg_c.as_ptr());
+        }
+    }
+}
+
 /// Opaque engine handle.
 pub struct PbEngine {
     inner: Arc<PhoneBuddyEngine>,
@@ -702,6 +786,51 @@ pub unsafe extern "C" fn pb_string_free(ptr: *mut c_char) {
     }
 }
 
+/// Initialize native logging for debugging.
+/// `min_level`: 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE, <=0=disabled.
+/// On Android, automatically attaches logcat layer alongside the host callback.
+/// In release builds (`release_max_level_off`), tracing macros are stripped at compile-time.
+#[no_mangle]
+pub unsafe extern "C" fn pb_init_logging(callback: PbLogCallback, min_level: i32) {
+    if let Ok(mut guard) = GLOBAL_LOG_CALLBACK.write() {
+        *guard = callback;
+    }
+
+    if min_level <= 0 {
+        return;
+    }
+
+    LOG_INIT.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let filter = match min_level {
+            1 => tracing_subscriber::filter::LevelFilter::ERROR,
+            2 => tracing_subscriber::filter::LevelFilter::WARN,
+            3 => tracing_subscriber::filter::LevelFilter::INFO,
+            4 => tracing_subscriber::filter::LevelFilter::DEBUG,
+            _ => tracing_subscriber::filter::LevelFilter::TRACE,
+        };
+
+        #[cfg(target_os = "android")]
+        {
+            if let Ok(android_layer) = tracing_android::layer("PhoneBuddy") {
+                let _ = tracing_subscriber::registry()
+                    .with(filter)
+                    .with(android_layer)
+                    .with(HostLogLayer)
+                    .try_init();
+                return;
+            }
+        }
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(HostLogLayer)
+            .try_init();
+    });
+}
+
 #[cfg(target_os = "android")]
 #[doc(hidden)]
 pub mod android_jni {
@@ -1131,6 +1260,52 @@ mod tests {
             pb_string_free(outcome_ptr);
             pb_engine_free(engine);
         }
+    }
+
+    static TEST_LOGS: std::sync::Mutex<Vec<(i32, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn test_log_cb(
+        level: i32,
+        target: *const c_char,
+        message: *const c_char,
+    ) {
+        let t = if target.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(target).to_str().unwrap_or("")
+        };
+        let m = if message.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(message).to_str().unwrap_or("")
+        };
+        TEST_LOGS
+            .lock()
+            .unwrap()
+            .push((level, t.to_string(), m.to_string()));
+    }
+
+    #[test]
+    fn test_pb_init_logging_captures_traces() {
+        unsafe {
+            pb_init_logging(Some(test_log_cb), 3); // min_level = 3 (INFO)
+        }
+
+        tracing::warn!("test warning message from ffi test");
+        tracing::info!("test info message from ffi test");
+
+        let logs = TEST_LOGS.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(lvl, _target, msg)| *lvl == 2 && msg.contains("test warning message")),
+            "expected WARN log, got: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|(lvl, _target, msg)| *lvl == 3 && msg.contains("test info message")),
+            "expected INFO log, got: {logs:?}"
+        );
     }
 }
 

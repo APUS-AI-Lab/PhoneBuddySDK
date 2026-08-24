@@ -58,6 +58,14 @@ typedef void (*PbWebViewFetchCallback)(const char *call_id,
                                        void *user_data);
 
 /**
+ * Native logging callback.
+ * `level`: 1 = ERROR, 2 = WARN, 3 = INFO, 4 = DEBUG, 5 = TRACE.
+ * `target`: Logger target / module name (C-string).
+ * `message`: Formatted log text (C-string).
+ */
+typedef void (*PbLogCallback)(int32_t level, const char *target, const char *message);
+
+/**
  * Library version string. Do not free.
  */
 const char *pb_version(void);
@@ -242,5 +250,13 @@ void pb_engine_set_agent_name(struct PbEngine *engine, const char *name);
  * `ptr` must be a string returned by this library, or null.
  */
 void pb_string_free(char *ptr);
+
+/**
+ * Initialize native logging for debugging.
+ * `min_level`: 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE, <=0=disabled.
+ * On Android, automatically attaches logcat layer alongside the host callback.
+ * In release builds (`release_max_level_off`), tracing macros are stripped at compile-time.
+ */
+void pb_init_logging(PbLogCallback callback, int32_t min_level);
 
 #endif  /* PHONE_BUDDY_H */
