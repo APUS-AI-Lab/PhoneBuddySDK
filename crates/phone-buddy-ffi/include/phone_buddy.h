@@ -110,6 +110,18 @@ char *pb_engine_chat(struct PbEngine *engine,
                      char **err_out);
 
 /**
+ * Run one versioned structured user turn.
+ * Invalid JSON, unsupported schema versions, missing attachments, or invalid
+ * content parts are returned through err_out. There is no text fallback.
+ */
+char *pb_engine_chat_v2(struct PbEngine *engine,
+                        const char *session_id,
+                        const char *turn_json,
+                        PbEventCallback callback,
+                        void *user_data,
+                        char **err_out);
+
+/**
  * List sessions as a JSON array of metadata objects. Caller frees.
  *
  * # Safety

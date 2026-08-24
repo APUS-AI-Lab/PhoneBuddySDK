@@ -16,7 +16,7 @@ impl WireAdapter for MessagesAdapter {
         format!("{base}/messages")
     }
 
-    fn build_payload(&self, req: &ConversationRequest) -> serde_json::Value {
+    fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value> {
         build_messages_payload(req)
     }
 
@@ -25,7 +25,7 @@ impl WireAdapter for MessagesAdapter {
     }
 }
 
-pub fn build_messages_payload(req: &ConversationRequest) -> serde_json::Value {
+pub fn build_messages_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
     let mut system_text = String::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut pending_assistant: Vec<serde_json::Value> = Vec::new();
@@ -63,7 +63,7 @@ pub fn build_messages_payload(req: &ConversationRequest) -> serde_json::Value {
                 flush_tools(&mut pending_tool_results, &mut messages);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": u.content
+                    "content": super::messages_user_content(u, req)?
                 }));
             }
             ConversationItem::Reasoning(r) => {
@@ -169,7 +169,7 @@ pub fn build_messages_payload(req: &ConversationRequest) -> serde_json::Value {
         payload["tools"] = serde_json::Value::Array(tools_val);
     }
 
-    payload
+    Ok(payload)
 }
 
 pub fn parse_messages_chunk(

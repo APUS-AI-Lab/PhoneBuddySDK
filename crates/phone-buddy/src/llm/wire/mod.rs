@@ -10,15 +10,158 @@ pub mod responses;
 #[cfg(test)]
 mod conformance_tests;
 
-use crate::error::EngineResult;
+use crate::conversation::{ImageDetail, UserContentPart, UserItem};
+use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{ChatCompletionChunk, ConversationRequest};
 
 /// One protocol's request builder + SSE parser.
 pub(crate) trait WireAdapter {
     fn endpoint(&self, base: &str, model: &str, stream: bool) -> String;
-    fn build_payload(&self, req: &ConversationRequest) -> serde_json::Value;
+    fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value>;
     /// One SSE frame → zero or one internal chunk (unchanged chunk model).
     fn parse_event(&self, event: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>>;
+}
+
+fn require_image(
+    req: &ConversationRequest,
+    attachment_id: &str,
+) -> EngineResult<crate::llm::image::MaterializedImage> {
+    req.image_bytes
+        .get(attachment_id)
+        .ok_or_else(|| EngineError::AttachmentMissing(attachment_id.to_string()))
+}
+
+/// OpenAI Responses user `content`: string, or `[input_image, input_text]`.
+pub fn responses_user_content(
+    u: &UserItem,
+    req: &ConversationRequest,
+) -> EngineResult<serde_json::Value> {
+    if !u.has_images() {
+        return Ok(serde_json::Value::String(u.text_content()));
+    }
+    let mut content = Vec::new();
+    for p in u.normalized_parts() {
+        match p {
+            UserContentPart::Image {
+                attachment_id,
+                detail,
+                ..
+            } => {
+                let img = require_image(req, attachment_id)?;
+                let d = detail.unwrap_or(ImageDetail::Auto);
+                content.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": img.data_url(),
+                    "detail": d.as_str(),
+                }));
+            }
+            UserContentPart::Text { text } => {
+                content.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": text,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::Value::Array(content))
+}
+
+/// Chat Completions user `content`: string, or `[image_url, text]`.
+pub fn chat_completions_user_content(
+    u: &UserItem,
+    req: &ConversationRequest,
+) -> EngineResult<serde_json::Value> {
+    if !u.has_images() {
+        return Ok(serde_json::Value::String(u.text_content()));
+    }
+    let mut content = Vec::new();
+    for p in u.normalized_parts() {
+        match p {
+            UserContentPart::Image {
+                attachment_id,
+                detail,
+                ..
+            } => {
+                let img = require_image(req, attachment_id)?;
+                let d = detail.unwrap_or(ImageDetail::Auto);
+                content.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": img.data_url(),
+                        "detail": d.as_str(),
+                    }
+                }));
+            }
+            UserContentPart::Text { text } => {
+                content.push(serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::Value::Array(content))
+}
+
+/// Anthropic Messages user `content` blocks. Images use raw base64.
+pub fn messages_user_content(
+    u: &UserItem,
+    req: &ConversationRequest,
+) -> EngineResult<serde_json::Value> {
+    if !u.has_images() {
+        return Ok(serde_json::Value::String(u.text_content()));
+    }
+    let mut content = Vec::new();
+    for p in u.normalized_parts() {
+        match p {
+            UserContentPart::Image { attachment_id, .. } => {
+                let img = require_image(req, attachment_id)?;
+                content.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.mime_type.as_str(),
+                        "data": img.raw_b64(),
+                    }
+                }));
+            }
+            UserContentPart::Text { text } => {
+                content.push(serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::Value::Array(content))
+}
+
+/// Gemini generateContent user parts. Images use camelCase `inlineData`.
+pub fn gemini_user_parts(
+    u: &UserItem,
+    req: &ConversationRequest,
+) -> EngineResult<Vec<serde_json::Value>> {
+    let mut parts = Vec::new();
+    for p in u.normalized_parts() {
+        match p {
+            UserContentPart::Image { attachment_id, .. } => {
+                let img = require_image(req, attachment_id)?;
+                parts.push(serde_json::json!({
+                    "inlineData": {
+                        "mimeType": img.mime_type.as_str(),
+                        "data": img.raw_b64(),
+                    }
+                }));
+            }
+            UserContentPart::Text { text } => {
+                parts.push(serde_json::json!({ "text": text }));
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push(serde_json::json!({ "text": "" }));
+    }
+    Ok(parts)
 }
 
 /// Strip JSON-Schema keywords Gemini's OpenAPI subset rejects, and map
@@ -74,6 +217,90 @@ pub(crate) fn adapter_for(backend: crate::llm::types::ApiBackend) -> Box<dyn Wir
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn multimodal_user_turn_golden_payloads() {
+        use crate::conversation::{
+            ConversationItem, ImageDetail, ImageMimeType, UserContentPart, UserItem,
+        };
+        use crate::llm::image::{ImageBytesStore, MaterializedImage};
+
+        let store = ImageBytesStore::default();
+        store.insert(MaterializedImage {
+            attachment_id: "img_1".into(),
+            mime_type: ImageMimeType::Jpeg,
+            bytes: b"fake-jpeg-bytes".to_vec(),
+            detail: Some(ImageDetail::Auto),
+            width: 1024,
+            height: 768,
+        });
+        let item = UserItem {
+            parts: vec![
+                UserContentPart::Image {
+                    attachment_id: "img_1".into(),
+                    local_path: "/private/objects/img_1.jpg".into(),
+                    mime_type: ImageMimeType::Jpeg,
+                    byte_size: 15,
+                    width: 1024,
+                    height: 768,
+                    detail: Some(ImageDetail::Auto),
+                },
+                UserContentPart::Text {
+                    text: "这是什么".into(),
+                },
+            ],
+        };
+        let req = ConversationRequest {
+            model: "vision".into(),
+            items: vec![ConversationItem::User(item.clone())],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+            image_bytes: store,
+        };
+
+        let responses = super::responses::build_responses_payload(&req).unwrap();
+        let resp_content = &responses["input"][0]["content"];
+        assert_eq!(resp_content[0]["type"], "input_image");
+        assert!(resp_content[0]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        assert_eq!(resp_content[0]["detail"], "auto");
+        assert_eq!(resp_content[1]["type"], "input_text");
+        assert_eq!(resp_content[1]["text"], "这是什么");
+
+        let cc = super::chat_completions::build_chat_completions_payload(&req).unwrap();
+        let cc_content = &cc["messages"][0]["content"];
+        assert_eq!(cc_content[0]["type"], "image_url");
+        assert!(cc_content[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        assert_eq!(cc_content[1]["type"], "text");
+
+        let messages = super::messages::build_messages_payload(&req).unwrap();
+        let msg_content = &messages["messages"][0]["content"];
+        assert_eq!(msg_content[0]["type"], "image");
+        assert_eq!(msg_content[0]["source"]["type"], "base64");
+        assert_eq!(msg_content[0]["source"]["media_type"], "image/jpeg");
+        assert!(!msg_content[0]["source"]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:"));
+        assert_eq!(msg_content[1]["type"], "text");
+
+        let gemini = super::gemini::build_gemini_payload(&req).unwrap();
+        let parts = &gemini["contents"][0]["parts"];
+        assert!(parts[0].get("inlineData").is_some());
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(parts[1]["text"], "这是什么");
+    }
 
     #[test]
     fn gemini_schema_sanitizer() {

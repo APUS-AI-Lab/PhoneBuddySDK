@@ -274,11 +274,70 @@ mod inject_fallback_tests {
 
 // ── Messages ─────────────────────────────────────────────────────────────
 
+/// Chat Completions / host-contract message content: a string or multimodal parts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl MessageContent {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text(s.into())
+    }
+
+    pub fn as_plain_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ChatContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text {
+        text: String,
+    },
+    #[serde(rename = "image_url")]
+    ImageUrl {
+        image_url: ChatImageUrl,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatImageUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Present on `role = "tool"` messages.
@@ -353,10 +412,17 @@ impl ChatMessage {
         self
     }
 
+    pub fn content_text(&self) -> String {
+        self.content
+            .as_ref()
+            .map(|c| c.as_plain_text())
+            .unwrap_or_default()
+    }
+
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: Some(text.into()),
+            content: Some(MessageContent::text(text)),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_items: Vec::new(),
@@ -369,7 +435,7 @@ impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: Some(text.into()),
+            content: Some(MessageContent::text(text)),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_items: Vec::new(),
@@ -382,7 +448,7 @@ impl ChatMessage {
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: Some(text.into()),
+            content: Some(MessageContent::text(text)),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_items: Vec::new(),
@@ -400,7 +466,7 @@ impl ChatMessage {
     ) -> Self {
         Self {
             role: Role::Assistant,
-            content: Some(text.into()),
+            content: Some(MessageContent::text(text)),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_items,
@@ -413,7 +479,7 @@ impl ChatMessage {
     pub fn assistant_tool_calls(calls: Vec<ToolCall>, text: Option<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: text,
+            content: text.map(MessageContent::Text),
             tool_calls: calls,
             tool_call_id: None,
             reasoning_items: Vec::new(),
@@ -432,7 +498,7 @@ impl ChatMessage {
     ) -> Self {
         Self {
             role: Role::Assistant,
-            content: text,
+            content: text.map(MessageContent::Text),
             tool_calls: calls,
             tool_call_id: None,
             reasoning_items,
@@ -445,7 +511,7 @@ impl ChatMessage {
     pub fn tool_result(call_id: impl Into<String>, output: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(output.into()),
+            content: Some(MessageContent::text(output)),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             reasoning_items: Vec::new(),
@@ -626,6 +692,8 @@ pub struct ConversationRequest {
     pub search_parameters: Option<SearchParameters>,
     pub hosted_tools: Vec<HostedTool>,
     pub previous_response_id: Option<String>,
+    /// Request-scoped image bytes. Never serialized to session storage.
+    pub image_bytes: crate::llm::image::ImageBytesStore,
 }
 
 impl ConversationRequest {
@@ -641,6 +709,7 @@ impl ConversationRequest {
             search_parameters: req.search_parameters,
             hosted_tools: req.hosted_tools,
             previous_response_id: req.previous_response_id,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         }
     }
 

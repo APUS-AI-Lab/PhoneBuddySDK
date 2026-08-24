@@ -85,16 +85,17 @@ fn fixture() -> ConversationRequest {
         search_parameters: None,
         hosted_tools: vec![],
         previous_response_id: None,
+        image_bytes: crate::llm::image::ImageBytesStore::default(),
     }
 }
 
 #[test]
 fn conformance_fixture_per_backend() {
     let req = fixture();
-    let responses = build_responses_payload(&req);
-    let cc = build_chat_completions_payload(&req);
-    let messages = build_messages_payload(&req);
-    let gemini = build_gemini_payload(&req);
+    let responses = build_responses_payload(&req).unwrap();
+    let cc = build_chat_completions_payload(&req).unwrap();
+    let messages = build_messages_payload(&req).unwrap();
+    let gemini = build_gemini_payload(&req).unwrap();
 
     // Responses: native reasoning + verbatim backend payload, no function_call for ws_*.
     let input = responses["input"].as_array().unwrap();
@@ -141,10 +142,10 @@ fn conformance_fixture_per_backend() {
 #[test]
 fn pairing_invariants_all_backends() {
     let req = fixture();
-    let responses = build_responses_payload(&req);
-    let cc = build_chat_completions_payload(&req);
-    let messages = build_messages_payload(&req);
-    let gemini = build_gemini_payload(&req);
+    let responses = build_responses_payload(&req).unwrap();
+    let cc = build_chat_completions_payload(&req).unwrap();
+    let messages = build_messages_payload(&req).unwrap();
+    let gemini = build_gemini_payload(&req).unwrap();
 
     // Responses: every function_call has a matching function_call_output.
     let input = responses["input"].as_array().unwrap();
@@ -222,10 +223,10 @@ fn pairing_invariants_all_backends() {
 #[test]
 fn backend_call_degrades_to_text() {
     let req = fixture();
-    let responses = build_responses_payload(&req);
-    let cc = build_chat_completions_payload(&req);
-    let messages = build_messages_payload(&req);
-    let gemini = build_gemini_payload(&req);
+    let responses = build_responses_payload(&req).unwrap();
+    let cc = build_chat_completions_payload(&req).unwrap();
+    let messages = build_messages_payload(&req).unwrap();
+    let gemini = build_gemini_payload(&req).unwrap();
 
     let input = responses["input"].as_array().unwrap();
     let backend = input
@@ -269,8 +270,8 @@ fn origin_strip_blocks_foreign_signatures() {
         "anthropic/claude",
         "openai/gpt-5",
     );
-    let messages = build_messages_payload(&req);
-    let gemini = build_gemini_payload(&req);
+    let messages = build_messages_payload(&req).unwrap();
+    let gemini = build_gemini_payload(&req).unwrap();
     let msg_s = messages.to_string();
     let gem_s = gemini.to_string();
     assert!(!msg_s.contains("\"signature\":\"enc\""));
@@ -281,7 +282,7 @@ fn origin_strip_blocks_foreign_signatures() {
 #[test]
 fn messages_thinking_block_ordering() {
     let req = fixture();
-    let messages = build_messages_payload(&req);
+    let messages = build_messages_payload(&req).unwrap();
     let asst = &messages["messages"][1];
     assert_eq!(asst["content"][0]["type"], "thinking");
     assert_eq!(asst["content"][0]["signature"], "enc");
@@ -337,4 +338,95 @@ fn endpoint_and_headers_per_backend() {
         ),
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
     );
+}
+
+#[test]
+fn multimodal_image_conformance_all_backends() {
+    use crate::conversation::{ImageDetail, ImageMimeType, UserContentPart, UserItem};
+    use crate::llm::image::{ImageBytesStore, MaterializedImage};
+
+    let png_bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+    let store = ImageBytesStore::default();
+    store.insert(MaterializedImage {
+        attachment_id: "att_1".into(),
+        mime_type: ImageMimeType::Png,
+        bytes: png_bytes.clone(),
+        detail: Some(ImageDetail::High),
+        width: 100,
+        height: 100,
+    });
+
+    let req = ConversationRequest {
+        model: "test-model".into(),
+        items: vec![ConversationItem::User(UserItem {
+            parts: vec![
+                UserContentPart::Text {
+                    text: "describe this".into(),
+                },
+                UserContentPart::Image {
+                    attachment_id: "att_1".into(),
+                    local_path: "/tmp/fake.png".into(),
+                    mime_type: ImageMimeType::Png,
+                    byte_size: png_bytes.len() as u64,
+                    width: 100,
+                    height: 100,
+                    detail: Some(ImageDetail::High),
+                },
+            ],
+        })],
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        temperature: None,
+        max_tokens: None,
+        search_parameters: None,
+        hosted_tools: vec![],
+        previous_response_id: None,
+        image_bytes: store,
+    };
+
+    // 1. OpenAI / xAI Responses API
+    let responses = build_responses_payload(&req).unwrap();
+    let resp_input = &responses["input"][0];
+    assert_eq!(resp_input["role"], "user");
+    let resp_content = resp_input["content"].as_array().unwrap();
+    // Normalized order: images first, then text
+    assert_eq!(resp_content[0]["type"], "input_image");
+    assert!(resp_content[0]["image_url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert_eq!(resp_content[0]["detail"], "high");
+    assert_eq!(resp_content[1]["type"], "input_text");
+    assert_eq!(resp_content[1]["text"], "describe this");
+
+    // 2. OpenAI Chat Completions API
+    let cc = build_chat_completions_payload(&req).unwrap();
+    let cc_msg = &cc["messages"][0];
+    assert_eq!(cc_msg["role"], "user");
+    let cc_content = cc_msg["content"].as_array().unwrap();
+    assert_eq!(cc_content[0]["type"], "image_url");
+    assert!(cc_content[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert_eq!(cc_content[0]["image_url"]["detail"], "high");
+    assert_eq!(cc_content[1]["type"], "text");
+    assert_eq!(cc_content[1]["text"], "describe this");
+
+    // 3. Anthropic Messages API
+    let msg = build_messages_payload(&req).unwrap();
+    let msg_item = &msg["messages"][0];
+    assert_eq!(msg_item["role"], "user");
+    let msg_content = msg_item["content"].as_array().unwrap();
+    assert_eq!(msg_content[0]["type"], "image");
+    assert_eq!(msg_content[0]["source"]["type"], "base64");
+    assert_eq!(msg_content[0]["source"]["media_type"], "image/png");
+    assert!(!msg_content[0]["source"]["data"].as_str().unwrap().starts_with("data:"));
+    assert_eq!(msg_content[1]["type"], "text");
+    assert_eq!(msg_content[1]["text"], "describe this");
+
+    // 4. Google Gemini generateContent API
+    let gem = build_gemini_payload(&req).unwrap();
+    let gem_item = &gem["contents"][0];
+    assert_eq!(gem_item["role"], "user");
+    let gem_parts = gem_item["parts"].as_array().unwrap();
+    assert!(gem_parts[0].get("inlineData").is_some());
+    assert_eq!(gem_parts[0]["inlineData"]["mimeType"], "image/png");
+    assert!(!gem_parts[0]["inlineData"]["data"].as_str().unwrap().starts_with("data:"));
+    assert_eq!(gem_parts[1]["text"], "describe this");
 }

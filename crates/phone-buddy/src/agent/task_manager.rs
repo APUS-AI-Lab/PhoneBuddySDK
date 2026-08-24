@@ -388,6 +388,7 @@ impl TaskManager {
                 search_parameters: None,
                 hosted_tools: hosted,
                 previous_response_id: None,
+                image_bytes: crate::llm::image::ImageBytesStore::default(),
             };
 
             let observer = NullObserver;

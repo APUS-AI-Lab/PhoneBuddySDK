@@ -15,7 +15,7 @@ impl WireAdapter for ChatCompletionsAdapter {
         format!("{base}/chat/completions")
     }
 
-    fn build_payload(&self, req: &ConversationRequest) -> serde_json::Value {
+    fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value> {
         build_chat_completions_payload(req)
     }
 
@@ -24,8 +24,8 @@ impl WireAdapter for ChatCompletionsAdapter {
     }
 }
 
-pub fn build_chat_completions_payload(req: &ConversationRequest) -> serde_json::Value {
-    let host = items_to_chat_request(req);
+pub fn build_chat_completions_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
+    let host = items_to_chat_request(req)?;
     let mut val = serde_json::to_value(&host).unwrap_or_else(|_| serde_json::json!({}));
     val["stream"] = serde_json::Value::Bool(true);
     val["stream_options"] = serde_json::json!({ "include_usage": true });
@@ -38,12 +38,12 @@ pub fn build_chat_completions_payload(req: &ConversationRequest) -> serde_json::
             }
         }
     }
-    val
+    Ok(val)
 }
 
 /// Host-contract Chat Completions request (no item types, origin stripped
 /// at serialize time by [`ChatMessage`] serde skip).
-pub fn items_to_chat_request(req: &ConversationRequest) -> ChatCompletionRequest {
+pub fn items_to_chat_request(req: &ConversationRequest) -> EngineResult<ChatCompletionRequest> {
     let mut messages = Vec::new();
     let mut pending_backend_text = String::new();
 
@@ -70,7 +70,7 @@ pub fn items_to_chat_request(req: &ConversationRequest) -> ChatCompletionRequest
                     content: if content.is_empty() {
                         None
                     } else {
-                        Some(content)
+                        Some(crate::llm::types::MessageContent::text(content))
                     },
                     tool_calls: a
                         .tool_calls
@@ -107,7 +107,7 @@ pub fn items_to_chat_request(req: &ConversationRequest) -> ChatCompletionRequest
             }
             ConversationItem::User(u) => {
                 flush_backend_as_assistant(&mut messages, &mut pending_backend_text);
-                messages.push(crate::llm::types::ChatMessage::user(&u.content));
+                messages.push(user_to_cc_message(u, req)?);
             }
             ConversationItem::ToolResult(t) => {
                 flush_backend_as_assistant(&mut messages, &mut pending_backend_text);
@@ -120,7 +120,7 @@ pub fn items_to_chat_request(req: &ConversationRequest) -> ChatCompletionRequest
     }
     flush_backend_as_assistant(&mut messages, &mut pending_backend_text);
 
-    ChatCompletionRequest {
+    Ok(ChatCompletionRequest {
         model: req.model.clone(),
         messages,
         stream: req.stream,
@@ -131,7 +131,31 @@ pub fn items_to_chat_request(req: &ConversationRequest) -> ChatCompletionRequest
         search_parameters: req.search_parameters.clone(),
         hosted_tools: Vec::new(),
         previous_response_id: None,
+    })
+}
+
+fn user_to_cc_message(
+    u: &crate::conversation::UserItem,
+    req: &ConversationRequest,
+) -> EngineResult<crate::llm::types::ChatMessage> {
+    if !u.has_images() {
+        return Ok(crate::llm::types::ChatMessage::user(u.text_content()));
     }
+    let content = super::chat_completions_user_content(u, req)?;
+    let parts: Vec<crate::llm::types::ChatContentPart> =
+        serde_json::from_value(content).map_err(|e| {
+            crate::error::EngineError::InvalidUserTurn(format!("cc content parts: {e}"))
+        })?;
+    Ok(crate::llm::types::ChatMessage {
+        role: Role::User,
+        content: Some(crate::llm::types::MessageContent::Parts(parts)),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        reasoning_items: Vec::new(),
+        reasoning_content: None,
+        encrypted_reasoning: None,
+        origin: None,
+    })
 }
 
 fn flush_backend_as_assistant(
@@ -147,7 +171,7 @@ fn flush_backend_as_assistant(
 }
 
 /// Host contract: serialize items as Chat Completions JSON (legacy messages).
-pub fn host_request_json(req: &ConversationRequest) -> Result<String, serde_json::Error> {
+pub fn host_request_json(req: &ConversationRequest) -> EngineResult<String> {
     let mut host = req.to_host_chat_request();
     for m in &mut host.messages {
         m.origin = None;
@@ -156,6 +180,6 @@ pub fn host_request_json(req: &ConversationRequest) -> Result<String, serde_json
     // Prefer the CC adapter's backend-degrade so the host never sees
     // `type: reasoning` / backend items.
     let _ = chat_messages_from_items;
-    let degraded = items_to_chat_request(req);
-    serde_json::to_string(&degraded)
+    let degraded = items_to_chat_request(req)?;
+    serde_json::to_string(&degraded).map_err(Into::into)
 }

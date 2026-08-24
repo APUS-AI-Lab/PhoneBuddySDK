@@ -17,7 +17,7 @@ impl WireAdapter for ResponsesAdapter {
         format!("{base}/responses")
     }
 
-    fn build_payload(&self, req: &ConversationRequest) -> serde_json::Value {
+    fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value> {
         build_responses_payload(req)
     }
 
@@ -47,7 +47,7 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
     }
 }
 
-pub fn build_responses_payload(req: &ConversationRequest) -> serde_json::Value {
+pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
     let mut instructions = String::new();
     let mut input = Vec::new();
 
@@ -62,7 +62,7 @@ pub fn build_responses_payload(req: &ConversationRequest) -> serde_json::Value {
             ConversationItem::User(u) => {
                 input.push(serde_json::json!({
                     "role": "user",
-                    "content": u.content
+                    "content": super::responses_user_content(u, req)?
                 }));
             }
             ConversationItem::Reasoning(r) => {
@@ -151,7 +151,7 @@ pub fn build_responses_payload(req: &ConversationRequest) -> serde_json::Value {
         payload["tools"] = serde_json::Value::Array(tools_val);
     }
 
-    payload
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -172,6 +172,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         }
     }
 
@@ -205,7 +206,7 @@ mod tests {
                 origin: None,
             }),
             ConversationItem::tool_result("c1", "out"),
-        ]));
+        ])).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[1], payload_item);
         assert_ne!(input[1]["type"], "function_call");
@@ -224,7 +225,7 @@ mod tests {
 
     #[test]
     fn responses_payload_sets_store_and_include() {
-        let body = build_responses_payload(&req(vec![ConversationItem::user("hi")]));
+        let body = build_responses_payload(&req(vec![ConversationItem::user("hi")])).unwrap();
         assert_eq!(body["store"], false);
         assert!(body["include"]
             .as_array()
@@ -273,7 +274,7 @@ mod tests {
                 encrypted_reasoning: None,
                 origin: None,
             }),
-        ]));
+        ])).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["id"], "r1");

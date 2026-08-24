@@ -88,7 +88,7 @@ fn agent_loop_executes_tools_and_reports() {
     assert!(!session.items.is_empty());
     match &session.items[0] {
         phone_buddy::conversation::ConversationItem::User(u) => {
-            assert_eq!(u.content, "compute the sum");
+            assert_eq!(u.text_content(), "compute the sum");
         }
         other => panic!("expected user item, got {other:?}"),
     }

@@ -167,6 +167,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         }
     }
 
@@ -247,6 +248,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         };
         let _ = hub.begin(&req).unwrap();
         let json = captured.lock().unwrap().clone();

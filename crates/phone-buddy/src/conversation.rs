@@ -3,11 +3,20 @@
 //! Wire adapters down-convert from this shape. The legacy [`ChatMessage`]
 //! list is retained only for host-transport and v1 session compatibility.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{
-    reasoning_item_text, ChatMessage, ReasoningItem, Role, ToolCall, ToolCallFunction,
+    reasoning_item_text, ChatMessage, MessageContent, ReasoningItem, Role, ToolCall,
+    ToolCallFunction,
 };
+
+/// Max processed image width accepted by the SDK.
+pub const MAX_IMAGE_WIDTH: u32 = 1024;
+/// Max processed image height accepted by the SDK.
+pub const MAX_IMAGE_HEIGHT: u32 = 768;
+/// Max image parts on a single user turn.
+pub const MAX_IMAGES_PER_TURN: usize = 5;
 
 /// A single item in a conversation — the unified internal representation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,9 +38,202 @@ pub struct SystemItem {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageMimeType {
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+    #[serde(rename = "image/png")]
+    Png,
+}
+
+impl ImageMimeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
+impl ImageDetail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Original => "original",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        attachment_id: String,
+        local_path: String,
+        mime_type: ImageMimeType,
+        byte_size: u64,
+        width: u32,
+        height: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+    },
+}
+
+/// Ordered user content. Legacy sessions with `content: "…"` migrate on load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserItem {
-    pub content: String,
+    pub parts: Vec<UserContentPart>,
+}
+
+impl<'de> Deserialize<'de> for UserItem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            parts: Option<Vec<UserContentPart>>,
+            #[serde(default)]
+            content: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if let Some(parts) = raw.parts {
+            Ok(UserItem { parts })
+        } else if let Some(content) = raw.content {
+            Ok(UserItem {
+                parts: vec![UserContentPart::Text { text: content }],
+            })
+        } else {
+            Ok(UserItem { parts: Vec::new() })
+        }
+    }
+}
+
+impl UserItem {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            parts: vec![UserContentPart::Text {
+                text: content.into(),
+            }],
+        }
+    }
+
+    pub fn text_content(&self) -> String {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                UserContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, UserContentPart::Image { .. }))
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.parts
+            .iter()
+            .filter(|p| matches!(p, UserContentPart::Image { .. }))
+            .count()
+    }
+
+    pub fn normalized_parts(&self) -> Vec<&UserContentPart> {
+        let mut images = Vec::new();
+        let mut texts = Vec::new();
+        for p in &self.parts {
+            match p {
+                UserContentPart::Image { .. } => images.push(p),
+                UserContentPart::Text { text } if !text.trim().is_empty() => texts.push(p),
+                UserContentPart::Text { .. } => {}
+            }
+        }
+        images.extend(texts);
+        images
+    }
+
+    pub fn validate_shape(&self) -> EngineResult<()> {
+        let images = self.image_count();
+        if images > MAX_IMAGES_PER_TURN {
+            return Err(EngineError::TooManyImages(images));
+        }
+        let has_text = self.parts.iter().any(|p| {
+            matches!(p, UserContentPart::Text { text } if !text.trim().is_empty())
+        });
+        if images == 0 && !has_text {
+            return Err(EngineError::InvalidUserTurn(
+                "turn has no text or image parts".into(),
+            ));
+        }
+        for p in &self.parts {
+            if let UserContentPart::Image {
+                width,
+                height,
+                attachment_id,
+                ..
+            } = p
+            {
+                if *width == 0 || *height == 0 {
+                    return Err(EngineError::AttachmentInvalid(
+                        attachment_id.clone(),
+                        "invalid dimensions".into(),
+                    ));
+                }
+                if *width > MAX_IMAGE_WIDTH || *height > MAX_IMAGE_HEIGHT {
+                    return Err(EngineError::AttachmentInvalid(
+                        attachment_id.clone(),
+                        format!("exceeds {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UserTurnV2Wire {
+    schema_version: u32,
+    #[serde(rename = "type")]
+    kind: String,
+    parts: Vec<UserContentPart>,
+}
+
+/// Parse a versioned `pb_engine_chat_v2` turn JSON. No text fallback.
+pub fn parse_user_turn_v2(json: &str) -> EngineResult<UserItem> {
+    let turn: UserTurnV2Wire = serde_json::from_str(json)
+        .map_err(|e| EngineError::InvalidUserTurn(e.to_string()))?;
+    if turn.schema_version != 1 {
+        return Err(EngineError::InvalidUserTurn(format!(
+            "unsupported schema_version {}",
+            turn.schema_version
+        )));
+    }
+    if turn.kind != "user_turn" {
+        return Err(EngineError::InvalidUserTurn(format!(
+            "unexpected type {}",
+            turn.kind
+        )));
+    }
+    let item = UserItem { parts: turn.parts };
+    item.validate_shape()?;
+    Ok(item)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,9 +279,7 @@ impl ConversationItem {
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self::User(UserItem {
-            content: content.into(),
-        })
+        Self::User(UserItem::text(content))
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -233,14 +433,10 @@ pub fn items_from_chat_messages(messages: &[ChatMessage]) -> Vec<ConversationIte
     for msg in messages {
         match msg.role {
             Role::System => {
-                out.push(ConversationItem::system(
-                    msg.content.clone().unwrap_or_default(),
-                ));
+                out.push(ConversationItem::system(msg.content_text()));
             }
             Role::User => {
-                out.push(ConversationItem::user(
-                    msg.content.clone().unwrap_or_default(),
-                ));
+                out.push(ConversationItem::user(msg.content_text()));
             }
             Role::Assistant => {
                 for r in &msg.reasoning_items {
@@ -275,7 +471,7 @@ pub fn items_from_chat_messages(messages: &[ChatMessage]) -> Vec<ConversationIte
                     }
                 }
 
-                let content = msg.content.clone().unwrap_or_default();
+                let content = msg.content_text();
                 out.push(ConversationItem::Assistant(AssistantItem {
                     content,
                     tool_calls: client_calls,
@@ -287,12 +483,18 @@ pub fn items_from_chat_messages(messages: &[ChatMessage]) -> Vec<ConversationIte
             Role::Tool => {
                 out.push(ConversationItem::tool_result(
                     msg.tool_call_id.clone().unwrap_or_default(),
-                    msg.content.clone().unwrap_or_default(),
+                    msg.content_text(),
                 ));
             }
         }
     }
     out
+}
+
+fn user_item_to_chat_message(u: &UserItem) -> ChatMessage {
+    // Image bytes are injected at wire time from `ImageBytesStore`. This
+    // down-conversion keeps plaintext so v1 consumers still compile.
+    ChatMessage::user(u.text_content())
 }
 
 /// Down-conversion for legacy consumers (host contract, v1 session compat).
@@ -333,7 +535,7 @@ pub fn chat_messages_from_items(items: &[ConversationItem]) -> Vec<ChatMessage> 
             }
             ConversationItem::User(u) => {
                 flush_orphans(&mut out, &mut pending_reasoning, &mut pending_backend);
-                out.push(ChatMessage::user(&u.content));
+                out.push(user_item_to_chat_message(u));
             }
             ConversationItem::Reasoning(r) => {
                 pending_reasoning.push(r.clone());
@@ -358,7 +560,7 @@ pub fn chat_messages_from_items(items: &[ConversationItem]) -> Vec<ChatMessage> 
                     content: if a.content.is_empty() {
                         None
                     } else {
-                        Some(a.content.clone())
+                        Some(MessageContent::text(a.content.clone()))
                     },
                     tool_calls,
                     tool_call_id: None,
@@ -567,6 +769,78 @@ mod tests {
         match &back[2] {
             ConversationItem::Assistant(a) => assert_eq!(a.content, "found it"),
             other => panic!("expected assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_user_content_migrates_to_text_part() {
+        let json = r#"{"type":"user","content":"hello"}"#;
+        let item: ConversationItem = serde_json::from_str(json).unwrap();
+        match item {
+            ConversationItem::User(u) => {
+                assert_eq!(u.parts.len(), 1);
+                assert_eq!(u.text_content(), "hello");
+            }
+            other => panic!("expected user, got {other:?}"),
+        }
+        let encoded = serde_json::to_value(&ConversationItem::user("hello")).unwrap();
+        assert!(encoded.get("content").is_none());
+        assert_eq!(encoded["parts"][0]["type"], "text");
+        assert_eq!(encoded["parts"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn parse_user_turn_v2_accepts_image_then_text() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": [
+                {
+                    "type": "image",
+                    "attachment_id": "img_1",
+                    "local_path": "/tmp/a.jpg",
+                    "mime_type": "image/jpeg",
+                    "byte_size": 12,
+                    "width": 800,
+                    "height": 600,
+                    "detail": "auto"
+                },
+                {"type": "text", "text": "这是什么"}
+            ]
+        });
+        let item = parse_user_turn_v2(&json.to_string()).unwrap();
+        assert_eq!(item.image_count(), 1);
+        assert_eq!(item.text_content(), "这是什么");
+        assert_eq!(item.normalized_parts().len(), 2);
+    }
+
+    #[test]
+    fn parse_user_turn_v2_rejects_unknown_schema_and_too_many_images() {
+        let bad_ver = r#"{"schema_version":2,"type":"user_turn","parts":[{"type":"text","text":"hi"}]}"#;
+        match parse_user_turn_v2(bad_ver) {
+            Err(EngineError::InvalidUserTurn(msg)) => assert!(msg.contains("schema_version")),
+            other => panic!("{other:?}"),
+        }
+        let mut parts = Vec::new();
+        for i in 0..6 {
+            parts.push(serde_json::json!({
+                "type": "image",
+                "attachment_id": format!("img_{i}"),
+                "local_path": "/tmp/a.jpg",
+                "mime_type": "image/jpeg",
+                "byte_size": 1,
+                "width": 10,
+                "height": 10
+            }));
+        }
+        let too_many = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": parts
+        });
+        match parse_user_turn_v2(&too_many.to_string()) {
+            Err(EngineError::TooManyImages(6)) => {}
+            other => panic!("{other:?}"),
         }
     }
 

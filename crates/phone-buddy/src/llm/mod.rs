@@ -4,6 +4,7 @@ pub mod client;
 pub mod doom_loop_collector;
 pub mod doom_loop_wire;
 pub mod dumper;
+pub mod image;
 pub mod failover;
 pub mod host;
 pub mod profiles;

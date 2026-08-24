@@ -284,7 +284,7 @@ impl LlmTransport for HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
 
-        let mut body = adapter.build_payload(req);
+        let mut body = adapter.build_payload(req)?;
 
 
         merge_extra_body(&mut body, &self.extra_body);
@@ -755,7 +755,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert_eq!(payload["model"], "grok-3");
         assert_eq!(payload["instructions"], "You are helpful.");
         assert_eq!(payload["input"][0]["role"], "user");
@@ -779,10 +779,10 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: Some("resp_abc".into()),
         };
-        let payload = build_responses_payload(&conv(req.clone()));
+        let payload = build_responses_payload(&conv(req.clone())).unwrap();
         assert_eq!(payload["previous_response_id"], "resp_abc");
         req.previous_response_id = Some(String::new());
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert!(payload.get("previous_response_id").is_none());
     }
 
@@ -813,7 +813,7 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert!(payload.get("search_parameters").is_none());
         assert!(payload.get("tools").is_none());
     }
@@ -849,7 +849,7 @@ mod tests {
             hosted_tools: vec![HostedTool::WebSearch],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let tools = payload["tools"].as_array().unwrap();
         assert_eq!(tools[0]["type"], "web_search");
         assert!(tools[0].get("name").is_none());
@@ -886,7 +886,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_messages_payload(&conv(req));
+        let payload = build_messages_payload(&conv(req)).unwrap();
         assert_eq!(payload["model"], "claude-3-5-sonnet");
         assert_eq!(payload["system"], "System prompt");
         assert_eq!(payload["messages"][0]["role"], "user");
@@ -942,7 +942,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         // Item 0: user message
         assert_eq!(input[0]["role"], "user");
@@ -972,7 +972,7 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert_eq!(payload["reasoning"]["summary"], "concise");
         assert!(payload["reasoning"].get("effort").is_none());
     }
@@ -1009,7 +1009,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["type"], "reasoning");
@@ -1057,7 +1057,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&conv(req));
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["summary"], serde_json::json!([]));
@@ -1281,7 +1281,7 @@ mod tests {
         extra.insert("user_tier".to_string(), serde_json::json!("premium"));
 
         // Test Responses API payload
-        let mut resp_payload = build_responses_payload(&conv(req.clone()));
+        let mut resp_payload = build_responses_payload(&conv(req.clone())).unwrap();
         merge_extra_body(&mut resp_payload, &extra);
         assert_eq!(resp_payload["custom_app_id"], "org.example.app");
         assert_eq!(resp_payload["client_version"], "1.0.0");
@@ -1289,7 +1289,7 @@ mod tests {
         assert_eq!(resp_payload["model"], "claude-3-5-sonnet");
 
         // Test Messages API payload
-        let mut msg_payload = build_messages_payload(&conv(req));
+        let mut msg_payload = build_messages_payload(&conv(req)).unwrap();
         merge_extra_body(&mut msg_payload, &extra);
         assert_eq!(msg_payload["custom_app_id"], "org.example.app");
         assert_eq!(msg_payload["client_version"], "1.0.0");

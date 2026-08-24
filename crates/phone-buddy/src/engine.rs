@@ -41,12 +41,46 @@ pub struct ChatOutcome {
 
 /// Approximate tokens = chars / 4 (same heuristic grok uses for quick
 /// estimates; avoids pulling in a tokenizer).
+fn estimate_image_chars(
+    width: u32,
+    height: u32,
+    detail: Option<crate::conversation::ImageDetail>,
+) -> usize {
+    use crate::conversation::ImageDetail;
+    let tiles = ((width.max(1) + 511) / 512) * ((height.max(1) + 511) / 512);
+    let tokens = match detail.unwrap_or(ImageDetail::Auto) {
+        ImageDetail::Low => 85,
+        ImageDetail::High | ImageDetail::Original => 85 + tiles as usize * 170,
+        ImageDetail::Auto => {
+            if width <= 512 && height <= 512 {
+                85
+            } else {
+                85 + tiles as usize * 170
+            }
+        }
+    };
+    tokens * 4
+}
+
 fn estimate_tokens(items: &[ConversationItem]) -> usize {
     let mut chars = 0usize;
     for item in items {
         match item {
             ConversationItem::System(s) => chars += s.content.len(),
-            ConversationItem::User(u) => chars += u.content.len(),
+            ConversationItem::User(u) => {
+                chars += u.text_content().len();
+                for p in &u.parts {
+                    if let crate::conversation::UserContentPart::Image {
+                        width,
+                        height,
+                        detail,
+                        ..
+                    } = p
+                    {
+                        chars += estimate_image_chars(*width, *height, *detail);
+                    }
+                }
+            }
             ConversationItem::Assistant(a) => {
                 chars += a.content.len();
                 chars += a.reasoning_content.as_deref().map(str::len).unwrap_or(0);
@@ -329,9 +363,17 @@ impl PhoneBuddyEngine {
         model: String,
         items: Vec<ConversationItem>,
         stream: bool,
-    ) -> ConversationRequest {
+    ) -> EngineResult<ConversationRequest> {
         let hosted = HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
-        ConversationRequest {
+        let root = self.config.resolved_attachment_root();
+        let image_bytes = if items.iter().any(|i| {
+            matches!(i, ConversationItem::User(u) if u.has_images())
+        }) {
+            crate::llm::image::materialize_items(&items, &root)?
+        } else {
+            crate::llm::image::ImageBytesStore::default()
+        };
+        Ok(ConversationRequest {
             model,
             items,
             stream: Some(stream),
@@ -342,7 +384,8 @@ impl PhoneBuddyEngine {
             search_parameters: None,
             hosted_tools: hosted,
             previous_response_id: None,
-        }
+            image_bytes,
+        })
     }
 
     fn build_prompt(&self) -> String {
@@ -386,21 +429,42 @@ impl PhoneBuddyEngine {
         user_input: &str,
         observer: Option<Arc<dyn AgentObserver>>,
     ) -> EngineResult<ChatOutcome> {
+        self.chat_user(
+            session_id,
+            crate::conversation::UserItem::text(user_input),
+            observer,
+        )
+    }
+
+    /// Versioned structured user turn (`pb_engine_chat_v2`).
+    pub fn chat_v2(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_json: &str,
+        observer: Option<Arc<dyn AgentObserver>>,
+    ) -> EngineResult<ChatOutcome> {
+        let user = crate::conversation::parse_user_turn_v2(turn_json)?;
+        self.chat_user(session_id, user, observer)
+    }
+
+    fn chat_user(
+        self: &Arc<Self>,
+        session_id: &str,
+        user: crate::conversation::UserItem,
+        observer: Option<Arc<dyn AgentObserver>>,
+    ) -> EngineResult<ChatOutcome> {
         let observer = observer.unwrap_or_else(|| Arc::new(NullObserver));
         let session_id = session_id.to_string();
-        let user_input = user_input.to_string();
         let this = self.clone();
-        // The internal runtime is only active outside of async context here.
-        self.runtime.block_on(async move {
-            this.chat_async(&session_id, &user_input, observer).await
-        })
+        self.runtime
+            .block_on(async move { this.chat_async(&session_id, user, observer).await })
     }
 
     /// Async version of [`chat`] for Rust consumers already on a runtime.
     pub async fn chat_async(
         self: &Arc<Self>,
         session_id: &str,
-        user_input: &str,
+        user: crate::conversation::UserItem,
         observer: Arc<dyn AgentObserver>,
     ) -> EngineResult<ChatOutcome> {
         let token = tokio_util::sync::CancellationToken::new();
@@ -415,7 +479,7 @@ impl PhoneBuddyEngine {
             _ = token.cancelled() => {
                 Err(EngineError::Cancelled)
             }
-            res = self.run_turn(session_id, user_input, &observer, &token) => {
+            res = self.run_turn(session_id, user, &observer, &token) => {
                 res
             }
         };
@@ -441,24 +505,44 @@ impl PhoneBuddyEngine {
     async fn run_turn(
         &self,
         session_id: &str,
-        user_input: &str,
+        user: crate::conversation::UserItem,
         observer: &Arc<dyn AgentObserver>,
         token: &tokio_util::sync::CancellationToken,
     ) -> EngineResult<ChatOutcome> {
+        user.validate_shape()?;
+        if user.has_images() && !self.config.supports_image_input {
+            return Err(EngineError::VisionUnsupported);
+        }
+        if user.has_images() {
+            let root = self.config.resolved_attachment_root();
+            crate::llm::image::materialize_user_item(
+                &user,
+                &root,
+                &crate::llm::image::ImageBytesStore::default(),
+            )?;
+        }
+
+        let title_src = user.text_content();
+        let title = if title_src.trim().is_empty() {
+            "Image".to_string()
+        } else {
+            truncate_title(&title_src)
+        };
+
         // Load or create the session.
         let mut session = self
             .sessions
             .load(session_id)?
             .unwrap_or_else(|| StoredSession {
                 id: session_id.to_string(),
-                title: truncate_title(user_input),
+                title,
                 created_at: now_iso(),
                 updated_at: now_iso(),
                 format_version: 2,
                 items: Vec::new(),
             });
 
-        session.items.push(ConversationItem::user(user_input));
+        session.items.push(ConversationItem::User(user));
         session.updated_at = now_iso();
 
         let system_prompt = self.build_prompt();
@@ -487,7 +571,7 @@ impl PhoneBuddyEngine {
             self.maybe_compact(&mut session.items, &system_prompt);
 
             let items = with_system(&session.items, &system_prompt);
-            let request = self.conversation_request(self.config.model.clone(), items, true);
+            let request = self.conversation_request(self.config.model.clone(), items, true)?;
 
             let turn = tokio::select! {
                 _ = token.cancelled() => {

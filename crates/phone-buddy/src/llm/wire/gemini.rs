@@ -25,7 +25,7 @@ impl WireAdapter for GeminiAdapter {
         url
     }
 
-    fn build_payload(&self, req: &ConversationRequest) -> serde_json::Value {
+    fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value> {
         build_gemini_payload(req)
     }
 
@@ -34,7 +34,7 @@ impl WireAdapter for GeminiAdapter {
     }
 }
 
-pub fn build_gemini_payload(req: &ConversationRequest) -> serde_json::Value {
+pub fn build_gemini_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut contents: Vec<serde_json::Value> = Vec::new();
     let mut pending_model_parts: Vec<serde_json::Value> = Vec::new();
@@ -67,7 +67,7 @@ pub fn build_gemini_payload(req: &ConversationRequest) -> serde_json::Value {
                 flush_user(&mut pending_user_parts, &mut contents);
                 contents.push(serde_json::json!({
                     "role": "user",
-                    "parts": [{ "text": u.content }]
+                    "parts": super::gemini_user_parts(u, req)?
                 }));
             }
             ConversationItem::Reasoning(_) => {
@@ -167,7 +167,11 @@ pub fn build_gemini_payload(req: &ConversationRequest) -> serde_json::Value {
         }
     }
 
-    payload
+    if req.image_bytes.total_bytes() > crate::llm::image::GEMINI_INLINE_MAX_BYTES {
+        return Err(crate::error::EngineError::PayloadTooLarge);
+    }
+
+    Ok(payload)
 }
 
 pub fn parse_gemini_chunk(
@@ -342,6 +346,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         }
     }
 
@@ -365,7 +370,7 @@ mod tests {
                 origin: None,
             }),
         ]);
-        let payload = build_gemini_payload(&req);
+        let payload = build_gemini_payload(&req).unwrap();
         let parts = &payload["contents"][1]["parts"];
         assert_eq!(parts[0]["functionCall"]["args"]["url"], "https://ex");
         assert!(parts[0]["functionCall"]["args"].is_object());
@@ -375,7 +380,7 @@ mod tests {
         if let ConversationItem::Assistant(a) = &mut bad.items[1] {
             a.tool_calls[0].function.arguments = "not-json".into();
         }
-        let payload = build_gemini_payload(&bad);
+        let payload = build_gemini_payload(&bad).unwrap();
         let args = &payload["contents"][1]["parts"][0]["functionCall"]["args"];
         assert_eq!(args, &serde_json::json!({}));
     }
@@ -452,7 +457,7 @@ mod tests {
                 content: "file contents".into(),
             }),
         ]);
-        let payload = build_gemini_payload(&req);
+        let payload = build_gemini_payload(&req).unwrap();
         let last = payload["contents"].as_array().unwrap().last().unwrap();
         assert_eq!(last["role"], "user");
         assert_eq!(
@@ -472,7 +477,7 @@ mod tests {
             }),
             ConversationItem::assistant("done"),
         ]);
-        let payload = build_gemini_payload(&req);
+        let payload = build_gemini_payload(&req).unwrap();
         let model = &payload["contents"][1];
         assert_eq!(model["role"], "model");
         let text = model["parts"][0]["text"].as_str().unwrap();

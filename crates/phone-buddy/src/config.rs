@@ -132,6 +132,17 @@ pub struct EngineConfig {
     /// artifacts when failing over to another host.
     #[serde(default)]
     pub provider_group: Option<String>,
+    /// App-private directory that image attachments must live under.
+    /// Empty falls back to `<root_dir>/image_attachments`.
+    #[serde(default)]
+    pub attachment_root: Option<PathBuf>,
+    /// When false, a user turn with images fails with [`crate::error::EngineError::VisionUnsupported`].
+    #[serde(default = "default_supports_image_input")]
+    pub supports_image_input: bool,
+}
+
+fn default_supports_image_input() -> bool {
+    true
 }
 
 /// One backup LLM HTTP endpoint. Fields mirror the primary EngineConfig
@@ -231,6 +242,8 @@ impl Default for EngineConfig {
             failover_max_attempts: default_failover_max_attempts(),
             provider_cooldown_secs: default_provider_cooldown_secs(),
             provider_group: None,
+            attachment_root: None,
+            supports_image_input: true,
         }
     }
 }
@@ -373,6 +386,13 @@ impl EngineConfig {
         } else {
             self.root_dir.join(".phonebuddy").join("http_dumps")
         }
+    }
+
+    /// Directory image attachments must live under.
+    pub fn resolved_attachment_root(&self) -> PathBuf {
+        self.attachment_root
+            .clone()
+            .unwrap_or_else(|| self.root_dir.join("image_attachments"))
     }
 
     pub fn root_as_path(&self) -> &Path {

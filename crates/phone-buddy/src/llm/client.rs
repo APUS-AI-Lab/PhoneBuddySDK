@@ -991,6 +991,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: Vec::new(),
             previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
         }
     }
 
@@ -1143,7 +1144,7 @@ mod tests {
         assert!(group_change.reasoning_content.is_none());
         assert!(group_change.encrypted_reasoning.is_none());
         assert!(group_change.reasoning_items.is_empty());
-        assert_eq!(group_change.content.as_deref(), Some("hello"));
+        assert_eq!(group_change.content_text(), "hello");
 
         let model_change = msg.sanitized_for_provider(
             "grok_build/grok-3",
