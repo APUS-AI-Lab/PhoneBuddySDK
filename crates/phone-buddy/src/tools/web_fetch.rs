@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::error::{EngineError, EngineResult};
+use crate::error::EngineResult;
 use crate::tools::browser::{
     apply_browser_headers, decode_bytes_to_string, get_fallback_fingerprint,
     get_platform_fingerprint, BrowserFingerprint, MAX_WEB_BODY_LENGTH,
@@ -56,7 +56,8 @@ impl WebFetchTool {
 
     pub fn with_allow_local_and_webview(allow_local: bool, webview: Arc<WebViewHost>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -209,8 +210,15 @@ impl Tool for WebFetchTool {
                 let mut response = match req.send().await {
                     Ok(res) => res,
                     Err(err) => {
+                        let reason = if err.is_timeout() {
+                            "连接超时"
+                        } else if err.is_connect() {
+                            "连接失败 (无法连接到目标服务器)"
+                        } else {
+                            "网络请求失败"
+                        };
                         return Ok(ToolOutput::new(format!(
-                            "[WebFetch Error]: Failed to connect to URL '{url_str}': {err}"
+                            "[WebFetch Error]: 网页访问失败: {reason} ({err})"
                         )));
                     }
                 };
@@ -257,10 +265,14 @@ impl Tool for WebFetchTool {
                     )));
                 }
 
-                let raw_bytes = response.bytes().await.map_err(|e| EngineError::Tool {
-                    name: "web_fetch".into(),
-                    message: format!("Failed to read response body bytes: {e}"),
-                })?;
+                let raw_bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        return Ok(ToolOutput::new(format!(
+                            "[WebFetch Error]: 网页读取失败: error decoding response body ({err})"
+                        )));
+                    }
+                };
                 tracing::info!(
                     "[web_fetch] HTTP client response received: url='{url_str}', status={status}, body_bytes={}",
                     raw_bytes.len()
@@ -283,10 +295,7 @@ impl Tool for WebFetchTool {
             _ => html_to_markdown_htmd(&self.converter, &html_content),
         };
 
-        let formatted = format!(
-            "URL: {}\nMode: {}\nUser-Agent: {}\n\n{}",
-            url_str, mode, active_ua, result_text
-        );
+        let formatted = format!("URL: {}\n\n{}", url_str, result_text);
 
         let output = truncate_chars(&formatted, max_chars);
         Ok(ToolOutput::new(output))

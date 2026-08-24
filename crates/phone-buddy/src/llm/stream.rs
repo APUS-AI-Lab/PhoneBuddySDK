@@ -98,7 +98,13 @@ pub async fn collect_stream(
                         }
                     }
                     if let Some(args) = &f.arguments {
-                        append_tool_argument_fragment(&mut entry.2, args);
+                        if entry.3 == "server" || tc.kind.as_deref() == Some("server") {
+                            if !args.is_empty() {
+                                entry.2 = args.clone();
+                            }
+                        } else {
+                            append_tool_argument_fragment(&mut entry.2, args);
+                        }
                     }
                 }
                 if !entry.1.is_empty() {

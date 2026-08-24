@@ -869,7 +869,7 @@ fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<Ch
         // and must not be concatenated (that produced `{...}{...}`).
         // The function *name* lives on `output_item.added`;
         // `output_index` / `call_id` let collect_stream merge them.
-        let id = v.get("call_id").or_else(|| v.get("item_id")).and_then(|s| s.as_str()).map(|s| s.to_string());
+        let id = v.get("call_id").and_then(|s| s.as_str()).map(|s| s.to_string());
         let name = v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
         let args = v.get("delta").and_then(|s| s.as_str()).map(|s| s.to_string());
         delta.tool_calls.push(ToolCallDelta {
