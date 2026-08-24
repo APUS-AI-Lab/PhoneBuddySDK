@@ -11,10 +11,15 @@ use crate::llm::types::{
     ToolCallFunction,
 };
 
-/// Max processed image width accepted by the SDK.
-pub const MAX_IMAGE_WIDTH: u32 = 1024;
-/// Max processed image height accepted by the SDK.
-pub const MAX_IMAGE_HEIGHT: u32 = 768;
+/// Max processed image long edge accepted by the SDK (e.g. 1024x768 landscape or 768x1024 portrait).
+pub const MAX_IMAGE_LONG_EDGE: u32 = 1024;
+/// Max processed image short edge accepted by the SDK.
+pub const MAX_IMAGE_SHORT_EDGE: u32 = 768;
+
+/// Max processed image width accepted by the SDK (landscape baseline).
+pub const MAX_IMAGE_WIDTH: u32 = MAX_IMAGE_LONG_EDGE;
+/// Max processed image height accepted by the SDK (landscape baseline).
+pub const MAX_IMAGE_HEIGHT: u32 = MAX_IMAGE_SHORT_EDGE;
 /// Max image parts on a single user turn.
 pub const MAX_IMAGES_PER_TURN: usize = 5;
 
@@ -195,7 +200,9 @@ impl UserItem {
                         "invalid dimensions".into(),
                     ));
                 }
-                if *width > MAX_IMAGE_WIDTH || *height > MAX_IMAGE_HEIGHT {
+                let max_dim = (*width).max(*height);
+                let min_dim = (*width).min(*height);
+                if max_dim > MAX_IMAGE_LONG_EDGE || min_dim > MAX_IMAGE_SHORT_EDGE {
                     return Err(EngineError::AttachmentInvalid(
                         attachment_id.clone(),
                         format!("exceeds {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}"),
@@ -873,5 +880,90 @@ mod tests {
         let json = serde_json::to_string(&items).unwrap();
         let back: Vec<ConversationItem> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, items);
+    }
+
+    #[test]
+    fn image_dimension_validation_supports_orientation_adaptability() {
+        // Landscape (1024x768) -> Valid
+        let landscape_turn = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": [
+                {
+                    "type": "image",
+                    "attachment_id": "img_landscape",
+                    "local_path": "/tmp/landscape.jpg",
+                    "mime_type": "image/jpeg",
+                    "byte_size": 100,
+                    "width": 1024,
+                    "height": 768
+                },
+                {"type": "text", "text": "look at landscape"}
+            ]
+        });
+        assert!(parse_user_turn_v2(&landscape_turn.to_string()).is_ok());
+
+        // Portrait / Rotated 90 degrees (768x1024) -> Valid
+        let portrait_turn = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": [
+                {
+                    "type": "image",
+                    "attachment_id": "img_portrait",
+                    "local_path": "/tmp/portrait.jpg",
+                    "mime_type": "image/jpeg",
+                    "byte_size": 100,
+                    "width": 768,
+                    "height": 1024
+                },
+                {"type": "text", "text": "look at portrait"}
+            ]
+        });
+        assert!(parse_user_turn_v2(&portrait_turn.to_string()).is_ok());
+
+        // Exceeds long edge (1025x768 or 768x1025) -> Invalid
+        let exceeds_long = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": [
+                {
+                    "type": "image",
+                    "attachment_id": "img_toolong",
+                    "local_path": "/tmp/toolong.jpg",
+                    "mime_type": "image/jpeg",
+                    "byte_size": 100,
+                    "width": 768,
+                    "height": 1025
+                },
+                {"type": "text", "text": "too long"}
+            ]
+        });
+        assert!(matches!(
+            parse_user_turn_v2(&exceeds_long.to_string()),
+            Err(EngineError::AttachmentInvalid(_, msg)) if msg.contains("exceeds 1024x768")
+        ));
+
+        // Exceeds short edge (800x800) -> Invalid
+        let exceeds_short = serde_json::json!({
+            "schema_version": 1,
+            "type": "user_turn",
+            "parts": [
+                {
+                    "type": "image",
+                    "attachment_id": "img_toowide",
+                    "local_path": "/tmp/toowide.jpg",
+                    "mime_type": "image/jpeg",
+                    "byte_size": 100,
+                    "width": 800,
+                    "height": 800
+                },
+                {"type": "text", "text": "too wide"}
+            ]
+        });
+        assert!(matches!(
+            parse_user_turn_v2(&exceeds_short.to_string()),
+            Err(EngineError::AttachmentInvalid(_, msg)) if msg.contains("exceeds 1024x768")
+        ));
     }
 }

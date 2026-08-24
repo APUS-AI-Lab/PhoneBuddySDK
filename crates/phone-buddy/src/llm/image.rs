@@ -11,8 +11,8 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::conversation::{
-    ImageDetail, ImageMimeType, UserContentPart, UserItem, MAX_IMAGE_HEIGHT, MAX_IMAGE_WIDTH,
-    MAX_IMAGES_PER_TURN,
+    ImageDetail, ImageMimeType, UserContentPart, UserItem, MAX_IMAGE_HEIGHT, MAX_IMAGE_LONG_EDGE,
+    MAX_IMAGE_SHORT_EDGE, MAX_IMAGE_WIDTH, MAX_IMAGES_PER_TURN,
 };
 use crate::error::{EngineError, EngineResult};
 
@@ -272,7 +272,8 @@ pub fn materialize_user_item(
                 format!("dimension mismatch: declared {width}x{height}, file {w}x{h}"),
             ));
         }
-        if w > MAX_IMAGE_WIDTH || h > MAX_IMAGE_HEIGHT {
+        let (max_dim, min_dim) = (w.max(h), w.min(h));
+        if max_dim > MAX_IMAGE_LONG_EDGE || min_dim > MAX_IMAGE_SHORT_EDGE {
             return Err(EngineError::AttachmentInvalid(
                 attachment_id.clone(),
                 format!("exceeds {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}"),
@@ -611,5 +612,98 @@ mod tests {
             v["image_url"]["url"],
             "https://cdn.example.com/x.jpg?[REDACTED]"
         );
+    }
+
+    #[test]
+    fn materialize_supports_portrait_and_rejects_oversize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("atts");
+        std::fs::create_dir(&root).unwrap();
+
+        let make_png = |w: u32, h: u32| -> Vec<u8> {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.extend_from_slice(&13u32.to_be_bytes());
+            bytes.extend_from_slice(b"IHDR");
+            bytes.extend_from_slice(&w.to_be_bytes());
+            bytes.extend_from_slice(&h.to_be_bytes());
+            bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            bytes
+        };
+
+        // Landscape 1024x768 -> Accepted
+        let f_land = root.join("land.png");
+        let b_land = make_png(1024, 768);
+        std::fs::write(&f_land, &b_land).unwrap();
+        let item_land = UserItem {
+            parts: vec![UserContentPart::Image {
+                attachment_id: "img_land".into(),
+                local_path: f_land.to_string_lossy().into(),
+                mime_type: ImageMimeType::Png,
+                byte_size: b_land.len() as u64,
+                width: 1024,
+                height: 768,
+                detail: Some(ImageDetail::Auto),
+            }],
+        };
+        let store = ImageBytesStore::default();
+        assert!(materialize_user_item(&item_land, &root, &store).is_ok());
+
+        // Portrait 768x1024 -> Accepted
+        let f_port = root.join("port.png");
+        let b_port = make_png(768, 1024);
+        std::fs::write(&f_port, &b_port).unwrap();
+        let item_port = UserItem {
+            parts: vec![UserContentPart::Image {
+                attachment_id: "img_port".into(),
+                local_path: f_port.to_string_lossy().into(),
+                mime_type: ImageMimeType::Png,
+                byte_size: b_port.len() as u64,
+                width: 768,
+                height: 1024,
+                detail: Some(ImageDetail::Auto),
+            }],
+        };
+        assert!(materialize_user_item(&item_port, &root, &store).is_ok());
+
+        // Exceeds long edge 768x1025 -> Rejected
+        let f_toolong = root.join("toolong.png");
+        let b_toolong = make_png(768, 1025);
+        std::fs::write(&f_toolong, &b_toolong).unwrap();
+        let item_toolong = UserItem {
+            parts: vec![UserContentPart::Image {
+                attachment_id: "img_toolong".into(),
+                local_path: f_toolong.to_string_lossy().into(),
+                mime_type: ImageMimeType::Png,
+                byte_size: b_toolong.len() as u64,
+                width: 768,
+                height: 1025,
+                detail: Some(ImageDetail::Auto),
+            }],
+        };
+        assert!(matches!(
+            materialize_user_item(&item_toolong, &root, &store),
+            Err(EngineError::AttachmentInvalid(_, msg)) if msg.contains("exceeds 1024x768")
+        ));
+
+        // Exceeds short edge 800x800 -> Rejected
+        let f_toowide = root.join("toowide.png");
+        let b_toowide = make_png(800, 800);
+        std::fs::write(&f_toowide, &b_toowide).unwrap();
+        let item_toowide = UserItem {
+            parts: vec![UserContentPart::Image {
+                attachment_id: "img_toowide".into(),
+                local_path: f_toowide.to_string_lossy().into(),
+                mime_type: ImageMimeType::Png,
+                byte_size: b_toowide.len() as u64,
+                width: 800,
+                height: 800,
+                detail: Some(ImageDetail::Auto),
+            }],
+        };
+        assert!(matches!(
+            materialize_user_item(&item_toowide, &root, &store),
+            Err(EngineError::AttachmentInvalid(_, msg)) if msg.contains("exceeds 1024x768")
+        ));
     }
 }

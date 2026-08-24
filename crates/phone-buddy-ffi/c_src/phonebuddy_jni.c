@@ -188,7 +188,7 @@ jstring pb_jni_nativeChatV2(
 
     if (err_out != NULL) {
         jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
-        (*env)->ThrowNew(ex_cls, err_out);
+        (*env)->ThrowNew(env, ex_cls, err_out);
         pb_string_free(err_out);
         return NULL;
     }
