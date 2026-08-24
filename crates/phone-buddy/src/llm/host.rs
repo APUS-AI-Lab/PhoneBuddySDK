@@ -166,6 +166,7 @@ mod tests {
             max_tokens: Some(128),
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         }
     }
 

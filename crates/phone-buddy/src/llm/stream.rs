@@ -3,6 +3,7 @@
 //! finish reason).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 
@@ -11,6 +12,29 @@ use crate::events::{AgentEvent, AgentObserver};
 use crate::llm::types::{
     ChatCompletionChunk, CollectedTurn, ToolCall, ToolCallFunction, Usage,
 };
+
+/// Error from [`collect_stream`]. Idle timeout keeps the partial turn so
+/// the retry layer can prefix-continue; every other stream error is
+/// wrapped as [`CollectStreamError::Other`].
+#[derive(Debug)]
+pub enum CollectStreamError {
+    IdleTimeout {
+        partial: CollectedTurn,
+        timeout: Duration,
+    },
+    Other(EngineError),
+}
+
+impl From<CollectStreamError> for EngineError {
+    fn from(err: CollectStreamError) -> Self {
+        match err {
+            CollectStreamError::IdleTimeout { timeout, .. } => {
+                EngineError::StreamIdleTimeout(timeout)
+            }
+            CollectStreamError::Other(e) => e,
+        }
+    }
+}
 
 /// Consume a raw chunk stream, streaming deltas to `observer` and returning
 /// the fully assembled turn.
@@ -23,7 +47,7 @@ pub async fn collect_stream(
         Box<dyn futures_util::Stream<Item = Result<ChatCompletionChunk, EngineError>> + Send>,
     >,
     observer: &dyn AgentObserver,
-) -> EngineResult<CollectedTurn> {
+) -> Result<CollectedTurn, CollectStreamError> {
     let mut turn = CollectedTurn::default();
 
     // Tool-call accumulators keyed by positional index:
@@ -35,7 +59,22 @@ pub async fn collect_stream(
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(next) = stream.next().await {
-        let chunk = next?;
+        let chunk = match next {
+            Ok(c) => c,
+            Err(e) => {
+                finalize_turn(&mut turn, std::mem::take(&mut tool_call_acc));
+                return Err(match idle_timeout_of(&e) {
+                    Some(timeout) => CollectStreamError::IdleTimeout {
+                        partial: turn,
+                        timeout,
+                    },
+                    None => CollectStreamError::Other(e),
+                });
+            }
+        };
+        if chunk.id.starts_with("resp_") {
+            turn.response_id = Some(chunk.id.clone());
+        }
         if !chunk.model.is_empty() {
             turn.model = chunk.model.clone();
         }
@@ -129,6 +168,24 @@ pub async fn collect_stream(
         }
     }
 
+    finalize_turn(&mut turn, tool_call_acc);
+    Ok(turn)
+}
+
+fn idle_timeout_of(err: &EngineError) -> Option<Duration> {
+    match err {
+        EngineError::StreamIdleTimeout(d) => Some(*d),
+        EngineError::Stream(msg) if msg.contains("idle timeout") => {
+            Some(Duration::from_secs(120))
+        }
+        _ => None,
+    }
+}
+
+fn finalize_turn(
+    turn: &mut CollectedTurn,
+    tool_call_acc: BTreeMap<u32, (String, String, String, String)>,
+) {
     // Assemble tool calls in index order.
     for (id, name, arguments, kind) in tool_call_acc.into_values() {
         if name.is_empty() {
@@ -168,8 +225,6 @@ pub async fn collect_stream(
             turn.reasoning_items.push(item);
         }
     }
-
-    Ok(turn)
 }
 
 fn is_complete_json(s: &str) -> bool {
@@ -322,6 +377,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_keeps_partial_text_and_response_id() {
+        let stream = stream::iter(vec![
+            Ok(ChatCompletionChunk {
+                id: "resp_abc".into(),
+                object: "response.chunk".into(),
+                created: 0,
+                model: "m".into(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta {
+                        content: Some("hello ".into()),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            }),
+            Err(EngineError::StreamIdleTimeout(Duration::from_secs(120))),
+        ]);
+        let err = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap_err();
+        match err {
+            CollectStreamError::IdleTimeout { partial, timeout } => {
+                assert_eq!(partial.text, "hello ");
+                assert_eq!(partial.response_id.as_deref(), Some("resp_abc"));
+                assert_eq!(timeout, Duration::from_secs(120));
+            }
+            other => panic!("expected IdleTimeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_with_incomplete_tool_json_is_still_partial() {
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("c1"),
+                Some("web_search"),
+                Some("{\"query\":"),
+            ))),
+            Err(EngineError::StreamIdleTimeout(Duration::from_secs(30))),
+        ]);
+        let err = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap_err();
+        match err {
+            CollectStreamError::IdleTimeout { partial, .. } => {
+                assert_eq!(partial.tool_calls.len(), 1);
+                assert_eq!(partial.tool_calls[0].function.arguments, "{\"query\":");
+            }
+            other => panic!("expected IdleTimeout, got {other:?}"),
+        }
     }
 }
 

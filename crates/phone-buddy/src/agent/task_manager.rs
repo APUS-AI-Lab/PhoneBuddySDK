@@ -388,6 +388,7 @@ impl TaskManager {
                 max_tokens: Some(self.config.max_output_tokens),
                 search_parameters: None,
                 hosted_tools: hosted,
+                previous_response_id: None,
             };
 
             let observer = NullObserver;

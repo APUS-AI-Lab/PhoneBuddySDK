@@ -68,7 +68,9 @@ pub fn retry_class_for_error(err: &EngineError) -> RetryClass {
                 RetryClass::Fatal
             }
         }
-        EngineError::Stream(_) | EngineError::EmptyResponse => RetryClass::Retry,
+        EngineError::Stream(_)
+        | EngineError::StreamIdleTimeout(_)
+        | EngineError::EmptyResponse => RetryClass::Retry,
         _ => RetryClass::Fatal,
     }
 }
@@ -433,9 +435,7 @@ impl LlmTransport for HttpTransport {
                         break;
                     }
                     Err(_) => {
-                        yield Err(EngineError::Stream(format!(
-                            "idle timeout after {idle_timeout:?} with no SSE events"
-                        )));
+                        yield Err(EngineError::StreamIdleTimeout(idle_timeout));
                         return;
                     }
                 };
@@ -597,6 +597,11 @@ fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
         "input": input,
         "stream": true,
     });
+    if let Some(ref id) = req.previous_response_id {
+        if !id.is_empty() {
+            payload["previous_response_id"] = serde_json::Value::String(id.clone());
+        }
+    }
 
     patch_reasoning_text_types(&mut payload);
 
@@ -922,18 +927,30 @@ fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<Ch
         total_tokens: u.get("total_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
     });
 
+    let response_id = v
+        .pointer("/response/id")
+        .or_else(|| v.get("id"))
+        .and_then(|s| s.as_str())
+        .filter(|s| s.starts_with("resp_"))
+        .unwrap_or("");
+
     if delta.content.is_none()
         && delta.reasoning_content.is_none()
         && delta.reasoning_items.is_empty()
         && delta.encrypted_reasoning.is_none()
         && delta.tool_calls.is_empty()
         && usage.is_none()
+        && response_id.is_empty()
     {
         return Ok(None);
     }
 
     Ok(Some(ChatCompletionChunk {
-        id: v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        id: if !response_id.is_empty() {
+            response_id.to_string()
+        } else {
+            v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string()
+        },
         object: "response.chunk".to_string(),
         created: 0,
         model: v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string(),
@@ -1321,6 +1338,7 @@ mod tests {
             max_tokens: Some(1024),
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let payload = build_responses_payload(&req);
@@ -1330,6 +1348,38 @@ mod tests {
         assert_eq!(payload["input"][0]["content"], "Hello!");
         assert_eq!(payload["tools"][0]["name"], "test_tool");
         assert!(payload.get("search_parameters").is_none());
+        assert!(payload.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn responses_payload_includes_previous_response_id() {
+        let mut req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: Some("resp_abc".into()),
+        };
+        let payload = build_responses_payload(&req);
+        assert_eq!(payload["previous_response_id"], "resp_abc");
+        req.previous_response_id = Some(String::new());
+        let payload = build_responses_payload(&req);
+        assert!(payload.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn parse_responses_captures_resp_id_from_response_created() {
+        let raw = r#"{"type":"response.created","response":{"id":"resp_xyz","status":"in_progress"}}"#;
+        let chunk = parse_responses_chunk("response.created", raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.id, "resp_xyz");
+        assert!(chunk.choices[0].delta.content.is_none());
     }
 
     #[test]
@@ -1347,6 +1397,7 @@ mod tests {
                 ..Default::default()
             }),
             hosted_tools: vec![],
+            previous_response_id: None,
         };
         let payload = build_responses_payload(&req);
         assert!(payload.get("search_parameters").is_none());
@@ -1382,6 +1433,7 @@ mod tests {
             max_tokens: None,
             search_parameters: None,
             hosted_tools: vec![HostedTool::WebSearch],
+            previous_response_id: None,
         };
         let payload = build_responses_payload(&req);
         let tools = payload["tools"].as_array().unwrap();
@@ -1416,6 +1468,7 @@ mod tests {
             max_tokens: Some(2048),
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let payload = build_messages_payload(&req);
@@ -1471,6 +1524,7 @@ mod tests {
             max_tokens: Some(1024),
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let payload = build_responses_payload(&req);
@@ -1638,6 +1692,7 @@ mod tests {
             max_tokens: Some(1024),
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let mut extra = std::collections::HashMap::new();
@@ -1704,6 +1759,7 @@ mod tests {
             max_tokens: None,
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let res = transport.request_stream(&req).await;
@@ -1766,6 +1822,7 @@ mod tests {
             max_tokens: None,
             search_parameters: None,
             hosted_tools: vec![],
+            previous_response_id: None,
         };
 
         let res = transport.request_stream(&req).await;

@@ -1,5 +1,7 @@
 //! Engine errors.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -12,6 +14,9 @@ pub enum EngineError {
 
     #[error("LLM stream interrupted: {0}")]
     Stream(String),
+
+    #[error("LLM stream interrupted: idle timeout after {0:?} with no SSE events")]
+    StreamIdleTimeout(Duration),
 
     #[error("LLM returned an empty response (no text or tool calls)")]
     EmptyResponse,

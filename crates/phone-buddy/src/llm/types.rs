@@ -454,6 +454,11 @@ pub struct ChatCompletionRequest {
     /// Responses-only hosted tools. Never serialized on Chat Completions.
     #[serde(skip)]
     pub hosted_tools: Vec<HostedTool>,
+    /// Responses `previous_response_id`. Set on same-provider idle-timeout
+    /// continuation so encrypted reasoning (`rs_*`) can resume. Never sent
+    /// across hosts — the id is bound to the originating gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -557,6 +562,8 @@ pub struct CollectedTurn {
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
     pub model: String,
+    /// Responses `resp_*` id captured from `response.created` / chunk `id`.
+    pub response_id: Option<String>,
 }
 
 impl CollectedTurn {
