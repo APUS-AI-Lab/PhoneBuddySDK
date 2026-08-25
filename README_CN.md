@@ -292,7 +292,6 @@ let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
 | `api_key` | String | HTTP 模式必填 | `""` | 用户 API Key 或 Bearer 鉴权 Token |
 | `base_url` | String | HTTP 模式必填 | `https://api.x.ai/v1` | OpenAI / xAI / Anthropic 兼容的 Endpoint URL |
 | `model` | String | 是 | `grok-4.6` | 目标模型标识（如 `grok-4.6`, `claude-opus-5`, `gpt-4o`） |
-
 | `client_profile` | String | 否 | `default` | 1:1 客户端仿真预设：`grok_build`, `codex`, `claude_code`, `default`。详见 [docs/client_profiles.md](docs/client_profiles.md) |
 | `client_version` | String | 否 | `null` | 自定义 `User-Agent` 报告的客户端版本号 |
 | `client_session_id` | String | 否 | `null` | 自定义厂商会话 UUID（`x-claude-code-session-id`, `session-id`） |
