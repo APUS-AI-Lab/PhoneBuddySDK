@@ -296,7 +296,6 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `api_key` | String | Yes (in HTTP mode) | `""` | User API Key or Bearer Token |
 | `base_url` | String | Yes (in HTTP mode) | `https://api.x.ai/v1` | OpenAI / xAI / Anthropic compatible endpoint URL |
 | `model` | String | Yes | `grok-4.6` | Model identifier (e.g. `grok-4.6`, `claude-opus-5`, `gpt-4o`) |
-
 | `client_profile` | String | No | `default` | 1:1 client emulation preset: `grok_build`, `codex`, `claude_code`, `default`. See [docs/client_profiles.md](docs/client_profiles.md) |
 | `client_version` | String | No | `null` | Custom client version string to report in `User-Agent` |
 | `client_session_id` | String | No | `null` | Custom session UUID for vendor headers (`x-claude-code-session-id`, `session-id`) |
