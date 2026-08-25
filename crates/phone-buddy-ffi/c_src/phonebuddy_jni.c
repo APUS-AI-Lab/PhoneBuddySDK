@@ -155,6 +155,50 @@ jstring pb_jni_nativeChat(
     return res;
 }
 
+jstring pb_jni_nativeChatV2(
+    JNIEnv *env, jclass clazz, jlong engine_ptr, jstring session_id, jstring turn_json, jobject listener
+) {
+    (void)clazz;
+    if (engine_ptr == 0) return NULL;
+    const char *c_session = (*env)->GetStringUTFChars(env, session_id, NULL);
+    const char *c_turn = (*env)->GetStringUTFChars(env, turn_json, NULL);
+    char *err_out = NULL;
+
+    JniCallbackContext ctx;
+    ctx.env = env;
+    ctx.listener = listener;
+    if (listener != NULL) {
+        jclass l_cls = (*env)->GetObjectClass(env, listener);
+        ctx.on_event_mid = (*env)->GetMethodID(env, l_cls, "onEvent", "(Ljava/lang/String;)V");
+    } else {
+        ctx.on_event_mid = NULL;
+    }
+
+    char *result_json = pb_engine_chat_v2(
+        (PbEngine *)engine_ptr,
+        c_session,
+        c_turn,
+        listener ? c_event_callback : NULL,
+        listener ? &ctx : NULL,
+        &err_out
+    );
+
+    (*env)->ReleaseStringUTFChars(env, session_id, c_session);
+    (*env)->ReleaseStringUTFChars(env, turn_json, c_turn);
+
+    if (err_out != NULL) {
+        jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
+        (*env)->ThrowNew(env, ex_cls, err_out);
+        pb_string_free(err_out);
+        return NULL;
+    }
+
+    if (result_json == NULL) return NULL;
+    jstring res = (*env)->NewStringUTF(env, result_json);
+    pb_string_free(result_json);
+    return res;
+}
+
 jstring pb_jni_nativeGetSession(
     JNIEnv *env, jclass clazz, jlong engine_ptr, jstring session_id
 ) {

@@ -279,6 +279,9 @@ impl WebSearchTool {
                 ApiBackend::Messages => "https://api.anthropic.com/v1".to_string(),
                 ApiBackend::Responses => "https://api.openai.com/v1".to_string(),
                 ApiBackend::ChatCompletions => "https://api.openai.com/v1".to_string(),
+                ApiBackend::Gemini => {
+                    "https://generativelanguage.googleapis.com/v1beta".to_string()
+                }
             });
 
         let trimmed = base_url.trim_end_matches('/');
@@ -292,10 +295,11 @@ impl WebSearchTool {
             trimmed
         };
 
-        let endpoint = match backend {
+        let mut endpoint = match backend {
             ApiBackend::ChatCompletions => format!("{root}/chat/completions"),
             ApiBackend::Responses => format!("{root}/responses"),
             ApiBackend::Messages => format!("{root}/messages"),
+            ApiBackend::Gemini => format!("{root}/models/placeholder:generateContent"),
         };
 
         let mut model = self
@@ -317,6 +321,9 @@ impl WebSearchTool {
             && endpoint.contains("api.openai.com")
         {
             model = "gpt-4o-mini".to_string();
+        }
+        if matches!(backend, ApiBackend::Gemini) {
+            endpoint = format!("{root}/models/{model}:generateContent");
         }
 
         let mut prompt_text = format!(
@@ -496,6 +503,69 @@ impl WebSearchTool {
 
                 parse_responses_api_json(&json_val, query)
             }
+            ApiBackend::Gemini => {
+                let mut payload = serde_json::json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{ "text": prompt_text }]
+                    }]
+                });
+                if let Some(obj) = payload.as_object_mut() {
+                    for (k, v) in &self.config.extra_body {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+
+                let mut req = self
+                    .client
+                    .post(&endpoint)
+                    .timeout(std::time::Duration::from_secs(90))
+                    .header("x-goog-api-key", &api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&payload);
+
+                for (k, v) in &self.config.extra_headers {
+                    req = req.header(k, v);
+                }
+
+                let resp = req.send().await.map_err(|e| {
+                    if e.is_timeout() {
+                        format!("Gemini API request timed out waiting for LLM response ({endpoint}): {e}")
+                    } else {
+                        format!("Failed to connect to Gemini API ({endpoint}): {e}")
+                    }
+                })?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_body = resp.text().await.unwrap_or_default();
+                    return Err(format!("Gemini API returned HTTP {status}: {err_body}"));
+                }
+
+                let json_val: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse Gemini API response JSON: {e}"))?;
+
+                let text = json_val
+                    .pointer("/candidates/0/content/parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| json_val.to_string());
+                parse_chat_completions_api_json(
+                    &serde_json::json!({
+                        "choices": [{ "message": { "content": text } }]
+                    }),
+                    query,
+                )
+            }
         }
     }
 }
@@ -626,6 +696,7 @@ impl Tool for WebSearchTool {
             ApiBackend::Messages => "Messages API",
             ApiBackend::Responses => "Responses API",
             ApiBackend::ChatCompletions => "ChatCompletions API",
+            ApiBackend::Gemini => "Gemini API",
         };
         tracing::info!(
             "[web_search] Executing LLM search API fallback ({backend_name}) for query='{query}'"

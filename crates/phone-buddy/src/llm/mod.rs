@@ -4,6 +4,7 @@ pub mod client;
 pub mod doom_loop_collector;
 pub mod doom_loop_wire;
 pub mod dumper;
+pub mod image;
 pub mod failover;
 pub mod host;
 pub mod profiles;
@@ -11,6 +12,7 @@ pub mod retry;
 pub mod stream;
 pub mod transport;
 pub mod types;
+pub mod wire;
 
 pub use client::{LlmClient, LlmTransportObj};
 pub use dumper::{HttpDumpConfig, HttpDumpMode, HttpDumper};

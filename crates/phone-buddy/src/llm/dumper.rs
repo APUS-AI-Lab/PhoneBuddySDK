@@ -196,7 +196,16 @@ impl HttpDumper {
         let file_name = format!("dump_{}_{}_{}.json", ts_clean, status_str, safe_req_id);
         let target_path = self.resolved_dir.join(file_name);
 
-        let json_str = match serde_json::to_string_pretty(record) {
+        let mut record = record.clone();
+        crate::llm::image::redact_image_json(&mut record.request.body);
+        if let Some(err) = &mut record.error {
+            *err = crate::llm::image::redact_text(err);
+        }
+        if let Some(resp) = &mut record.response {
+            resp.body_text = crate::llm::image::redact_text(&resp.body_text);
+        }
+
+        let json_str = match serde_json::to_string_pretty(&record) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("failed to serialize HTTP dump record: {e}");

@@ -14,9 +14,10 @@ use futures_util::Stream;
 use crate::error::{EngineError, EngineResult};
 use crate::llm::retry::{classify_status, is_retry_vetoed_message, RetryClass};
 use crate::llm::types::{
-    ApiBackend, ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ChatCompletionRequest,
-    Role, ToolCallDelta, ToolCallFunctionDelta, Usage,
+    ApiBackend, ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ConversationRequest,
+    ToolCallDelta, ToolCallFunctionDelta, Usage,
 };
+use crate::llm::wire::adapter_for;
 
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, EngineError>> + Send>>;
@@ -27,7 +28,7 @@ pub type ChunkStream =
 /// [`EngineError::Llm`] with a `status=<code>` prefix so the retry layer can
 /// classify it (see [`status_from_error`]).
 pub trait LlmTransport: Send + Sync {
-    fn request_stream(&self, req: &ChatCompletionRequest)
+    fn request_stream(&self, req: &ConversationRequest)
         -> impl std::future::Future<Output = EngineResult<ChunkStream>> + Send;
 
     /// Transport name for diagnostics.
@@ -211,7 +212,12 @@ impl HttpTransport {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn endpoint(&self) -> String {
+        self.endpoint_for_model("")
+    }
+
+    fn endpoint_for_model(&self, model: &str) -> String {
         let trimmed = self.base_url.trim_end_matches('/');
         let root = if let Some(stripped) = trimmed.strip_suffix("/chat/completions") {
             stripped
@@ -222,11 +228,7 @@ impl HttpTransport {
         } else {
             trimmed
         };
-        match self.api_backend {
-            ApiBackend::ChatCompletions => format!("{root}/chat/completions"),
-            ApiBackend::Responses => format!("{root}/responses"),
-            ApiBackend::Messages => format!("{root}/messages"),
-        }
+        adapter_for(self.api_backend).endpoint(root, model, true)
     }
 }
 
@@ -245,9 +247,10 @@ pub fn merge_extra_body(
 impl LlmTransport for HttpTransport {
     async fn request_stream(
         &self,
-        req: &ChatCompletionRequest,
+        req: &ConversationRequest,
     ) -> EngineResult<ChunkStream> {
-        let endpoint = self.endpoint();
+        let adapter = adapter_for(self.api_backend);
+        let endpoint = self.endpoint_for_model(&req.model);
         let mut builder = self.client.post(&endpoint);
 
         let mut req_headers_map = std::collections::BTreeMap::new();
@@ -266,30 +269,22 @@ impl LlmTransport for HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
         }
 
+        // Gemini uses x-goog-api-key rather than Bearer.
+        if matches!(self.api_backend, ApiBackend::Gemini) && !self.api_key.is_empty() {
+            builder = builder.header("x-goog-api-key", &self.api_key);
+            req_headers_map.insert(
+                "x-goog-api-key".into(),
+                self.dumper.mask_header_value("x-goog-api-key", &self.api_key),
+            );
+        }
+
         // 2. Extra headers override anything from the profile
         for (k, v) in &self.extra_headers {
             builder = builder.header(k, v);
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
 
-        let mut body = match self.api_backend {
-            ApiBackend::ChatCompletions => {
-                let mut val = serde_json::to_value(req)?;
-                val["stream"] = serde_json::Value::Bool(true);
-                val["stream_options"] = serde_json::json!({ "include_usage": true });
-                // Internal origin tags must never leave the process.
-                if let Some(arr) = val.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                    for m in arr {
-                        if let Some(obj) = m.as_object_mut() {
-                            obj.remove("origin");
-                        }
-                    }
-                }
-                val
-            }
-            ApiBackend::Responses => build_responses_payload(req),
-            ApiBackend::Messages => build_messages_payload(req),
-        };
+        let mut body = adapter.build_payload(req)?;
 
 
         merge_extra_body(&mut body, &self.extra_body);
@@ -460,11 +455,7 @@ impl LlmTransport for HttpTransport {
                     }
                 }
 
-                let res = match backend {
-                    ApiBackend::ChatCompletions => crate::llm::stream::parse_chunk(&event.data),
-                    ApiBackend::Responses => parse_responses_chunk(&event.event, &event.data),
-                    ApiBackend::Messages => parse_messages_chunk(&event.event, &event.data),
-                };
+                let res = adapter_for(backend).parse_event(&event.event, &event.data);
                 match res {
                     Ok(Some(chunk)) => yield Ok(chunk),
                     Ok(None) => {}
@@ -484,636 +475,15 @@ impl LlmTransport for HttpTransport {
             ApiBackend::ChatCompletions => "http (chat/completions)",
             ApiBackend::Responses => "http (responses)",
             ApiBackend::Messages => "http (messages)",
+            ApiBackend::Gemini => "http (gemini)",
         }
     }
 }
 
 /// Inject the `type: "reasoning_text"` discriminator the API requires.
-/// Ported verbatim from grok-build `conversation/responses.rs::patch_reasoning_text_types`.
-pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
-    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    for item in input.iter_mut() {
-        if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
-            continue;
-        }
-        let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-        for c in content.iter_mut() {
-            if let Some(obj) = c.as_object_mut() {
-                obj.entry("type")
-                    .or_insert_with(|| serde_json::Value::String("reasoning_text".into()));
-            }
-        }
-    }
-}
 
-fn build_responses_payload(req: &ChatCompletionRequest) -> serde_json::Value {
-    let mut instructions = String::new();
-    let mut input = Vec::new();
-
-    for msg in &req.messages {
-        match msg.role {
-            Role::System => {
-                if let Some(ref content) = msg.content {
-                    if !instructions.is_empty() {
-                        instructions.push_str("\n\n");
-                    }
-                    instructions.push_str(content);
-                }
-            }
-            Role::User => {
-                if let Some(ref content) = msg.content {
-                    input.push(serde_json::json!({
-                        "role": "user",
-                        "content": content
-                    }));
-                }
-            }
-            Role::Assistant => {
-                // Sibling Reasoning items. Mirrors grok-build
-                // `conversation_item_to_input_items`: serialize the
-                // typed item, drop output-only `status`, keep `summary`
-                // even when empty. Do not invent summary from
-                // `reasoning_content` — grok-build fills that at collect
-                // time via `inject_streaming_reasoning_fallback`.
-                for r in &msg.reasoning_items {
-                    let mut r_val = serde_json::to_value(r).unwrap_or_default();
-                    if let Some(obj) = r_val.as_object_mut() {
-                        obj.remove("status");
-                    }
-                    let mut item_obj = serde_json::json!({
-                        "type": "reasoning",
-                        "summary": r_val
-                            .get("summary")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                    });
-                    if let Some(content) = r_val.get("content") {
-                        if !content.is_null() {
-                            item_obj["content"] = content.clone();
-                        }
-                    }
-                    if let Some(enc) = r_val.get("encrypted_content") {
-                        if !enc.is_null() {
-                            item_obj["encrypted_content"] = enc.clone();
-                        }
-                    }
-                    if let Some(id) = r_val.get("id").and_then(|s| s.as_str()) {
-                        if !id.is_empty() {
-                            item_obj["id"] = serde_json::Value::String(id.to_string());
-                        }
-                    }
-                    input.push(item_obj);
-                }
-
-                if let Some(ref content) = msg.content {
-                    if !content.is_empty() {
-                        input.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": content
-                        }));
-                    }
-                }
-                for tc in &msg.tool_calls {
-                    input.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": tc.id,
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }));
-                }
-            }
-            Role::Tool => {
-                if let Some(ref call_id) = msg.tool_call_id {
-                    input.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": msg.content.as_deref().unwrap_or("")
-                    }));
-                }
-            }
-        }
-    }
-
-    let mut payload = serde_json::json!({
-        "model": req.model,
-        "input": input,
-        "stream": true,
-        // grok-build `From<&ConversationRequest> for rs::CreateResponse`
-        // always requests a concise reasoning summary so the next turn
-        // can round-trip `summary: []` encrypted blobs *and* visible
-        // `summary_text` parts. Effort is optional there; we don't have
-        // a per-request effort field yet.
-        "reasoning": { "summary": "concise" },
-    });
-    if let Some(ref id) = req.previous_response_id {
-        if !id.is_empty() {
-            payload["previous_response_id"] = serde_json::Value::String(id.clone());
-        }
-    }
-
-    patch_reasoning_text_types(&mut payload);
-
-    if !instructions.is_empty() {
-        payload["instructions"] = serde_json::Value::String(instructions);
-    }
-    if let Some(temp) = req.temperature {
-        payload["temperature"] = serde_json::json!(temp);
-    }
-    if let Some(max_tokens) = req.max_tokens {
-        payload["max_output_tokens"] = serde_json::json!(max_tokens);
-    }
-    let mut tools_val: Vec<serde_json::Value> = req
-        .hosted_tools
-        .iter()
-        .map(|h| h.to_tool_entry())
-        .collect();
-    if let Some(ref tools) = req.tools {
-        for t in tools {
-            if req
-                .hosted_tools
-                .iter()
-                .any(|h| h.wire_name() == t.function.name)
-            {
-                continue;
-            }
-            tools_val.push(serde_json::json!({
-                "type": "function",
-                "name": t.function.name,
-                "description": t.function.description,
-                "parameters": t.function.parameters
-            }));
-        }
-    }
-    if !tools_val.is_empty() {
-        payload["tools"] = serde_json::Value::Array(tools_val);
-    }
-    // Grok Build never sends Chat Completions `search_parameters` on
-    // `/v1/responses`. Do not copy `req.search_parameters` here.
-
-    payload
-}
-
-fn build_messages_payload(req: &ChatCompletionRequest) -> serde_json::Value {
-    let mut system_text = String::new();
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-
-    for msg in &req.messages {
-        match msg.role {
-            Role::System => {
-                if let Some(ref content) = msg.content {
-                    if !system_text.is_empty() {
-                        system_text.push_str("\n\n");
-                    }
-                    system_text.push_str(content);
-                }
-            }
-            Role::User => {
-                if let Some(ref content) = msg.content {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content
-                    }));
-                }
-            }
-            Role::Assistant => {
-                let mut blocks = Vec::new();
-                if let Some(ref reasoning) = msg.reasoning_content {
-                    if !reasoning.is_empty() || msg.encrypted_reasoning.is_some() {
-                        blocks.push(serde_json::json!({
-                            "type": "thinking",
-                            "thinking": reasoning,
-                            "signature": msg.encrypted_reasoning.as_deref().unwrap_or("")
-                        }));
-                    }
-                }
-                if let Some(ref text) = msg.content {
-                    if !text.is_empty() {
-                        blocks.push(serde_json::json!({
-                            "type": "text",
-                            "text": text
-                        }));
-                    }
-                }
-                for tc in &msg.tool_calls {
-                    let input_val: serde_json::Value =
-                        serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                    blocks.push(serde_json::json!({
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "input": input_val
-                    }));
-                }
-                if !blocks.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": blocks
-                    }));
-                }
-            }
-            Role::Tool => {
-                let call_id = msg.tool_call_id.as_deref().unwrap_or("");
-                let content = msg.content.as_deref().unwrap_or("");
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": content
-                        }
-                    ]
-                }));
-            }
-        }
-    }
-
-    let mut payload = serde_json::json!({
-        "model": req.model,
-        "messages": messages,
-        "max_tokens": req.max_tokens.unwrap_or(8192),
-        "stream": true,
-    });
-
-    if !system_text.is_empty() {
-        payload["system"] = serde_json::Value::String(system_text);
-    }
-    if let Some(temp) = req.temperature {
-        payload["temperature"] = serde_json::json!(temp);
-    }
-    if let Some(ref tools) = req.tools {
-        let tools_val: Vec<_> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "name": t.function.name,
-                    "description": t.function.description,
-                    "input_schema": t.function.parameters
-                })
-            })
-            .collect();
-        payload["tools"] = serde_json::Value::Array(tools_val);
-    }
-
-    payload
-}
-
-fn output_index_of(v: &serde_json::Value) -> u32 {
-    v.get("output_index")
-        .or_else(|| v.get("index"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0) as u32
-}
-
-/// Map a Responses `output_item` that represents a tool (client function
-/// call or a server-side built-in such as `web_search_call`) into a
-/// `ToolCallDelta` so the rest of the engine can surface it to the UI.
-fn tool_delta_from_output_item(
-    item: &serde_json::Value,
-    fallback_index: u32,
-) -> Option<ToolCallDelta> {
-    let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
-    match item_type {
-        "function_call" => {
-            let id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let name = item
-                .get("name")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let args = item
-                .get("arguments")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            Some(ToolCallDelta {
-                index: fallback_index,
-                id,
-                kind: Some("function".to_string()),
-                function: Some(ToolCallFunctionDelta { name, arguments: args }),
-            })
-        }
-        "web_search_call" | "file_search_call" | "computer_call" | "mcp_call"
-        | "image_generation_call" | "code_interpreter_call" => {
-            let id = item
-                .get("id")
-                .or_else(|| item.get("call_id"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let name = match item_type {
-                "web_search_call" => "web_search",
-                "file_search_call" => "file_search",
-                "computer_call" => "computer",
-                "mcp_call" => item
-                    .get("name")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("mcp"),
-                "image_generation_call" => "image_generation",
-                "code_interpreter_call" => "code_interpreter",
-                other => other,
-            }
-            .to_string();
-            let args = item
-                .get("action")
-                .or_else(|| item.get("arguments"))
-                .map(|a| {
-                    if let Some(s) = a.as_str() {
-                        s.to_string()
-                    } else {
-                        a.to_string()
-                    }
-                });
-            Some(ToolCallDelta {
-                index: fallback_index,
-                id,
-                kind: Some("server".to_string()),
-                function: Some(ToolCallFunctionDelta {
-                    name: Some(name),
-                    arguments: args,
-                }),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn parse_responses_chunk(event_name: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
-    let raw = data.trim();
-    if raw.is_empty() || raw == "[DONE]" {
-        return Ok(None);
-    }
-
-    if let Ok(Some(chunk)) = crate::llm::stream::parse_chunk(raw) {
-        if !chunk.choices.is_empty() {
-            return Ok(Some(chunk));
-        }
-    }
-
-    let v: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(val) => val,
-        Err(_) => return Ok(None),
-    };
-
-    let mut delta = ChatChunkDelta::default();
-
-    let type_str = event_name.to_lowercase();
-    let json_type = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
-
-    if type_str.contains("reasoning_summary_text.delta") || json_type.contains("reasoning_summary_text.delta") {
-        if let Some(text) = v.get("delta").and_then(|s| s.as_str()) {
-            delta.reasoning_content = Some(text.to_string());
-        }
-    } else if type_str.contains("reasoning_text.delta") || json_type.contains("reasoning_text.delta") {
-        if let Some(text) = v.get("delta").and_then(|s| s.as_str()) {
-            delta.reasoning_content = Some(text.to_string());
-        }
-    } else if type_str.contains("output_text.delta") || json_type.contains("output_text.delta") || type_str.contains("text.delta") || json_type.contains("text.delta") {
-        if let Some(text) = v.get("delta").and_then(|s| s.as_str()) {
-            delta.content = Some(text.to_string());
-        }
-    } else if type_str.contains("function_call_arguments.delta")
-        || json_type.contains("function_call_arguments.delta")
-    {
-        // grok-build: only `ResponseFunctionCallArgumentsDelta` is
-        // appended. `.done` is a full-JSON snapshot of the same buffer
-        // and must not be concatenated (that produced `{...}{...}`).
-        // The function *name* lives on `output_item.added`;
-        // `output_index` / `call_id` let collect_stream merge them.
-        let id = v.get("call_id").and_then(|s| s.as_str()).map(|s| s.to_string());
-        let name = v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
-        let args = v.get("delta").and_then(|s| s.as_str()).map(|s| s.to_string());
-        delta.tool_calls.push(ToolCallDelta {
-            index: output_index_of(&v),
-            id,
-            kind: Some("function".to_string()),
-            function: Some(ToolCallFunctionDelta { name, arguments: args }),
-        });
-    } else if let Some(item) = v.get("item").or_else(|| v.get("reasoning")) {
-        let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
-        if item_type == "reasoning" {
-            // grok-build `stream/responses.rs`: `ResponseOutputItemAdded`
-            // only handles FunctionCall. Reasoning siblings are taken
-            // from OutputItemDone / ResponseCompleted.output — the added
-            // event is an empty stub (`summary: []`) that 422s if replayed.
-            let is_added = type_str.contains("output_item.added")
-                || json_type.contains("output_item.added");
-            if !is_added {
-                if let Ok(ri) =
-                    serde_json::from_value::<crate::llm::types::ReasoningItem>(item.clone())
-                {
-                    delta.encrypted_reasoning = ri.encrypted_content.clone();
-                    delta.reasoning_items.push(ri);
-                }
-            }
-        } else if let Some(mut tc) = tool_delta_from_output_item(item, output_index_of(&v)) {
-            // grok-build: `ResponseOutputItemAdded` is id+name only.
-            // FunctionCall arguments arrive via `.delta` fragments;
-            // `output_item.done` may carry a snapshot used only if the
-            // buffer is still empty.
-            // Hosted tools (`web_search_call`, …) are the same: added is
-            // not the payload. Grok often sends a placeholder
-            // `{"type":"search","query":"","sources":[]}` on added;
-            // query and sources arrive on OutputItemDone.
-            let is_added = type_str.contains("output_item.added")
-                || json_type.contains("output_item.added");
-            if is_added {
-                if let Some(f) = tc.function.as_mut() {
-                    f.arguments = None;
-                }
-            }
-            delta.tool_calls.push(tc);
-        }
-    } else if let Some(output) = v.get("output").or_else(|| v.get("response").and_then(|r| r.get("output"))).and_then(|o| o.as_array()) {
-        for item in output {
-            if item.get("type").and_then(|s| s.as_str()) == Some("reasoning") {
-                if let Ok(ri) = serde_json::from_value::<crate::llm::types::ReasoningItem>(item.clone()) {
-                    delta.encrypted_reasoning = ri.encrypted_content.clone();
-                    delta.reasoning_items.push(ri);
-                }
-            } else if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
-                delta.content = Some(text.to_string());
-            }
-        }
-    } else if let Some(d) = v.get("delta").and_then(|s| s.as_str()) {
-        delta.content = Some(d.to_string());
-    }
-
-    let usage = v.get("usage").map(|u| Usage {
-        prompt_tokens: u.get("input_tokens").or_else(|| u.get("prompt_tokens")).and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        completion_tokens: u.get("output_tokens").or_else(|| u.get("completion_tokens")).and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        total_tokens: u.get("total_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-    });
-
-    let response_id = v
-        .pointer("/response/id")
-        .or_else(|| v.get("id"))
-        .and_then(|s| s.as_str())
-        .filter(|s| s.starts_with("resp_"))
-        .unwrap_or("");
-
-    if delta.content.is_none()
-        && delta.reasoning_content.is_none()
-        && delta.reasoning_items.is_empty()
-        && delta.encrypted_reasoning.is_none()
-        && delta.tool_calls.is_empty()
-        && usage.is_none()
-        && response_id.is_empty()
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(ChatCompletionChunk {
-        id: if !response_id.is_empty() {
-            response_id.to_string()
-        } else {
-            v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string()
-        },
-        object: "response.chunk".to_string(),
-        created: 0,
-        model: v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-        choices: vec![ChatChunkChoice {
-            index: 0,
-            delta,
-            finish_reason: None,
-        }],
-        usage,
-    }))
-}
-
-fn parse_messages_chunk(event_name: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
-    let raw = data.trim();
-    if raw.is_empty() || raw == "[DONE]" {
-        return Ok(None);
-    }
-
-    let v: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(val) => val,
-        Err(_) => return Ok(None),
-    };
-
-    let event_type = if !event_name.is_empty() {
-        event_name
-    } else {
-        v.get("type").and_then(|s| s.as_str()).unwrap_or("")
-    };
-
-    let mut delta = ChatChunkDelta::default();
-    let mut usage = None;
-    let mut finish_reason = None;
-
-    match event_type {
-        "message_start" => {
-            if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
-                usage = Some(Usage {
-                    prompt_tokens: u.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-                    completion_tokens: u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-                    total_tokens: 0,
-                });
-            }
-        }
-        "content_block_start" => {
-            if let Some(block) = v.get("content_block") {
-                let btype = block.get("type").and_then(|s| s.as_str()).unwrap_or("");
-                let index = v.get("index").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
-                if btype == "tool_use" {
-                    let id = block.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
-                    let name = block.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
-                    delta.tool_calls.push(ToolCallDelta {
-                        index,
-                        id,
-                        kind: Some("function".to_string()),
-                        function: Some(ToolCallFunctionDelta {
-                            name,
-                            arguments: Some(String::new()),
-                        }),
-                    });
-                }
-            }
-        }
-        "content_block_delta" => {
-            let index = v.get("index").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
-            if let Some(d) = v.get("delta") {
-                let dtype = d.get("type").and_then(|s| s.as_str()).unwrap_or("");
-                match dtype {
-                    "text_delta" => {
-                        if let Some(text) = d.get("text").and_then(|s| s.as_str()) {
-                            delta.content = Some(text.to_string());
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(partial) = d.get("partial_json").and_then(|s| s.as_str()) {
-                            delta.tool_calls.push(ToolCallDelta {
-                                index,
-                                id: None,
-                                kind: None,
-                                function: Some(ToolCallFunctionDelta {
-                                    name: None,
-                                    arguments: Some(partial.to_string()),
-                                }),
-                            });
-                        }
-                    }
-                    "thinking_delta" => {
-                        if let Some(thinking) = d.get("thinking").and_then(|s| s.as_str()) {
-                            delta.reasoning_content = Some(thinking.to_string());
-                        }
-                    }
-                    "signature_delta" => {
-                        if let Some(sig) = d.get("signature").and_then(|s| s.as_str()) {
-                            delta.encrypted_reasoning = Some(sig.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "message_delta" => {
-            if let Some(u) = v.get("usage") {
-                usage = Some(Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-                    total_tokens: 0,
-                });
-            }
-            if let Some(d) = v.get("delta") {
-                if let Some(sr) = d.get("stop_reason").and_then(|s| s.as_str()) {
-                    finish_reason = Some(sr.to_string());
-                }
-            }
-        }
-        _ => {}
-    }
-
-    if delta.content.is_none()
-        && delta.reasoning_content.is_none()
-        && delta.encrypted_reasoning.is_none()
-        && delta.tool_calls.is_empty()
-        && usage.is_none()
-        && finish_reason.is_none()
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(ChatCompletionChunk {
-        id: v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-        object: "chat.completion.chunk".to_string(),
-        created: 0,
-        model: String::new(),
-        choices: vec![ChatChunkChoice {
-            index: 0,
-            delta,
-            finish_reason,
-        }],
-        usage,
-    }))
-}
+pub use crate::llm::wire::responses::{build_responses_payload, parse_responses_chunk, patch_reasoning_text_types};
+pub use crate::llm::wire::messages::{build_messages_payload, parse_messages_chunk};
 
 fn truncate_for_error(text: &str) -> String {
     let t = text.trim();
@@ -1197,7 +567,7 @@ impl MockTransport {
 impl LlmTransport for MockTransport {
     async fn request_stream(
         &self,
-        _req: &ChatCompletionRequest,
+        _req: &ConversationRequest,
     ) -> EngineResult<ChunkStream> {
         let turn = {
             let mut q = self.turns.lock().unwrap();
@@ -1249,6 +619,7 @@ impl LlmTransport for MockTransport {
                         name: Some(name.clone()),
                         arguments: Some(a.to_string()),
                     }),
+                    thought_signature: None,
                 });
                 yield Ok(make_chunk(&d));
                 // second chunk: rest of arguments
@@ -1261,6 +632,7 @@ impl LlmTransport for MockTransport {
                         name: None,
                         arguments: Some(b.to_string()),
                     }),
+                    thought_signature: None,
                 });
                 yield Ok(make_chunk(&d2));
             }
@@ -1323,8 +695,13 @@ fn split_half(s: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use crate::llm::types::{
-        ChatMessage, FunctionDefinitionWire, HostedTool, SearchParameters, ToolDefinitionWire,
+        ChatCompletionRequest, ChatMessage, ConversationRequest, FunctionDefinitionWire,
+        HostedTool, SearchParameters, ToolDefinitionWire,
     };
+
+    fn conv(req: ChatCompletionRequest) -> ConversationRequest {
+        ConversationRequest::from_chat(req)
+    }
 
     #[test]
     fn test_api_backend_endpoint_resolution() {
@@ -1338,6 +715,19 @@ mod tests {
 
         let t_msg = HttpTransport::new(base_url, "key", Duration::from_secs(10), ApiBackend::Messages, std::collections::HashMap::new()).unwrap();
         assert_eq!(t_msg.endpoint(), "https://api.x.ai/v1/messages");
+
+        let t_gem = HttpTransport::new(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "key",
+            Duration::from_secs(10),
+            ApiBackend::Gemini,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            t_gem.endpoint_for_model("gemini-2.5-flash"),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
     }
 
     #[test]
@@ -1365,7 +755,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert_eq!(payload["model"], "grok-3");
         assert_eq!(payload["instructions"], "You are helpful.");
         assert_eq!(payload["input"][0]["role"], "user");
@@ -1389,10 +779,10 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: Some("resp_abc".into()),
         };
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req.clone())).unwrap();
         assert_eq!(payload["previous_response_id"], "resp_abc");
         req.previous_response_id = Some(String::new());
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert!(payload.get("previous_response_id").is_none());
     }
 
@@ -1423,7 +813,7 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert!(payload.get("search_parameters").is_none());
         assert!(payload.get("tools").is_none());
     }
@@ -1459,7 +849,7 @@ mod tests {
             hosted_tools: vec![HostedTool::WebSearch],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let tools = payload["tools"].as_array().unwrap();
         assert_eq!(tools[0]["type"], "web_search");
         assert!(tools[0].get("name").is_none());
@@ -1474,6 +864,7 @@ mod tests {
         assert!(HostedTool::for_request(true, ApiBackend::Responses) == vec![HostedTool::WebSearch]);
         assert!(HostedTool::for_request(true, ApiBackend::ChatCompletions).is_empty());
         assert!(HostedTool::for_request(true, ApiBackend::Messages).is_empty());
+        assert!(HostedTool::for_request(true, ApiBackend::Gemini).is_empty());
         assert!(HostedTool::for_request(false, ApiBackend::Responses).is_empty());
     }
 
@@ -1495,7 +886,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_messages_payload(&req);
+        let payload = build_messages_payload(&conv(req)).unwrap();
         assert_eq!(payload["model"], "claude-3-5-sonnet");
         assert_eq!(payload["system"], "System prompt");
         assert_eq!(payload["messages"][0]["role"], "user");
@@ -1551,7 +942,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         // Item 0: user message
         assert_eq!(input[0]["role"], "user");
@@ -1581,7 +972,7 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: None,
         };
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         assert_eq!(payload["reasoning"]["summary"], "concise");
         assert!(payload["reasoning"].get("effort").is_none());
     }
@@ -1618,7 +1009,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["type"], "reasoning");
@@ -1666,7 +1057,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let payload = build_responses_payload(&req);
+        let payload = build_responses_payload(&conv(req)).unwrap();
         let input = payload["input"].as_array().unwrap();
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["summary"], serde_json::json!([]));
@@ -1890,7 +1281,7 @@ mod tests {
         extra.insert("user_tier".to_string(), serde_json::json!("premium"));
 
         // Test Responses API payload
-        let mut resp_payload = build_responses_payload(&req);
+        let mut resp_payload = build_responses_payload(&conv(req.clone())).unwrap();
         merge_extra_body(&mut resp_payload, &extra);
         assert_eq!(resp_payload["custom_app_id"], "org.example.app");
         assert_eq!(resp_payload["client_version"], "1.0.0");
@@ -1898,7 +1289,7 @@ mod tests {
         assert_eq!(resp_payload["model"], "claude-3-5-sonnet");
 
         // Test Messages API payload
-        let mut msg_payload = build_messages_payload(&req);
+        let mut msg_payload = build_messages_payload(&conv(req)).unwrap();
         merge_extra_body(&mut msg_payload, &extra);
         assert_eq!(msg_payload["custom_app_id"], "org.example.app");
         assert_eq!(msg_payload["client_version"], "1.0.0");
@@ -1951,7 +1342,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let res = transport.request_stream(&req).await;
+        let res = transport.request_stream(&conv(req)).await;
         assert!(res.is_err());
         let err = res.err().unwrap();
         let err_str = err.to_string();
@@ -2014,7 +1405,7 @@ mod tests {
             previous_response_id: None,
         };
 
-        let res = transport.request_stream(&req).await;
+        let res = transport.request_stream(&conv(req)).await;
         assert!(res.is_err());
 
         let entries: Vec<_> = std::fs::read_dir(&dump_dir)

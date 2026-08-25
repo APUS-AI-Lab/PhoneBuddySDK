@@ -94,7 +94,7 @@ pub struct EngineConfig {
     /// LLM transport mode. Default: HTTP.
     #[serde(default)]
     pub llm_mode: LlmMode,
-    /// API backend protocol (ChatCompletions, Responses, Messages). Default: ChatCompletions.
+    /// API backend protocol (ChatCompletions, Responses, Messages, Gemini). Default: ChatCompletions.
     #[serde(default)]
     pub api_backend: ApiBackend,
     /// Extra HTTP headers sent with every LLM request (e.g. X-App-Version, X-Client-Platform).
@@ -132,6 +132,17 @@ pub struct EngineConfig {
     /// artifacts when failing over to another host.
     #[serde(default)]
     pub provider_group: Option<String>,
+    /// App-private directory that image attachments must live under.
+    /// Empty falls back to `<root_dir>/image_attachments`.
+    #[serde(default)]
+    pub attachment_root: Option<PathBuf>,
+    /// When false, a user turn with images fails with [`crate::error::EngineError::VisionUnsupported`].
+    #[serde(default = "default_supports_image_input")]
+    pub supports_image_input: bool,
+}
+
+fn default_supports_image_input() -> bool {
+    true
 }
 
 /// One backup LLM HTTP endpoint. Fields mirror the primary EngineConfig
@@ -231,6 +242,8 @@ impl Default for EngineConfig {
             failover_max_attempts: default_failover_max_attempts(),
             provider_cooldown_secs: default_provider_cooldown_secs(),
             provider_group: None,
+            attachment_root: None,
+            supports_image_input: true,
         }
     }
 }
@@ -279,6 +292,15 @@ impl EngineConfig {
         EngineConfigBuilder::new()
             .client_profile(ClientProfile::Codex)
             .url("https://api.openai.com/v1")
+            .api_key(api_key)
+            .model(model)
+    }
+
+    /// Builder pre-configured for the Gemini generateContent protocol.
+    pub fn for_gemini(api_key: impl Into<String>, model: impl Into<String>) -> EngineConfigBuilder {
+        EngineConfigBuilder::new()
+            .url("https://generativelanguage.googleapis.com/v1beta")
+            .api_backend(ApiBackend::Gemini)
             .api_key(api_key)
             .model(model)
     }
@@ -364,6 +386,13 @@ impl EngineConfig {
         } else {
             self.root_dir.join(".phonebuddy").join("http_dumps")
         }
+    }
+
+    /// Directory image attachments must live under.
+    pub fn resolved_attachment_root(&self) -> PathBuf {
+        self.attachment_root
+            .clone()
+            .unwrap_or_else(|| self.root_dir.join("image_attachments"))
     }
 
     pub fn root_as_path(&self) -> &Path {
@@ -648,6 +677,16 @@ mod tests {
         assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
         assert_eq!(claude_cfg.api_backend, ApiBackend::Messages);
         assert_eq!(claude_cfg.client_session_id.as_deref(), Some("sess-custom-uuid"));
+
+        let gemini_cfg = EngineConfig::for_gemini("AIza-test", "gemini-2.5-flash")
+            .build()
+            .unwrap();
+        assert_eq!(gemini_cfg.api_backend, ApiBackend::Gemini);
+        assert_eq!(
+            gemini_cfg.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(gemini_cfg.model, "gemini-2.5-flash");
     }
 
     #[test]

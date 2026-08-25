@@ -59,6 +59,24 @@ pub enum EngineError {
 
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    #[error("invalid user turn: {0}")]
+    InvalidUserTurn(String),
+
+    #[error("attachment '{0}' is missing or evicted")]
+    AttachmentMissing(String),
+
+    #[error("attachment '{0}' is invalid: {1}")]
+    AttachmentInvalid(String, String),
+
+    #[error("too many images: {0} (max 5)")]
+    TooManyImages(usize),
+
+    #[error("current model does not support image input")]
+    VisionUnsupported,
+
+    #[error("inline request payload too large")]
+    PayloadTooLarge,
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

@@ -33,6 +33,11 @@
   // 3. "messages":
   //    - Anthropic Claude Messages API `/v1/messages` protocol.
   //    - Used for Anthropic Claude (e.g. Claude 3.5 Sonnet) or Claude-compatible proxies.
+  //
+  // 4. "gemini":
+  //    - Google Gemini `generateContent` / `streamGenerateContent?alt=sse`.
+  //    - Base URL example: "https://generativelanguage.googleapis.com/v1beta"
+  //    - Auth: API key is sent as the `x-goog-api-key` header.
   "api_backend": "responses",
 
   // Maximum tool loop turns per user message (default: 24)

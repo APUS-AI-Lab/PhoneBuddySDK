@@ -49,10 +49,11 @@ pub async fn collect_stream(
     let mut turn = CollectedTurn::default();
 
     // Tool-call accumulators keyed by positional index:
-    // (id, name, arguments_buffer, kind). Mirrors grok's `tool_call_acc`.
+    // (id, name, arguments_buffer, kind, thought_signature).
     // `id_to_idx` merges Responses events that share `call_id` but
     // disagree on `output_index` (arguments.delta often omits it).
-    let mut tool_call_acc: BTreeMap<u32, (String, String, String, String)> = BTreeMap::new();
+    let mut tool_call_acc: BTreeMap<u32, (String, String, String, String, Option<String>)> =
+        BTreeMap::new();
     let mut id_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -103,6 +104,9 @@ pub async fn collect_stream(
             if let Some(enc) = &delta.encrypted_reasoning {
                 turn.encrypted_reasoning = Some(enc.clone());
             }
+            if delta.final_output.is_some() {
+                turn.final_output = delta.final_output.clone();
+            }
             if !delta.reasoning_items.is_empty() {
                 turn.reasoning_items = crate::llm::types::merge_reasoning_items(
                     &turn.reasoning_items,
@@ -129,6 +133,11 @@ pub async fn collect_stream(
                 if let Some(kind) = &tc.kind {
                     if !kind.is_empty() {
                         entry.3 = kind.clone();
+                    }
+                }
+                if let Some(sig) = &tc.thought_signature {
+                    if !sig.is_empty() {
+                        entry.4 = Some(sig.clone());
                     }
                 }
                 if let Some(f) = &tc.function {
@@ -187,16 +196,16 @@ fn idle_timeout_of(err: &EngineError) -> Option<Duration> {
 
 fn finalize_turn(
     turn: &mut CollectedTurn,
-    tool_call_acc: BTreeMap<u32, (String, String, String, String)>,
+    tool_call_acc: BTreeMap<u32, (String, String, String, String, Option<String>)>,
 ) {
-    // Assemble tool calls in index order.
-    for (id, name, arguments, kind) in tool_call_acc.into_values() {
+    // Assemble streamed tool calls in index order.
+    let mut streamed_calls = Vec::new();
+    for (id, name, arguments, kind, thought_signature) in tool_call_acc.into_values() {
         if name.is_empty() {
             continue;
         }
-        turn.tool_calls.push(ToolCall {
+        streamed_calls.push(ToolCall {
             id: if id.is_empty() {
-                // Some providers omit the id; synthesize a stable one.
                 format!("call_{}", uuid::Uuid::new_v4().simple())
             } else {
                 id
@@ -214,26 +223,169 @@ fn finalize_turn(
                     arguments
                 },
             },
+            thought_signature,
         });
     }
 
-    // grok-build: after flattening `response.output`, splice streamed
-    // reasoning text into empty-summary items. Encrypted-only items
-    // already arrived via OutputItemDone; only synthesize one if the
-    // stream never produced a typed item.
-    crate::llm::types::inject_streaming_reasoning_fallback(
-        &mut turn.reasoning_items,
-        &turn.reasoning,
-    );
-    if turn.reasoning_items.is_empty() {
-        if let Some(item) = crate::llm::types::build_synthetic_reasoning(
-            String::new(),
-            None,
-            turn.encrypted_reasoning.as_deref(),
-        ) {
-            turn.reasoning_items.push(item);
+    if let Some(output) = turn.final_output.take() {
+        turn.items = items_from_canonical_output(&output, &streamed_calls);
+    } else {
+        turn.tool_calls = streamed_calls.clone();
+        crate::llm::types::inject_streaming_reasoning_fallback(
+            &mut turn.reasoning_items,
+            &turn.reasoning,
+        );
+        if turn.reasoning_items.is_empty() {
+            if let Some(item) = crate::llm::types::build_synthetic_reasoning(
+                String::new(),
+                None,
+                turn.encrypted_reasoning.as_deref(),
+            ) {
+                turn.reasoning_items.push(item);
+            }
+        }
+        turn.items = synthesize_items_from_accumulated(turn, streamed_calls);
+    }
+
+    // Apply streamed reasoning text to empty-summary items (canonical and
+    // fallback). Encrypted-only tco_* blobs keep summary: [].
+    let mut reasoning_view = turn.reasoning_from_items();
+    crate::llm::types::inject_streaming_reasoning_fallback(&mut reasoning_view, &turn.reasoning);
+    let mut ri = 0;
+    for item in &mut turn.items {
+        if let crate::conversation::ConversationItem::Reasoning(r) = item {
+            if ri < reasoning_view.len() {
+                *r = reasoning_view[ri].clone();
+                ri += 1;
+            }
         }
     }
+    while ri < reasoning_view.len() {
+        turn.items
+            .insert(0, crate::conversation::ConversationItem::Reasoning(reasoning_view[ri].clone()));
+        ri += 1;
+    }
+
+    turn.sync_derived_views();
+}
+
+fn items_from_canonical_output(
+    output: &[crate::llm::types::OutputItemWire],
+    streamed_calls: &[ToolCall],
+) -> Vec<crate::conversation::ConversationItem> {
+    use crate::conversation::{AssistantItem, BackendToolCallItem, ConversationItem};
+    use crate::llm::types::OutputItemWire;
+
+    let mut items = Vec::new();
+    let mut text = String::new();
+    let mut client_calls = Vec::new();
+
+    for item in output {
+        match item {
+            OutputItemWire::Message { text: t, .. } => {
+                if !text.is_empty() && !t.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
+            }
+            OutputItemWire::Reasoning(r) => {
+                items.push(ConversationItem::Reasoning(r.clone()));
+            }
+            OutputItemWire::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let args = if arguments.trim().is_empty() {
+                    streamed_calls
+                        .iter()
+                        .find(|c| c.id == *call_id)
+                        .map(|c| c.function.arguments.clone())
+                        .filter(|a| !a.trim().is_empty())
+                        .unwrap_or_else(|| "{}".into())
+                } else {
+                    arguments.clone()
+                };
+                let thought_signature = streamed_calls
+                    .iter()
+                    .find(|c| c.id == *call_id)
+                    .and_then(|c| c.thought_signature.clone());
+                client_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    kind: "function".into(),
+                    function: ToolCallFunction {
+                        name: name.clone(),
+                        arguments: args,
+                    },
+                    thought_signature,
+                });
+            }
+            OutputItemWire::Backend {
+                item_type,
+                id,
+                payload,
+            } => {
+                items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                    item_type: item_type.clone(),
+                    id: id.clone(),
+                    payload: payload.clone(),
+                }));
+            }
+        }
+    }
+
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: text,
+        tool_calls: client_calls,
+        reasoning_content: None,
+        encrypted_reasoning: None,
+        origin: None,
+    }));
+    items
+}
+
+fn synthesize_items_from_accumulated(
+    turn: &CollectedTurn,
+    streamed_calls: Vec<ToolCall>,
+) -> Vec<crate::conversation::ConversationItem> {
+    use crate::conversation::{AssistantItem, BackendToolCallItem, ConversationItem};
+
+    let mut items = Vec::new();
+    for r in &turn.reasoning_items {
+        items.push(ConversationItem::Reasoning(r.clone()));
+    }
+
+    let mut client_calls = Vec::new();
+    for tc in streamed_calls {
+        if tc.kind == "server" {
+            let item_type = crate::conversation::server_tool_item_type(&tc.function.name);
+            let payload = crate::conversation::reconstruct_backend_payload(
+                &item_type,
+                &tc.id,
+                &tc.function.arguments,
+            );
+            items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                item_type,
+                id: tc.id,
+                payload,
+            }));
+        } else {
+            client_calls.push(tc);
+        }
+    }
+
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: turn.text.clone(),
+        tool_calls: client_calls,
+        reasoning_content: if turn.reasoning.is_empty() {
+            None
+        } else {
+            Some(turn.reasoning.clone())
+        },
+        encrypted_reasoning: turn.encrypted_reasoning.clone(),
+        origin: None,
+    }));
+    items
 }
 
 fn is_complete_json(s: &str) -> bool {
@@ -332,6 +484,7 @@ mod tests {
                 name: name.map(str::to_string),
                 arguments: arguments.map(str::to_string),
             }),
+            thought_signature: None,
         }
     }
 
@@ -599,6 +752,136 @@ mod tests {
             crate::llm::types::reasoning_item_text(&turn.reasoning_items[0]),
             "thinking about APUS"
         );
+    }
+
+    fn chunk_final_output(output: Vec<crate::llm::types::OutputItemWire>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "resp_1".into(),
+            object: "response.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatChunkDelta {
+                    final_output: Some(output),
+                    ..Default::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_completed_is_canonical() {
+        use crate::conversation::ConversationItem;
+        use crate::llm::types::OutputItemWire;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("c1"),
+                Some("read_file"),
+                Some("{\"path\":"),
+            ))),
+            Ok(chunk_with_tool(tc(0, None, None, Some("\"a\"}")))),
+            Ok(chunk_final_output(vec![
+                OutputItemWire::Backend {
+                    item_type: "web_search_call".into(),
+                    id: "ws_1".into(),
+                    payload: serde_json::json!({"type":"web_search_call","id":"ws_1"}),
+                },
+                OutputItemWire::FunctionCall {
+                    call_id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"canonical"}"#.into(),
+                },
+                OutputItemWire::Message {
+                    id: "msg_1".into(),
+                    text: "hello".into(),
+                },
+            ])),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert!(matches!(
+            turn.items[0],
+            ConversationItem::BackendToolCall(_)
+        ));
+        match &turn.items[1] {
+            ConversationItem::Assistant(a) => {
+                assert_eq!(a.content, "hello");
+                assert_eq!(a.tool_calls.len(), 1);
+                assert_eq!(a.tool_calls[0].function.arguments, r#"{"path":"canonical"}"#);
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_output_replaces_merge_heuristics() {
+        use crate::conversation::ConversationItem;
+        use crate::llm::types::OutputItemWire;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_reasoning(
+                Some(reasoning_item("rs_1", Vec::new(), Some("enc-delta"))),
+                None,
+            )),
+            Ok(chunk_final_output(vec![
+                OutputItemWire::Reasoning(reasoning_item("rs_1", Vec::new(), Some("enc-final"))),
+                OutputItemWire::Message {
+                    id: "m".into(),
+                    text: "ok".into(),
+                },
+            ])),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        let reasoning: Vec<_> = turn
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::Reasoning(_)))
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        match &turn.items[0] {
+            ConversationItem::Reasoning(r) => {
+                assert_eq!(r.encrypted_content.as_deref(), Some("enc-final"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_views_match_items() {
+        use crate::conversation::ConversationItem;
+        use crate::llm::types::OutputItemWire;
+        let stream = stream::iter(vec![Ok(chunk_final_output(vec![
+            OutputItemWire::Reasoning(reasoning_item("rs_1", Vec::new(), None)),
+            OutputItemWire::FunctionCall {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            OutputItemWire::Message {
+                id: "m".into(),
+                text: "hi".into(),
+            },
+        ]))]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.text, turn.text_from_items());
+        assert_eq!(turn.client_tool_calls().len(), 1);
+        assert_eq!(
+            turn.reasoning_items.len(),
+            turn.items
+                .iter()
+                .filter(|i| matches!(i, ConversationItem::Reasoning(_)))
+                .count()
+        );
+        assert_eq!(turn.text, "hi");
+        assert_eq!(turn.tool_calls[0].id, "c1");
     }
 }
 

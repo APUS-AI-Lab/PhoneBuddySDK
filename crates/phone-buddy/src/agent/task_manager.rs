@@ -19,9 +19,8 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
-use crate::llm::types::{
-    drop_colliding_function_tools, ChatCompletionRequest, ChatMessage, HostedTool,
-};
+use crate::conversation::ConversationItem;
+use crate::llm::types::{drop_colliding_function_tools, ConversationRequest, HostedTool};
 use crate::prompt::{build_subagent_prompt, PromptRuntime};
 use crate::tools::fs::Sandbox;
 use crate::tools::{ToolCtx, ToolRegistry};
@@ -49,7 +48,7 @@ pub struct TaskRecord {
     pub output: String,
     pub tool_calls: u32,
     pub turns: u32,
-    pub messages: Vec<ChatMessage>,
+    pub items: Vec<ConversationItem>,
     pub logs: Vec<String>,
     pub cancel_token: CancellationToken,
 }
@@ -248,7 +247,7 @@ impl TaskManager {
             output: String::new(),
             tool_calls: 0,
             turns: 0,
-            messages: Vec::new(),
+            items: Vec::new(),
             logs: vec![format!(
                 "[{}] Subagent task '{}' spawned (type: {})",
                 Utc::now().to_rfc3339(),
@@ -315,16 +314,16 @@ impl TaskManager {
         model_override: Option<&str>,
     ) {
         let start_time = Instant::now();
-        let mut messages = Vec::new();
+        let mut items = Vec::new();
 
         if let Some(rf) = resume_from {
             let guard = self.tasks.lock().unwrap();
             if let Some(prev) = guard.get(rf) {
-                messages = prev.messages.clone();
+                items = prev.items.clone();
             }
         }
 
-        messages.push(ChatMessage::user(prompt));
+        items.push(ConversationItem::user(prompt));
 
         let cancel_token = {
             let guard = self.tasks.lock().unwrap();
@@ -369,15 +368,15 @@ impl TaskManager {
                 }
             }
 
-            let mut req_messages = vec![ChatMessage::system(&system_prompt)];
-            req_messages.extend(messages.clone());
+            let mut req_items = vec![ConversationItem::system(&system_prompt)];
+            req_items.extend(items.clone());
 
             let model = model_override.unwrap_or(&self.config.model).to_string();
             let hosted =
                 HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
-            let request = ChatCompletionRequest {
+            let request = ConversationRequest {
                 model,
-                messages: req_messages,
+                items: req_items,
                 stream: Some(false),
                 tools: drop_colliding_function_tools(
                     self.subagent_tools.wire_definitions(),
@@ -389,31 +388,29 @@ impl TaskManager {
                 search_parameters: None,
                 hosted_tools: hosted,
                 previous_response_id: None,
+                image_bytes: crate::llm::image::ImageBytesStore::default(),
             };
 
             let observer = NullObserver;
             match self.client.complete(&request, &observer).await {
                 Ok(turn) => {
-                    let reasoning_opt = if turn.reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(turn.reasoning.clone())
-                    };
-                    let reasoning_items = turn.reasoning_items.clone();
-                    let encrypted_reasoning = turn.encrypted_reasoning.clone();
-
                     let origin = self.client.origin_fingerprint();
-                    if turn.tool_calls.is_empty() {
+                    let mut turn_items = turn.items.clone();
+                    if turn_items.is_empty() {
+                        turn_items.push(ConversationItem::assistant(&turn.text));
+                    }
+                    if let Some(a) = turn_items.iter_mut().rev().find_map(|i| i.as_assistant_mut()) {
+                        a.origin = Some(origin);
+                    }
+                    let client_calls: Vec<_> = turn_items
+                        .iter()
+                        .rev()
+                        .find_map(|i| i.as_assistant().map(|a| a.tool_calls.clone()))
+                        .unwrap_or_default();
+
+                    if client_calls.is_empty() {
                         final_text = turn.text.clone();
-                        messages.push(
-                            ChatMessage::assistant_with_reasoning(
-                                turn.text,
-                                reasoning_opt,
-                                reasoning_items,
-                                encrypted_reasoning,
-                            )
-                            .with_origin(origin.clone()),
-                        );
+                        items.extend(turn_items);
                         {
                             let mut guard = self.tasks.lock().unwrap();
                             if let Some(record) = guard.get_mut(task_id) {
@@ -426,18 +423,9 @@ impl TaskManager {
                         break;
                     }
 
-                    messages.push(
-                        ChatMessage::assistant_tool_calls_with_reasoning(
-                            turn.tool_calls.clone(),
-                            if turn.text.is_empty() { None } else { Some(turn.text.clone()) },
-                            reasoning_opt,
-                            reasoning_items,
-                            encrypted_reasoning,
-                        )
-                        .with_origin(origin),
-                    );
+                    items.extend(turn_items);
 
-                    for call in &turn.tool_calls {
+                    for call in &client_calls {
                         total_tool_calls += 1;
                         let name = call.function.name.clone();
                         let args: Value = serde_json::from_str(&call.function.arguments)
@@ -478,7 +466,7 @@ impl TaskManager {
                             }
                         }
 
-                        messages.push(ChatMessage::tool_result(call.id.clone(), output_text));
+                        items.push(ConversationItem::tool_result(call.id.clone(), output_text));
                     }
                 }
                 Err(e) => {
@@ -508,7 +496,7 @@ impl TaskManager {
                 record.output = final_text;
                 record.tool_calls = total_tool_calls;
                 record.turns = turns_used;
-                record.messages = messages;
+                record.items = items;
                 record.logs.push(format!(
                     "[{}] Subagent task finished with status '{:?}' in {:.2}s.",
                     Utc::now().to_rfc3339(),

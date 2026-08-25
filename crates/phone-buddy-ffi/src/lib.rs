@@ -322,17 +322,71 @@ pub unsafe extern "C" fn pb_engine_chat(
     };
 
     match engine.inner.chat(&session_id, &user_input, observer) {
-        Ok(outcome) => {
-            let plan: serde_json::Value =
-                serde_json::from_str(&outcome.plan_items_json).unwrap_or(serde_json::json!([]));
-            let result = serde_json::json!({
-                "final_text": outcome.final_text,
-                "turns_used": outcome.turns_used,
-                "usage": outcome.usage,
-                "plan": plan,
-            });
-            to_cstring(result.to_string())
+        Ok(outcome) => outcome_json(&outcome),
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            std::ptr::null_mut()
         }
+    }
+}
+
+fn outcome_json(outcome: &phone_buddy::engine::ChatOutcome) -> *mut c_char {
+    let plan: serde_json::Value =
+        serde_json::from_str(&outcome.plan_items_json).unwrap_or(serde_json::json!([]));
+    let result = serde_json::json!({
+        "final_text": outcome.final_text,
+        "turns_used": outcome.turns_used,
+        "usage": outcome.usage,
+        "plan": plan,
+    });
+    to_cstring(result.to_string())
+}
+
+/// Run one versioned structured user turn (`schema_version: 1`).
+/// Invalid JSON, unsupported schema versions, missing attachments, or invalid
+/// content parts are returned through `err_out`. There is no text fallback.
+///
+/// # Safety
+/// All pointers must be valid. `callback` may be null (events discarded).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_chat_v2(
+    engine: *mut PbEngine,
+    session_id: *const c_char,
+    turn_json: *const c_char,
+    callback: PbEventCallback,
+    user_data: *mut c_void,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let engine = match engine.as_ref() {
+        Some(e) => e,
+        None => {
+            set_err(err_out, "engine is null".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let session_id = match str_from(session_id) {
+        Some(s) => s.to_string(),
+        None => {
+            set_err(err_out, "session_id is null or invalid".into());
+            return std::ptr::null_mut();
+        }
+    };
+    let turn_json = match str_from(turn_json) {
+        Some(s) => s.to_string(),
+        None => {
+            set_err(err_out, "turn_json is null or invalid".into());
+            return std::ptr::null_mut();
+        }
+    };
+
+    let observer: Option<Arc<dyn AgentObserver>> = if callback.is_some() {
+        Some(Arc::new(FfiObserver { callback, user_data }))
+    } else {
+        None
+    };
+
+    match engine.inner.chat_v2(&session_id, &turn_json, observer) {
+        Ok(outcome) => outcome_json(&outcome),
         Err(e) => {
             set_err(err_out, e.to_string());
             std::ptr::null_mut()
@@ -848,6 +902,14 @@ pub mod android_jni {
             user_input: *mut c_void,
             listener: *mut c_void,
         ) -> *mut c_void;
+        fn pb_jni_nativeChatV2(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            session_id: *mut c_void,
+            turn_json: *mut c_void,
+            listener: *mut c_void,
+        ) -> *mut c_void;
         fn pb_jni_nativeGetSession(
             env: *mut c_void,
             clazz: *mut c_void,
@@ -928,6 +990,18 @@ pub mod android_jni {
         listener: *mut c_void,
     ) -> *mut c_void {
         pb_jni_nativeChat(env, clazz, engine_ptr, session_id, user_input, listener)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeAgent_nativeChatV2(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        engine_ptr: i64,
+        session_id: *mut c_void,
+        turn_json: *mut c_void,
+        listener: *mut c_void,
+    ) -> *mut c_void {
+        pb_jni_nativeChatV2(env, clazz, engine_ptr, session_id, turn_json, listener)
     }
 
     #[no_mangle]
