@@ -202,6 +202,87 @@ fn engine_cancel_aborts_inflight_turn() {
 }
 
 #[test]
+fn engine_cancel_before_chat_is_consumed_by_the_next_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = EngineConfig {
+        api_key: "mock".into(),
+        base_url: "http://mock.local/v1".into(),
+        model: "mock-model".into(),
+        root_dir: root.path().to_path_buf(),
+        ..Default::default()
+    };
+    let engine = PhoneBuddyEngine::with_transport(
+        cfg,
+        MockTransport::new(vec![MockTurn::text("must not be sampled")]),
+    )
+    .unwrap();
+
+    engine.cancel("cancel_before_start");
+    let result = engine.chat("cancel_before_start", "hello", None);
+    assert!(matches!(
+        result,
+        Err(phone_buddy::error::EngineError::Cancelled)
+    ));
+}
+
+#[test]
+fn late_cancel_does_not_poison_a_later_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = EngineConfig {
+        api_key: "mock".into(),
+        base_url: "http://mock.local/v1".into(),
+        model: "mock-model".into(),
+        root_dir: root.path().to_path_buf(),
+        ..Default::default()
+    };
+    let engine = PhoneBuddyEngine::with_transport(
+        cfg,
+        MockTransport::new(vec![
+            MockTurn::text("first answer"),
+            MockTurn::text("second answer"),
+        ]),
+    )
+    .unwrap();
+
+    let first = engine.chat("same_session", "first", None).unwrap();
+    assert_eq!(first.final_text, "first answer");
+
+    engine.cancel("same_session");
+    let second = engine.chat("same_session", "second", None).unwrap();
+    assert_eq!(second.final_text, "second answer");
+}
+
+#[test]
+fn isolated_engines_can_chat_concurrently_without_crossing_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        api_key: "mock".into(),
+        base_url: "http://mock.local/v1".into(),
+        model: "mock-model".into(),
+        root_dir: root.path().to_path_buf(),
+        ..Default::default()
+    };
+    let first = PhoneBuddyEngine::with_transport(
+        config.clone(),
+        MockTransport::new(vec![MockTurn::text("first answer")]),
+    )
+    .unwrap();
+    let second = PhoneBuddyEngine::with_transport(
+        config,
+        MockTransport::new(vec![MockTurn::text("second answer")]),
+    )
+    .unwrap();
+
+    let first_thread = std::thread::spawn(move || first.chat("session_a", "first", None));
+    let second_thread = std::thread::spawn(move || second.chat("session_b", "second", None));
+    let first_outcome = first_thread.join().unwrap().unwrap();
+    let second_outcome = second_thread.join().unwrap().unwrap();
+
+    assert_eq!(first_outcome.final_text, "first answer");
+    assert_eq!(second_outcome.final_text, "second answer");
+}
+
+#[test]
 fn agent_name_is_configurable_and_resettable() {
     let root = tempfile::tempdir().unwrap();
     let cfg = EngineConfig {
@@ -293,4 +374,3 @@ fn server_tools_complete_in_single_turn() {
     assert_eq!(assistant.content, "Here is the latest news for today.");
     assert!(assistant.tool_calls.is_empty());
 }
-

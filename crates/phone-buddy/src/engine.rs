@@ -6,8 +6,8 @@
 //! append results, repeat until a final answer — with doom-loop detection,
 //! cancellation, and history compaction.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::agent::doom_loop::{
     step_signature, stationarity_nudge_message, IdenticalToolCallRun,
@@ -103,11 +103,44 @@ fn estimate_tokens(items: &[ConversationItem]) -> usize {
 /// Threshold above which we compact history (tokens).
 const COMPACT_THRESHOLD_TOKENS: usize = 24_000;
 
+#[derive(Default)]
+struct CancellationState {
+    active: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Cancellation requested before the first turn for a session is registered.
+    pending: HashSet<String>,
+    /// Prevents a late cancel after one turn from poisoning a future turn.
+    started: HashSet<String>,
+}
+
+/// Process-wide async executor shared by isolated engine instances.
+///
+/// Mobile hosts create one engine per active run so mutable prompt, plan,
+/// tool callback, and cancellation state cannot leak across conversations.
+/// Sharing only the executor avoids creating a separate Tokio worker pool for
+/// every simultaneous cloud chat while keeping all run state isolated.
+fn shared_runtime() -> EngineResult<Arc<tokio::runtime::Runtime>> {
+    static RUNTIME: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime.clone());
+    }
+
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("phone-buddy")
+            .build()
+            .map_err(|e| EngineError::Config(format!("failed to build runtime: {e}")))?,
+    );
+    let _ = RUNTIME.set(runtime);
+    Ok(RUNTIME.get().expect("runtime initialized").clone())
+}
+
 pub struct PhoneBuddyEngine {
     config: EngineConfig,
     /// Runtime identity + extra instructions, shared with subagents.
     prompt: Arc<Mutex<PromptRuntime>>,
-    runtime: tokio::runtime::Runtime,
+    runtime: Arc<tokio::runtime::Runtime>,
     tools: Arc<ToolRegistry>,
     sandbox: Arc<Sandbox>,
     client: Arc<LlmClient>,
@@ -115,7 +148,7 @@ pub struct PhoneBuddyEngine {
     plan_state: Arc<PlanState>,
     task_manager: Arc<crate::agent::task_manager::TaskManager>,
     scheduler_manager: Arc<crate::agent::scheduler_manager::SchedulerManager>,
-    cancels: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    cancellation: Mutex<CancellationState>,
     /// Present when `llm_mode == Host` (and also allocated for with_transport).
     host_llm: Arc<HostLlmHub>,
     host_tools: Arc<HostToolHub>,
@@ -240,12 +273,7 @@ impl PhoneBuddyEngine {
         ));
         let registry = Arc::new(registry);
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("phone-buddy")
-            .build()
-            .map_err(|e| EngineError::Config(format!("failed to build runtime: {e}")))?;
+        let runtime = shared_runtime()?;
 
         Ok(Arc::new(Self {
             config,
@@ -258,7 +286,7 @@ impl PhoneBuddyEngine {
             plan_state,
             task_manager,
             scheduler_manager,
-            cancels: Mutex::new(HashMap::new()),
+            cancellation: Mutex::new(CancellationState::default()),
             host_llm,
             host_tools,
             webview,
@@ -411,9 +439,13 @@ impl PhoneBuddyEngine {
 
     /// Cancel an in-flight turn for `session_id`.
     pub fn cancel(&self, session_id: &str) {
-        if let Some(token) = self.cancels.lock().unwrap().get(session_id) {
+        let mut cancellation = self.cancellation.lock().unwrap();
+        if let Some(token) = cancellation.active.get(session_id) {
             token.cancel();
+        } else if !cancellation.started.contains(session_id) {
+            cancellation.pending.insert(session_id.to_string());
         }
+        drop(cancellation);
         // Unblock any host LLM stream waiting on the host.
         self.host_llm
             .abort_all(&format!("cancelled session {session_id}"));
@@ -468,10 +500,15 @@ impl PhoneBuddyEngine {
         observer: Arc<dyn AgentObserver>,
     ) -> EngineResult<ChatOutcome> {
         let token = tokio_util::sync::CancellationToken::new();
-        self.cancels
-            .lock()
-            .unwrap()
+        let mut cancellation = self.cancellation.lock().unwrap();
+        if cancellation.pending.remove(session_id) {
+            token.cancel();
+        }
+        cancellation.started.insert(session_id.to_string());
+        cancellation
+            .active
             .insert(session_id.to_string(), token.clone());
+        drop(cancellation);
         // Wire the plan observer so plan updates stream to the UI.
         *self.plan_state.observer.lock().unwrap() = Some(observer.clone());
 
@@ -484,7 +521,11 @@ impl PhoneBuddyEngine {
             }
         };
 
-        self.cancels.lock().unwrap().remove(session_id);
+        self.cancellation
+            .lock()
+            .unwrap()
+            .active
+            .remove(session_id);
 
         match &result {
             Ok(outcome) => {
@@ -864,4 +905,17 @@ fn now_iso() -> String {
 
 fn truncate_tool_event(s: &str) -> String {
     crate::tools::truncate_chars(s, 2_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_runtime;
+    use std::sync::Arc;
+
+    #[test]
+    fn isolated_engines_share_the_process_runtime() {
+        let first = shared_runtime().expect("first runtime");
+        let second = shared_runtime().expect("second runtime");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }
