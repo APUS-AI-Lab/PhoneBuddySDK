@@ -28,6 +28,8 @@ pub enum ScheduledStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledTaskItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub cron_or_time: String,
@@ -95,6 +97,7 @@ impl SchedulerManager {
 
     pub fn create_task(
         &self,
+        title: Option<String>,
         prompt: String,
         cron_or_time: Option<String>,
         recurring: bool,
@@ -104,6 +107,7 @@ impl SchedulerManager {
         let cron_or_time = cron_or_time.unwrap_or_else(|| "in 5m".to_string());
         let item = ScheduledTaskItem {
             id: id.clone(),
+            title,
             prompt,
             cron_or_time,
             recurring,

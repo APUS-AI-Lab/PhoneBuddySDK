@@ -46,6 +46,7 @@ impl Tool for SchedulerTool {
             parameters: schema_object(
                 vec![
                     ("action", s_enum(&["create", "list", "delete"]), "Action to perform: 'create' to add a schedule, 'list' to view schedules, 'delete' to cancel a schedule"),
+                    ("title", s_string(), "A short, distinctive descriptive title (5-10 words / 6-15 Chinese characters) capturing what this scheduled task does, e.g. '每日 AI 行业新闻简报', '服务器健康巡检' (recommended for 'create')"),
                     ("prompt", s_string(), "Task prompt/instruction to execute when triggered (required for 'create')"),
                     ("cron_or_time", s_string(), "Schedule specification: cron expression (e.g. '*/15 * * * *'), relative duration (e.g. '10m', '1h'), or ISO timestamp (e.g. '2026-08-12T18:00:00Z')"),
                     ("recurring", s_boolean(), "Whether this task is recurring periodically (default: false)"),
@@ -60,11 +61,13 @@ impl Tool for SchedulerTool {
         let action = arg_str(&args, "action")?;
         match action.as_str() {
             "create" => {
+                let title = arg_opt_str(&args, "title");
                 let prompt = arg_str(&args, "prompt")?;
                 let cron_or_time = arg_opt_str(&args, "cron_or_time");
                 let recurring = arg_bool(&args, "recurring");
 
                 let item = self.scheduler_manager.create_task(
+                    title,
                     prompt,
                     cron_or_time,
                     recurring,
@@ -74,6 +77,7 @@ impl Tool for SchedulerTool {
                 let res = serde_json::json!({
                     "status": "scheduled",
                     "id": item.id,
+                    "title": item.title,
                     "prompt": item.prompt,
                     "cron_or_time": item.cron_or_time,
                     "recurring": item.recurring,
@@ -131,6 +135,7 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "action": "create",
+                    "title": "晨间天气查询",
                     "prompt": "Check morning weather",
                     "cron_or_time": "0 8 * * *",
                     "recurring": true
@@ -141,6 +146,7 @@ mod tests {
             .unwrap();
         assert!(out.text.contains("scheduled"));
         assert!(out.text.contains("sched-1"));
+        assert!(out.text.contains("晨间天气查询"));
 
         // List tasks
         let out_list = tool
