@@ -46,10 +46,10 @@ impl Tool for SchedulerTool {
             parameters: schema_object(
                 vec![
                     ("action", s_enum(&["create", "list", "delete"]), "Action to perform: 'create' to add a schedule, 'list' to view schedules, 'delete' to cancel a schedule"),
-                    ("title", s_string(), "A short, distinctive descriptive title (5-10 words / 6-15 Chinese characters) capturing what this scheduled task does, e.g. '每日 AI 行业新闻简报', '服务器健康巡检' (recommended for 'create')"),
-                    ("prompt", s_string(), "Task prompt/instruction to execute when triggered (required for 'create')"),
-                    ("cron_or_time", s_string(), "Schedule specification: cron expression (e.g. '*/15 * * * *'), relative duration (e.g. '10m', '1h'), or ISO timestamp (e.g. '2026-08-12T18:00:00Z')"),
-                    ("recurring", s_boolean(), "Whether this task is recurring periodically (default: false)"),
+                    ("title", s_string(), "A short, distinctive descriptive title (5-10 words / 6-15 Chinese characters) capturing what this scheduled task does, e.g. '每日 AI 行业新闻简报', '喝水提醒' (recommended for 'create')"),
+                    ("prompt", s_string(), "The actionable task instruction to execute ONCE triggered (e.g. '向用户发送当天重要新闻简报...'). CRITICAL: Do NOT include cadence/time trigger words (like '每天18:00', '每天早上8点', '定时') in prompt. The cadence belongs strictly in 'cron_or_time'."),
+                    ("cron_or_time", s_string(), "Schedule specification / cadence: daily time (e.g. '18:00', '08:00'), relative duration (e.g. '10m', '1h', '2d'), or cron expression (e.g. '0 18 * * *')"),
+                    ("recurring", s_boolean(), "Whether this task is recurring periodically (true for daily/periodic schedules, false for one-off reminders)"),
                     ("task_id", s_string(), "Task ID to delete (required for 'delete')"),
                 ],
                 &["action"],

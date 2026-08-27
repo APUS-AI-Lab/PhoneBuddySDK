@@ -105,10 +105,17 @@ impl SchedulerManager {
     ) -> EngineResult<ScheduledTaskItem> {
         let id = self.generate_id();
         let cron_or_time = cron_or_time.unwrap_or_else(|| "in 5m".to_string());
+        let cleaned_prompt = clean_schedule_prompt(&prompt);
+        let final_prompt = if cleaned_prompt.is_empty() {
+            prompt
+        } else {
+            cleaned_prompt
+        };
+
         let item = ScheduledTaskItem {
             id: id.clone(),
             title,
-            prompt,
+            prompt: final_prompt,
             cron_or_time,
             recurring,
             created_at: Utc::now().to_rfc3339(),
@@ -159,5 +166,67 @@ impl SchedulerManager {
                 message: format!("scheduled task '{task_id}' not found"),
             })
         }
+    }
+}
+
+/// Clean schedule prompt by removing leading timing/cadence trigger words.
+/// E.g. "每天18:00向用户发送当天重要新闻简报..." -> "向用户发送当天重要新闻简报..."
+/// E.g. "每天早上8点，给我发一条今天的新闻" -> "给我发一条今天的新闻"
+pub fn clean_schedule_prompt(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(re) = regex::Regex::new(r"^(?i)(?:定时(?:在|于)?\s*)?(?:每天|每日|每隔\s*\d+\s*(?:小时|分钟|秒|天|min|mins|hour|hours|sec|secs|h|m|d)|(?:\d+)\s*(?:分钟|小时|秒|天|min|mins|hour|hours|sec|secs|h|m|d)后|今天|明天)?\s*(?:(?:早上|上午|中午|下午|晚上)?\s*(?:\d{1,2}[:：点时]\d{0,2}\s*分?|\d{1,2}\s*(?:点|时)))?\s*(?:，|,|：|:)?\s*") {
+        if let Some(mat) = re.find(trimmed) {
+            if mat.end() > 0 && mat.end() < trimmed.len() {
+                let rest = trimmed[mat.end()..].trim_start_matches(|c: char| c == '，' || c == ',' || c == '：' || c == ':' || c.is_whitespace());
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+
+    if let Ok(rel_re) = regex::Regex::new(r"^(?i)(?:(?:\d+)\s*(?:分钟|小时|秒|天|min|mins|hour|hours|sec|secs|h|m|d)后|每隔\s*\d+\s*(?:小时|分钟|秒|天|min|mins|hour|hours)|in\s+\d+\s*(?:min|mins|minutes|hour|hours|sec|secs|days))\s*(?:，|,|：|:)?\s*") {
+        if let Some(mat) = rel_re.find(trimmed) {
+            if mat.end() > 0 && mat.end() < trimmed.len() {
+                let rest = trimmed[mat.end()..].trim_start_matches(|c: char| c == '，' || c == ',' || c == '：' || c == ':' || c.is_whitespace());
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_schedule_prompt() {
+        assert_eq!(
+            clean_schedule_prompt("每天18:00向用户发送当天重要新闻简报。优先覆盖国际、美国、科技、财经和重大突发事件；核实最新信息，使用可靠来源，简洁列出要点并附来源链接。"),
+            "向用户发送当天重要新闻简报。优先覆盖国际、美国、科技、财经和重大突发事件；核实最新信息，使用可靠来源，简洁列出要点并附来源链接。"
+        );
+
+        assert_eq!(
+            clean_schedule_prompt("每天早上8点，给我发一条今天的新闻"),
+            "给我发一条今天的新闻"
+        );
+
+        assert_eq!(
+            clean_schedule_prompt("10分钟后提醒我喝水"),
+            "提醒我喝水"
+        );
+
+        assert_eq!(
+            clean_schedule_prompt("向用户发送当天重要新闻简报"),
+            "向用户发送当天重要新闻简报"
+        );
     }
 }
