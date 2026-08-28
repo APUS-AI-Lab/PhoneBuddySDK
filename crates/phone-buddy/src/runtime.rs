@@ -61,7 +61,7 @@ impl PhoneBuddyRuntime {
 mod tests {
     use super::*;
     use crate::llm::router::{
-        FailureClass, PoolMember, ProviderPool, ProviderTarget, MAIN_POOL_ID,
+        FailureClass, PoolMember, ProviderPool, ProviderTarget, MAIN_POOL_ID, SUBAGENT_POOL_ID,
     };
     use chrono::{TimeZone, Utc};
 
@@ -91,16 +91,24 @@ mod tests {
     fn engine_recreation_keeps_health() {
         let dir = tempfile::tempdir().unwrap();
         let mut pools = std::collections::BTreeMap::new();
+        let member = PoolMember {
+            provider_id: "p1".into(),
+            routing_group: "g".into(),
+            base_score: 10,
+            order: 0,
+            enabled: true,
+        };
         pools.insert(
             MAIN_POOL_ID.into(),
             ProviderPool {
-                members: vec![PoolMember {
-                    provider_id: "p1".into(),
-                    routing_group: "g".into(),
-                    base_score: 10,
-                    order: 0,
-                    enabled: true,
-                }],
+                members: vec![member.clone()],
+                ..Default::default()
+            },
+        );
+        pools.insert(
+            SUBAGENT_POOL_ID.into(),
+            ProviderPool {
+                members: vec![member],
                 ..Default::default()
             },
         );
@@ -122,5 +130,40 @@ mod tests {
         drop(engine);
         let _engine2 = runtime.create_engine(cfg, MAIN_POOL_ID).unwrap();
         assert!(runtime.router().health_record("p1").unwrap().is_cooling(t));
+    }
+
+    #[test]
+    fn create_engine_without_subagent_pool_is_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: vec![PoolMember {
+                    provider_id: "p1".into(),
+                    routing_group: "g".into(),
+                    base_score: 10,
+                    order: 0,
+                    enabled: true,
+                }],
+                ..Default::default()
+            },
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![target("p1")],
+            pools,
+            health: Default::default(),
+        };
+        let runtime = PhoneBuddyRuntime::new(routing, dir.path()).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.api_key = "k".into();
+        cfg.root_dir = dir.path().to_path_buf();
+        match runtime.create_engine(cfg, MAIN_POOL_ID) {
+            Err(EngineError::RouteNotConfigured { pool_id }) => {
+                assert_eq!(pool_id, SUBAGENT_POOL_ID);
+            }
+            Err(other) => panic!("expected RouteNotConfigured, got {other}"),
+            Ok(_) => panic!("expected RouteNotConfigured for missing subagent pool"),
+        }
     }
 }

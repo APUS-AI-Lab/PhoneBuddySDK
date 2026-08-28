@@ -16,7 +16,7 @@ use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
-use crate::llm::router::MAIN_POOL_ID;
+use crate::llm::router::{MAIN_POOL_ID, SUBAGENT_POOL_ID};
 use crate::llm::types::{
     drop_colliding_function_tools, ConversationRequest, HostedTool, ToolCall, ToolDefinitionWire,
     Usage,
@@ -280,9 +280,20 @@ impl PhoneBuddyEngine {
         ));
         subagent_registry.register(crate::tools::notification::arc(host_tools.clone()));
 
+        // HTTP engines bind TaskManager to `subagent`. Host / injected
+        // transports share the engine client because they have no pools.
+        let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
+            (Some(runtime), LlmMode::Http) => Arc::new(LlmClient::from_router(
+                runtime.router(),
+                SUBAGENT_POOL_ID,
+                &config,
+            )?),
+            _ => client.clone(),
+        };
+
         let task_manager = Arc::new(crate::agent::task_manager::TaskManager::with_prompt(
             config.clone(),
-            client.clone(),
+            subagent_client,
             sandbox.clone(),
             Arc::new(subagent_registry),
             prompt.clone(),
@@ -1050,7 +1061,8 @@ fn truncate_tool_event(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shared_runtime;
+    use super::*;
+    use crate::llm::router::{LlmRoutingConfig, PoolMember, ProviderPool, ProviderTarget};
     use std::sync::Arc;
 
     #[test]
@@ -1058,5 +1070,82 @@ mod tests {
         let first = shared_runtime().expect("first runtime");
         let second = shared_runtime().expect("second runtime");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    fn target(id: &str) -> ProviderTarget {
+        ProviderTarget {
+            provider_id: id.into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            api_backend: Default::default(),
+            client_profile: Default::default(),
+            client_version: None,
+            client_session_id: None,
+            reasoning_compatibility_key: None,
+            capabilities: Default::default(),
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            enable_web_search: false,
+            web_search_options: None,
+            enable_x_search: false,
+            x_search_options: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn legacy_engine_binds_subagent_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.api_key = "k".into();
+        cfg.root_dir = dir.path().to_path_buf();
+        let engine = PhoneBuddyEngine::new(cfg).unwrap();
+        assert_eq!(engine.client.pool_id(), MAIN_POOL_ID);
+        assert_eq!(engine.task_manager.pool_id(), SUBAGENT_POOL_ID);
+        let runtime = engine.phone_buddy_runtime().expect("legacy runtime");
+        assert!(runtime.router().has_pool(MAIN_POOL_ID));
+        assert!(runtime.router().has_pool(SUBAGENT_POOL_ID));
+        assert!(!runtime.router().has_pool("session_title"));
+    }
+
+    #[test]
+    fn missing_session_title_does_not_block_engine_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = PoolMember {
+            provider_id: "p1".into(),
+            routing_group: "g".into(),
+            base_score: 10,
+            order: 0,
+            enabled: true,
+        };
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: vec![member.clone()],
+                ..Default::default()
+            },
+        );
+        pools.insert(
+            SUBAGENT_POOL_ID.into(),
+            ProviderPool {
+                members: vec![member],
+                ..Default::default()
+            },
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![target("p1")],
+            pools,
+            health: Default::default(),
+        };
+        let runtime = PhoneBuddyRuntime::new(routing, dir.path()).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.api_key = "k".into();
+        cfg.root_dir = dir.path().to_path_buf();
+        let engine = runtime.create_engine(cfg, MAIN_POOL_ID).unwrap();
+        assert_eq!(engine.client.pool_id(), MAIN_POOL_ID);
+        assert_eq!(engine.task_manager.pool_id(), SUBAGENT_POOL_ID);
+        assert!(!runtime.router().has_pool("session_title"));
     }
 }

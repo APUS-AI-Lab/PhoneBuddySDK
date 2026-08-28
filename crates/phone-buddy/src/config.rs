@@ -134,6 +134,10 @@ pub struct EngineConfig {
     /// Ordered fallback endpoints tried after the primary provider degrades.
     /// Empty (the default) keeps single-provider behaviour: the full
     /// [`max_retries`] budget is spent on the primary endpoint.
+    ///
+    /// The legacy adapter copies this chain into both `main` and `subagent`
+    /// pools. A direct [`crate::llm::router::LlmRoutingConfig`] must declare
+    /// `subagent` itself; it is not inherited from `main`.
     #[serde(default)]
     pub fallback_providers: Vec<ProviderEndpoint>,
     /// Chain mode only: total attempts per provider per LLM request before
@@ -210,7 +214,6 @@ pub struct ProviderEndpoint {
     #[serde(default)]
     pub provider_group: Option<String>,
 }
-
 
 /// Default system-prompt identity when the host does not set [`EngineConfig::agent_name`].
 pub const DEFAULT_AGENT_NAME: &str = "PhoneBuddy";
@@ -364,10 +367,8 @@ impl EngineConfig {
 
     /// Whether to send the doom-loop opt-in header and act on server signals.
     pub fn doom_loop_check_enabled(&self) -> bool {
-        self.enable_doom_loop_check.unwrap_or(matches!(
-            self.api_backend,
-            ApiBackend::Responses
-        ))
+        self.enable_doom_loop_check
+            .unwrap_or(matches!(self.api_backend, ApiBackend::Responses))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -382,8 +383,7 @@ impl EngineConfig {
                 if self.api_key.trim().is_empty() {
                     return Err("api_key is empty".into());
                 }
-                if !self.base_url.starts_with("http://") && !self.base_url.starts_with("https://")
-                {
+                if !self.base_url.starts_with("http://") && !self.base_url.starts_with("https://") {
                     return Err(format!(
                         "base_url must be an http(s) URL: {}",
                         self.base_url
@@ -401,8 +401,7 @@ impl EngineConfig {
             if ep.api_key.trim().is_empty() {
                 return Err(format!("fallback_providers[{i}].api_key is empty"));
             }
-            if !ep.base_url.starts_with("http://") && !ep.base_url.starts_with("https://")
-            {
+            if !ep.base_url.starts_with("http://") && !ep.base_url.starts_with("https://") {
                 return Err(format!(
                     "fallback_providers[{i}].base_url must be an http(s) URL: {}",
                     ep.base_url
@@ -483,7 +482,6 @@ impl EngineConfigBuilder {
         self.config.model = model.into();
         self
     }
-
 
     /// Set the client emulation profile (Default, GrokBuild, Codex, ClaudeCode).
     ///
@@ -630,10 +628,7 @@ impl EngineConfigBuilder {
     }
 
     /// Extend extra HTTP headers.
-    pub fn extra_headers(
-        mut self,
-        headers: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn extra_headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
         self.config.extra_headers.extend(headers);
         self
     }
@@ -714,7 +709,6 @@ impl EngineConfigBuilder {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,7 +753,10 @@ mod tests {
         assert_eq!(claude_cfg.client_profile, ClientProfile::ClaudeCode);
         assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
         assert_eq!(claude_cfg.api_backend, ApiBackend::Messages);
-        assert_eq!(claude_cfg.client_session_id.as_deref(), Some("sess-custom-uuid"));
+        assert_eq!(
+            claude_cfg.client_session_id.as_deref(),
+            Some("sess-custom-uuid")
+        );
 
         let gemini_cfg = EngineConfig::for_gemini("AIza-test", "gemini-2.5-flash")
             .build()
@@ -799,5 +796,3 @@ mod tests {
         assert_eq!(decoded.fallback_providers[0].model, "gpt-4o");
     }
 }
-
-

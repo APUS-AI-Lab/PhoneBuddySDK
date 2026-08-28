@@ -294,6 +294,30 @@ impl LlmClient {
         })
     }
 
+    /// Bind this client to `pool_id` on a shared router using injected
+    /// transports keyed by `provider_id`. A missing pool member is a hard
+    /// error. Used by tests; production HTTP clients use [`from_router`].
+    pub fn from_router_with_transports(
+        router: Arc<LlmRouter>,
+        pool_id: impl Into<String>,
+        transports: HashMap<String, Arc<dyn LlmTransportObj>>,
+    ) -> EngineResult<Self> {
+        let pool_id = pool_id.into();
+        if !router.has_pool(&pool_id) {
+            return Err(EngineError::RouteNotConfigured { pool_id });
+        }
+        let (generation, snapshot) = router.snapshot();
+        let bound = bind_injected_slots(&pool_id, generation, &snapshot, &transports)?;
+        Ok(Self {
+            router,
+            pool_id,
+            slots: Mutex::new(bound),
+            http_factory: None,
+            doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
+            last_success: Mutex::new(None),
+        })
+    }
+
     pub fn pool_id(&self) -> &str {
         &self.pool_id
     }
@@ -1098,9 +1122,15 @@ fn bind_http_slots(
             pool_id: pool_id.to_string(),
         })?;
     let mut providers = HashMap::new();
-    for target in &snapshot.providers {
+    for member in &pool.members {
+        let target = snapshot.provider(&member.provider_id).ok_or_else(|| {
+            EngineError::InvalidRoutingConfig(format!(
+                "pool '{pool_id}' member '{}' is missing from providers",
+                member.provider_id
+            ))
+        })?;
         providers.insert(
-            target.provider_id.clone(),
+            member.provider_id.clone(),
             slot_from_target(factory, target)?,
         );
     }
@@ -1113,6 +1143,63 @@ fn bind_http_slots(
                 .provider(pool.members.first()?.provider_id.as_str())
                 .map(|p| p.resolved_compat_key())
         })
+        .unwrap_or_default();
+    Ok(BoundSlots {
+        generation,
+        providers,
+        max_retries: pool.retry.max_retries.max(1),
+        failover_max_attempts: pool.retry.failover_max_attempts.max(1),
+        primary_compat_key,
+    })
+}
+
+fn bind_injected_slots(
+    pool_id: &str,
+    generation: u64,
+    snapshot: &LlmRoutingConfig,
+    transports: &HashMap<String, Arc<dyn LlmTransportObj>>,
+) -> EngineResult<BoundSlots> {
+    let pool = snapshot
+        .pools
+        .get(pool_id)
+        .ok_or_else(|| EngineError::RouteNotConfigured {
+            pool_id: pool_id.to_string(),
+        })?;
+    let mut providers = HashMap::new();
+    for member in &pool.members {
+        let Some(transport) = transports.get(&member.provider_id) else {
+            return Err(EngineError::InvalidRoutingConfig(format!(
+                "pool '{pool_id}' member '{}' has no bound transport",
+                member.provider_id
+            )));
+        };
+        let target = snapshot.provider(&member.provider_id).ok_or_else(|| {
+            EngineError::InvalidRoutingConfig(format!(
+                "pool '{pool_id}' member '{}' is missing from providers",
+                member.provider_id
+            ))
+        })?;
+        providers.insert(
+            member.provider_id.clone(),
+            ProviderSlot {
+                provider_id: member.provider_id.clone(),
+                transport: transport.clone(),
+                fingerprint: provider_fingerprint(&target.base_url, &target.model),
+                compat_key: target.resolved_compat_key(),
+                model: target.model.clone(),
+                api_backend: target.api_backend,
+                reasoning_effort: target.reasoning_effort,
+                enable_web_search: target.enable_web_search,
+                web_search_options: target.web_search_options.clone(),
+                enable_x_search: target.enable_x_search,
+                x_search_options: target.x_search_options.clone(),
+            },
+        );
+    }
+    let primary_compat_key = pool
+        .members
+        .first()
+        .and_then(|m| providers.get(&m.provider_id).map(|s| s.compat_key.clone()))
         .unwrap_or_default();
     Ok(BoundSlots {
         generation,
@@ -1283,6 +1370,7 @@ fn retry_after_from_error(err: &EngineError) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::events::RecordingObserver;
+    use crate::llm::router::SUBAGENT_POOL_ID;
     use crate::llm::types::{ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, Role};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1404,6 +1492,49 @@ mod tests {
             previous_response_id: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
+        }
+    }
+
+    fn target(id: &str, url: &str, model: &str) -> ProviderTarget {
+        ProviderTarget {
+            provider_id: id.into(),
+            base_url: url.into(),
+            api_key: "k".into(),
+            model: model.into(),
+            api_backend: Default::default(),
+            client_profile: Default::default(),
+            client_version: None,
+            client_session_id: None,
+            reasoning_compatibility_key: None,
+            capabilities: Default::default(),
+            extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
+            enable_web_search: false,
+            web_search_options: None,
+            enable_x_search: false,
+            x_search_options: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn member(id: &str, order: u32) -> PoolMember {
+        PoolMember {
+            provider_id: id.into(),
+            routing_group: crate::llm::router::DEFAULT_ROUTING_GROUP.into(),
+            base_score: 10,
+            order,
+            enabled: true,
+        }
+    }
+
+    fn pool(members: Vec<PoolMember>) -> ProviderPool {
+        ProviderPool {
+            members,
+            retry: RetryPolicy {
+                failover_max_attempts: 3,
+                max_retries: 5,
+            },
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
         }
     }
 
@@ -2035,5 +2166,258 @@ mod tests {
         assert_eq!(turn.text, "ok");
         assert_eq!(a_hits.load(Ordering::SeqCst), 3);
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_pool_never_hits_main_transport() {
+        let main_hits = Arc::new(AtomicU32::new(0));
+        let sub_hits = Arc::new(AtomicU32::new(0));
+        let main_t = ScriptedTransport::failing("main", 0, "", main_hits.clone());
+        let sub_t = ScriptedTransport::failing("sub", 0, "", sub_hits.clone());
+
+        let mut pools = BTreeMap::new();
+        pools.insert(MAIN_POOL_ID.into(), pool(vec![member("p-main", 0)]));
+        pools.insert(SUBAGENT_POOL_ID.into(), pool(vec![member("p-sub", 0)]));
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                target("p-main", "https://main.example/v1", "main-model"),
+                target("p-sub", "https://cheap.example/v1", "cheap-model"),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let main = LlmClient::from_router_with_transports(
+            router.clone(),
+            MAIN_POOL_ID,
+            HashMap::from([("p-main".into(), main_t as Arc<dyn LlmTransportObj>)]),
+        )
+        .unwrap();
+        let sub = LlmClient::from_router_with_transports(
+            router,
+            SUBAGENT_POOL_ID,
+            HashMap::from([("p-sub".into(), sub_t as Arc<dyn LlmTransportObj>)]),
+        )
+        .unwrap();
+
+        let observer = RecordingObserver::new();
+        sub.complete(&req(), &observer).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_hits.load(Ordering::SeqCst), 1);
+
+        main.complete(&req(), &observer).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_trip_of_shared_provider_id_affects_main_selection() {
+        tokio::time::pause();
+        let shared_hits = Arc::new(AtomicU32::new(0));
+        let backup_hits = Arc::new(AtomicU32::new(0));
+        let cheap_hits = Arc::new(AtomicU32::new(0));
+        let shared =
+            ScriptedTransport::failing("shared", u32::MAX, "status=503 busy", shared_hits.clone());
+        let backup = ScriptedTransport::failing("backup", 0, "", backup_hits.clone());
+        let cheap = ScriptedTransport::failing("cheap", 0, "", cheap_hits.clone());
+
+        let mut pools = BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            pool(vec![member("p-shared", 0), member("p-backup", 1)]),
+        );
+        pools.insert(
+            SUBAGENT_POOL_ID.into(),
+            pool(vec![member("p-shared", 0), member("p-cheap", 1)]),
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                target("p-shared", "https://shared.example/v1", "m"),
+                target("p-backup", "https://backup.example/v1", "m"),
+                target("p-cheap", "https://cheap.example/v1", "m"),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let main = LlmClient::from_router_with_transports(
+            router.clone(),
+            MAIN_POOL_ID,
+            HashMap::from([
+                (
+                    "p-shared".into(),
+                    shared.clone() as Arc<dyn LlmTransportObj>,
+                ),
+                ("p-backup".into(), backup as Arc<dyn LlmTransportObj>),
+            ]),
+        )
+        .unwrap();
+        let sub = LlmClient::from_router_with_transports(
+            router,
+            SUBAGENT_POOL_ID,
+            HashMap::from([
+                ("p-shared".into(), shared as Arc<dyn LlmTransportObj>),
+                ("p-cheap".into(), cheap as Arc<dyn LlmTransportObj>),
+            ]),
+        )
+        .unwrap();
+
+        let observer = RecordingObserver::new();
+        sub.complete(&req(), &observer).await.unwrap();
+        let after_sub = shared_hits.load(Ordering::SeqCst);
+        assert!(after_sub >= 1);
+        assert_eq!(cheap_hits.load(Ordering::SeqCst), 1);
+
+        main.complete(&req(), &observer).await.unwrap();
+        assert_eq!(shared_hits.load(Ordering::SeqCst), after_sub);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_provider_ids_same_url_have_independent_health() {
+        tokio::time::pause();
+        let main_hits = Arc::new(AtomicU32::new(0));
+        let sub_hits = Arc::new(AtomicU32::new(0));
+        let main_t = ScriptedTransport::failing("main", 0, "", main_hits.clone());
+        let sub_t =
+            ScriptedTransport::failing("sub", u32::MAX, "status=503 busy", sub_hits.clone());
+
+        let url = "https://same.example/v1";
+        let mut pools = BTreeMap::new();
+        pools.insert(MAIN_POOL_ID.into(), pool(vec![member("p-main", 0)]));
+        pools.insert(SUBAGENT_POOL_ID.into(), pool(vec![member("p-sub", 0)]));
+        let routing = LlmRoutingConfig {
+            providers: vec![target("p-main", url, "m"), target("p-sub", url, "m")],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let main = LlmClient::from_router_with_transports(
+            router.clone(),
+            MAIN_POOL_ID,
+            HashMap::from([("p-main".into(), main_t as Arc<dyn LlmTransportObj>)]),
+        )
+        .unwrap();
+        let sub = LlmClient::from_router_with_transports(
+            router,
+            SUBAGENT_POOL_ID,
+            HashMap::from([("p-sub".into(), sub_t as Arc<dyn LlmTransportObj>)]),
+        )
+        .unwrap();
+
+        let observer = RecordingObserver::new();
+        let _ = sub.complete(&req(), &observer).await.unwrap_err();
+        main.complete(&req(), &observer).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert!(sub_hits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_main_and_subagents_isolate_turn_context() {
+        let main_probe = ContextProbeTransport::new();
+        let sub_probe = ContextProbeTransport::new();
+
+        let mut pools = BTreeMap::new();
+        pools.insert(MAIN_POOL_ID.into(), pool(vec![member("p-main", 0)]));
+        pools.insert(SUBAGENT_POOL_ID.into(), pool(vec![member("p-sub", 0)]));
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                target("p-main", "https://main.example/v1", "m"),
+                target("p-sub", "https://sub.example/v1", "m"),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let main_client = LlmClient::from_router_with_transports(
+            router.clone(),
+            MAIN_POOL_ID,
+            HashMap::from([(
+                "p-main".into(),
+                main_probe.clone() as Arc<dyn LlmTransportObj>,
+            )]),
+        )
+        .unwrap();
+        let sub_client = LlmClient::from_router_with_transports(
+            router,
+            SUBAGENT_POOL_ID,
+            HashMap::from([(
+                "p-sub".into(),
+                sub_probe.clone() as Arc<dyn LlmTransportObj>,
+            )]),
+        )
+        .unwrap();
+
+        let observer = RecordingObserver::new();
+        let request = req();
+        let main = main_client.begin_turn();
+        let sub_one = sub_client.begin_turn();
+        let sub_two = sub_client.begin_turn();
+
+        let first = tokio::join!(
+            main.complete(&request, &observer),
+            sub_one.complete(&request, &observer),
+            sub_two.complete(&request, &observer),
+        );
+        first.0.unwrap();
+        first.1.unwrap();
+        first.2.unwrap();
+
+        let second = tokio::join!(
+            main.complete(&request, &observer),
+            sub_one.complete(&request, &observer),
+            sub_two.complete(&request, &observer),
+        );
+        second.0.unwrap();
+        second.1.unwrap();
+        second.2.unwrap();
+
+        let main_obs = main_probe.observed.lock().unwrap().clone();
+        let sub_obs = sub_probe.observed.lock().unwrap().clone();
+        assert_eq!(main_obs, vec![None, Some("sticky".into())]);
+        assert_eq!(sub_obs.len(), 4);
+        assert!(
+            sub_obs[..2].iter().all(Option::is_none),
+            "concurrent subagent first hops must not share turn state: {sub_obs:?}"
+        );
+        assert!(
+            sub_obs[2..]
+                .iter()
+                .all(|state| state.as_deref() == Some("sticky")),
+            "same-turn subagent hops must reuse turn state: {sub_obs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_injected_slot_is_a_hard_error() {
+        let mut pools = BTreeMap::new();
+        pools.insert(MAIN_POOL_ID.into(), pool(vec![member("p-main", 0)]));
+        pools.insert(
+            SUBAGENT_POOL_ID.into(),
+            pool(vec![member("p-a", 0), member("p-b", 1)]),
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                target("p-main", "https://main.example/v1", "m"),
+                target("p-a", "https://a.example/v1", "m"),
+                target("p-b", "https://b.example/v1", "m"),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let t = ScriptedTransport::failing("a", 0, "", hits);
+        match LlmClient::from_router_with_transports(
+            router,
+            SUBAGENT_POOL_ID,
+            HashMap::from([("p-a".into(), t as Arc<dyn LlmTransportObj>)]),
+        ) {
+            Err(EngineError::InvalidRoutingConfig(msg)) => {
+                assert!(msg.contains("p-b"), "{msg}");
+            }
+            Err(other) => panic!("expected InvalidRoutingConfig, got {other}"),
+            Ok(_) => panic!("expected missing slot to be a hard error"),
+        }
     }
 }

@@ -11,7 +11,9 @@ use crate::llm::types::{ApiBackend, ReasoningEffort, WebSearchOptions, XSearchOp
 
 /// Default pool used by the main agent engine.
 pub const MAIN_POOL_ID: &str = "main";
-/// Default pool used by subagents. The legacy adapter aliases this to `main`.
+/// Default pool used by subagents. HTTP engines bind TaskManager here.
+/// The legacy adapter copies `main` into this pool; a direct routing config
+/// that omits it is [`crate::error::EngineError::RouteNotConfigured`].
 pub const SUBAGENT_POOL_ID: &str = "subagent";
 /// Synthesized id for the EngineConfig primary endpoint.
 pub const LEGACY_PRIMARY_PROVIDER_ID: &str = "legacy-primary";

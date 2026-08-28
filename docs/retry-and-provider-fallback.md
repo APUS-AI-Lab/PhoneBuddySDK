@@ -46,6 +46,15 @@ named pools (`main`, `subagent`, `session_title`, …), and a
 `RouterHealthConfig`. Create a long-lived `PhoneBuddyRuntime` and bind
 engines with `runtime.create_engine(agent_config, "main")`.
 
+The main-agent tool loop uses the engine's pool-bound client (typically
+`main`). `TaskManager` receives a **second** `LlmClient` bound to
+`subagent`: same router (shared health), independent provider slots, and
+a fresh `begin_turn()` per spawned subagent. A direct routing config that
+omits `subagent` returns `RouteNotConfigured` when creating an HTTP
+engine. Only the legacy `EngineConfig` adapter copies `main` into
+`subagent`. Utility pools such as `session_title` stay unconfigured until
+the host declares them.
+
 Legacy `EngineConfig` fields still synthesize a chain:
 
 ```json
@@ -242,3 +251,6 @@ The printer logs `Retrying` and `ProviderSwitched` events on stderr.
    and `http_dump` (no per-endpoint override in this revision).
 7. Health is shared by `provider_id` across pools and engines that
    borrow the same runtime.
+8. Subagents never inherit the main pool by falling back; missing
+   `subagent` is `RouteNotConfigured`. Free-form task `model` overrides
+   are not accepted — the selected pool member supplies the model.

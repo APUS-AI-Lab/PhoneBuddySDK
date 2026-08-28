@@ -1,14 +1,14 @@
 //! Subagent and Task management tools (`task`, `task_output`, `get_task_output`, `kill_task`, `wait_tasks`).
 
-use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::agent::task_manager::{TaskInput, TaskManager, MAX_MULTI_WAIT_IDS};
 use crate::error::{EngineError, EngineResult};
 use crate::tools::{
-    schema_object, s_boolean, s_enum, s_integer, s_string, s_string_array, Tool, ToolCtx, ToolOutput,
-    ToolSpec,
+    s_boolean, s_enum, s_integer, s_string, s_string_array, schema_object, Tool, ToolCtx,
+    ToolOutput, ToolSpec,
 };
 
 // ── 1. task (spawn) tool ───────────────────────────────────────────────────
@@ -42,7 +42,6 @@ impl Tool for TaskTool {
                     ("subagent_type", s_string(), "Name of subagent type (default: 'general-purpose')."),
                     ("run_in_background", s_boolean(), "Whether to run subagent in background (default: true)."),
                     ("resume_from", s_string(), "Subagent ID to resume conversation from."),
-                    ("model", s_string(), "Optional model override."),
                 ],
                 &["prompt", "description"],
             ),
@@ -84,9 +83,21 @@ impl Tool for TaskOutputTool {
             description: "Get output or status from one or more background subagent tasks.".into(),
             parameters: schema_object(
                 vec![
-                    ("task_ids", s_string_array(), "Task IDs to inspect or wait for."),
-                    ("task_id", s_string(), "Single task ID alias for convenience."),
-                    ("timeout_ms", s_integer(), "Max wait time in milliseconds. 0 or omitted for non-blocking poll."),
+                    (
+                        "task_ids",
+                        s_string_array(),
+                        "Task IDs to inspect or wait for.",
+                    ),
+                    (
+                        "task_id",
+                        s_string(),
+                        "Single task ID alias for convenience.",
+                    ),
+                    (
+                        "timeout_ms",
+                        s_integer(),
+                        "Max wait time in milliseconds. 0 or omitted for non-blocking poll.",
+                    ),
                 ],
                 &[],
             ),
@@ -193,7 +204,11 @@ impl Tool for WaitTasksTool {
             parameters: schema_object(
                 vec![
                     ("task_ids", s_string_array(), "Task IDs to wait for."),
-                    ("mode", s_enum(&["wait_any", "wait_all"]), "Wait mode: wait_any or wait_all (default: wait_all)."),
+                    (
+                        "mode",
+                        s_enum(&["wait_any", "wait_all"]),
+                        "Wait mode: wait_any or wait_all (default: wait_all).",
+                    ),
                     ("timeout_ms", s_integer(), "Max wait time in milliseconds."),
                 ],
                 &["task_ids"],

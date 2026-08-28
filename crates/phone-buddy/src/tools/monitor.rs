@@ -358,7 +358,6 @@ mod tests {
             subagent_type: "general-purpose".into(),
             run_in_background: true,
             resume_from: None,
-            model: None,
         };
         let spawn_res = task_manager.spawn_task(task_input).await.unwrap();
         assert!(spawn_res.contains("subagent_id: task-1"));

@@ -10,16 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use regex::RegexBuilder;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::EngineConfig;
+use crate::conversation::ConversationItem;
 use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
-use crate::conversation::ConversationItem;
 use crate::llm::types::{drop_colliding_function_tools, ConversationRequest, HostedTool};
 use crate::prompt::{build_subagent_prompt, PromptRuntime};
 use crate::tools::fs::Sandbox;
@@ -63,7 +63,6 @@ pub struct TaskInput {
     #[serde(default = "default_true")]
     pub run_in_background: bool,
     pub resume_from: Option<String>,
-    pub model: Option<String>,
 }
 
 fn default_subagent_type() -> String {
@@ -218,6 +217,11 @@ impl TaskManager {
         }
     }
 
+    /// Pool this manager's LLM client is bound to.
+    pub fn pool_id(&self) -> &str {
+        self.client.pool_id()
+    }
+
     fn system_prompt(&self) -> String {
         let mut cfg = self.config.clone();
         self.prompt.lock().unwrap().apply_to(&mut cfg);
@@ -267,10 +271,10 @@ impl TaskManager {
             let task_id_clone = task_id.clone();
             let prompt = input.prompt.clone();
             let resume_from = input.resume_from.clone();
-            let model = input.model.clone();
 
             tokio::spawn(async move {
-                this.run_subagent(&task_id_clone, &prompt, resume_from.as_deref(), model.as_deref()).await;
+                this.run_subagent(&task_id_clone, &prompt, resume_from.as_deref())
+                    .await;
             });
 
             Ok(format_subagent_started_background(
@@ -281,9 +285,9 @@ impl TaskManager {
         } else {
             let prompt = input.prompt.clone();
             let resume_from = input.resume_from.clone();
-            let model = input.model.clone();
 
-            self.run_subagent(&task_id, &prompt, resume_from.as_deref(), model.as_deref()).await;
+            self.run_subagent(&task_id, &prompt, resume_from.as_deref())
+                .await;
 
             let guard = self.tasks.lock().unwrap();
             if let Some(res) = guard.get(&task_id) {
@@ -306,13 +310,7 @@ impl TaskManager {
     }
 
     /// Run subagent turn loop.
-    pub async fn run_subagent(
-        &self,
-        task_id: &str,
-        prompt: &str,
-        resume_from: Option<&str>,
-        model_override: Option<&str>,
-    ) {
+    pub async fn run_subagent(&self, task_id: &str, prompt: &str, resume_from: Option<&str>) {
         let start_time = Instant::now();
         let mut items = Vec::new();
 
@@ -351,7 +349,10 @@ impl TaskManager {
                     record.ended = Some(Utc::now().to_rfc3339());
                     record.duration_secs = start_time.elapsed().as_secs_f64();
                     record.output = "Task was cancelled.".to_string();
-                    record.logs.push(format!("[{}] Task cancelled via token.", Utc::now().to_rfc3339()));
+                    record.logs.push(format!(
+                        "[{}] Task cancelled via token.",
+                        Utc::now().to_rfc3339()
+                    ));
                 }
                 return;
             }
@@ -372,7 +373,6 @@ impl TaskManager {
             let mut req_items = vec![ConversationItem::system(&system_prompt)];
             req_items.extend(items.clone());
 
-            let model = model_override.unwrap_or(&self.config.model).to_string();
             let hosted = HostedTool::for_request_with_options(
                 self.config.enable_web_search,
                 self.config.web_search_options.clone(),
@@ -381,7 +381,7 @@ impl TaskManager {
                 self.config.api_backend,
             );
             let request = ConversationRequest {
-                model,
+                model: self.config.model.clone(),
                 items: req_items,
                 stream: Some(false),
                 tools: drop_colliding_function_tools(
@@ -407,7 +407,11 @@ impl TaskManager {
                     if turn_items.is_empty() {
                         turn_items.push(ConversationItem::assistant(&turn.text));
                     }
-                    if let Some(a) = turn_items.iter_mut().rev().find_map(|i| i.as_assistant_mut()) {
+                    if let Some(a) = turn_items
+                        .iter_mut()
+                        .rev()
+                        .find_map(|i| i.as_assistant_mut())
+                    {
                         a.origin = Some(origin);
                     }
                     let client_calls: Vec<_> = turn_items
@@ -483,10 +487,9 @@ impl TaskManager {
                     {
                         let mut guard = self.tasks.lock().unwrap();
                         if let Some(record) = guard.get_mut(task_id) {
-                            record.logs.push(format!(
-                                "[{}] Subagent error: {e}",
-                                Utc::now().to_rfc3339()
-                            ));
+                            record
+                                .logs
+                                .push(format!("[{}] Subagent error: {e}", Utc::now().to_rfc3339()));
                         }
                     }
                     break;
@@ -498,7 +501,11 @@ impl TaskManager {
         let mut guard = self.tasks.lock().unwrap();
         if let Some(record) = guard.get_mut(task_id) {
             if record.status != TaskStatus::Cancelled {
-                record.status = if failed { TaskStatus::Failed } else { TaskStatus::Completed };
+                record.status = if failed {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                };
                 record.ended = Some(Utc::now().to_rfc3339());
                 record.duration_secs = elapsed.as_secs_f64();
                 record.output = final_text;
@@ -529,7 +536,9 @@ impl TaskManager {
                 let all_done = {
                     let guard = self.tasks.lock().unwrap();
                     task_ids.iter().all(|id| {
-                        guard.get(id).map_or(true, |t| t.status != TaskStatus::Running)
+                        guard
+                            .get(id)
+                            .map_or(true, |t| t.status != TaskStatus::Running)
                     })
                 };
                 if all_done || start.elapsed() >= timeout_dur {
