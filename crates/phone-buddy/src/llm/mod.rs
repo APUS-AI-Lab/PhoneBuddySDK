@@ -14,13 +14,13 @@ pub mod transport;
 pub mod types;
 pub mod wire;
 
-pub use client::{LlmClient, LlmTransportObj};
+pub use client::{LlmClient, LlmTransportObj, LlmTurnSession};
 pub use dumper::{HttpDumpConfig, HttpDumpMode, HttpDumper};
 pub use host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
 pub use profiles::{
     build_profile_headers, get_profile_definition, render_user_agent, ClientProfile,
     ClientProfileDefinition,
 };
-pub use transport::{HttpTransport, MockTransport, MockTurn};
+pub use transport::{HttpTransport, LlmTurnContext, MockTransport, MockTurn};
 pub use types::*;
 

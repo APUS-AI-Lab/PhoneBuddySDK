@@ -6,7 +6,7 @@
 //! demo and tests so the whole agent loop can run without an API key.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::Stream;
@@ -22,6 +22,37 @@ use crate::llm::wire::adapter_for;
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, EngineError>> + Send>>;
 
+/// Ephemeral, logical-turn-scoped transport state.
+///
+/// A fresh context must be created for every main-agent or subagent turn. It
+/// may be reused by all LLM calls inside that turn (for example, after a tool
+/// result), but must never be shared with another turn. State is keyed by the
+/// concrete transport so provider failover cannot carry host-bound tokens to
+/// a different endpoint.
+#[derive(Clone, Default)]
+pub struct LlmTurnContext {
+    turn_states: Arc<Mutex<std::collections::HashMap<String, String>>>,
+}
+
+impl LlmTurnContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn turn_state(&self, transport_key: &str) -> Option<String> {
+        self.turn_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(transport_key).cloned())
+    }
+
+    pub(crate) fn set_turn_state(&self, transport_key: &str, state: String) {
+        if let Ok(mut states) = self.turn_states.lock() {
+            states.insert(transport_key.to_string(), state);
+        }
+    }
+}
+
 /// A transport turns a chat-completion request into a stream of chunks.
 ///
 /// Implementations must surface HTTP status information through
@@ -30,6 +61,17 @@ pub type ChunkStream =
 pub trait LlmTransport: Send + Sync {
     fn request_stream(&self, req: &ConversationRequest)
         -> impl std::future::Future<Output = EngineResult<ChunkStream>> + Send;
+
+    /// Request within a logical agent turn. Implementations with ephemeral
+    /// server-side affinity state may override this; stateless transports use
+    /// the ordinary request path.
+    fn request_stream_in_context<'a>(
+        &'a self,
+        req: &'a ConversationRequest,
+        _context: &'a LlmTurnContext,
+    ) -> futures_util::future::BoxFuture<'a, EngineResult<ChunkStream>> {
+        Box::pin(self.request_stream(req))
+    }
 
     /// Transport name for diagnostics.
     fn name(&self) -> &str;
@@ -93,8 +135,9 @@ pub struct HttpTransport {
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     /// Opt into server doom-loop recovery (Responses API).
     doom_loop_enabled: bool,
-    /// Sticky routing state (x-codex-turn-state) captured from server response headers
-    turn_state: Arc<std::sync::RwLock<Option<String>>>,
+    /// Unique key for turn-scoped sticky routing state. A random key prevents
+    /// two separately configured providers on the same host from sharing it.
+    turn_state_key: String,
     /// HTTP Traffic Dumper for diagnostics
     dumper: crate::llm::dumper::HttpDumper,
 }
@@ -208,28 +251,10 @@ impl HttpTransport {
             client_session_id,
             extra_headers,
             extra_body,
-            doom_loop_enabled: doom_loop_enabled
-                && matches!(api_backend, ApiBackend::Responses),
-            turn_state: Arc::new(std::sync::RwLock::new(None)),
+            doom_loop_enabled: doom_loop_enabled && matches!(api_backend, ApiBackend::Responses),
+            turn_state_key: uuid::Uuid::new_v4().to_string(),
             dumper,
         })
-    }
-
-    /// Retrieve the current sticky routing token (`x-codex-turn-state`), if recorded.
-    pub fn turn_state(&self) -> Option<String> {
-        self.turn_state.read().ok().and_then(|g| g.clone())
-    }
-
-    /// Explicitly set the sticky routing token (`x-codex-turn-state`).
-    pub fn set_turn_state(&self, state: Option<String>) {
-        if let Ok(mut g) = self.turn_state.write() {
-            *g = state;
-        }
-    }
-
-    /// Clear the sticky routing token (`x-codex-turn-state`).
-    pub fn clear_turn_state(&self) {
-        self.set_turn_state(None);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -264,10 +289,11 @@ pub fn merge_extra_body(
     }
 }
 
-impl LlmTransport for HttpTransport {
-    async fn request_stream(
+impl HttpTransport {
+    async fn request_stream_in_context_inner(
         &self,
         req: &ConversationRequest,
+        context: &LlmTurnContext,
     ) -> EngineResult<ChunkStream> {
         let adapter = adapter_for(self.api_backend);
         let endpoint = self.endpoint_for_model(&req.model);
@@ -289,8 +315,8 @@ impl LlmTransport for HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
         }
 
-        // Attach sticky routing token (x-codex-turn-state) if present
-        if let Some(ts) = self.turn_state() {
+        // The token is scoped to this exact transport and logical agent turn.
+        if let Some(ts) = context.turn_state(&self.turn_state_key) {
             builder = builder.header("x-codex-turn-state", &ts);
             req_headers_map.insert(
                 "x-codex-turn-state".into(),
@@ -399,10 +425,10 @@ impl LlmTransport for HttpTransport {
             }
         };
 
-        // Capture sticky routing token from response headers if present
+        // Capture sticky routing token for later requests in this logical turn.
         if let Some(ts_val) = resp.headers().get("x-codex-turn-state") {
             if let Ok(ts_str) = ts_val.to_str() {
-                self.set_turn_state(Some(ts_str.to_string()));
+                context.set_turn_state(&self.turn_state_key, ts_str.to_string());
             }
         }
 
@@ -546,6 +572,24 @@ impl LlmTransport for HttpTransport {
         };
 
         Ok(Box::pin(chunk_stream))
+    }
+}
+
+impl LlmTransport for HttpTransport {
+    async fn request_stream(
+        &self,
+        req: &ConversationRequest,
+    ) -> EngineResult<ChunkStream> {
+        let context = LlmTurnContext::new();
+        self.request_stream_in_context_inner(req, &context).await
+    }
+
+    fn request_stream_in_context<'a>(
+        &'a self,
+        req: &'a ConversationRequest,
+        context: &'a LlmTurnContext,
+    ) -> futures_util::future::BoxFuture<'a, EngineResult<ChunkStream>> {
+        Box::pin(self.request_stream_in_context_inner(req, context))
     }
 
     fn name(&self) -> &str {
@@ -777,8 +821,201 @@ mod tests {
         HostedTool, SearchParameters, ToolDefinitionWire,
     };
 
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                return headers.into_owned();
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     fn conv(req: ChatCompletionRequest) -> ConversationRequest {
         ConversationRequest::from_chat(req)
+    }
+
+    #[tokio::test]
+    async fn codex_turn_state_header_is_scoped_to_one_logical_turn() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_headers = Arc::new(Mutex::new(Vec::new()));
+        let server_headers = observed_headers.clone();
+        let server = tokio::spawn(async move {
+            for response_number in 1..=3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = read_http_request(&mut socket).await;
+                server_headers.lock().unwrap().push(headers);
+
+                let body = "data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-codex-turn-state: state-{response_number}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let transport = HttpTransport::new(
+            &format!("http://{address}/v1"),
+            "test-key",
+            Duration::from_secs(2),
+            ApiBackend::Responses,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let request = conv(ChatCompletionRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("Hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        });
+
+        let first_turn = LlmTurnContext::new();
+        for context in [&first_turn, &first_turn, &LlmTurnContext::new()] {
+            let mut response = transport
+                .request_stream_in_context(&request, context)
+                .await
+                .unwrap();
+            while response.next().await.is_some() {}
+        }
+        server.await.unwrap();
+
+        let headers = observed_headers.lock().unwrap();
+        assert!(!headers[0]
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-state:"));
+        assert!(headers[1]
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-state: state-1"));
+        assert!(!headers[2]
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-state:"));
+    }
+
+    #[test]
+    fn turn_context_state_is_keyed_by_transport() {
+        let context = LlmTurnContext::new();
+        context.set_turn_state("transport-a", "token-a".into());
+        context.set_turn_state("transport-b", "token-b".into());
+        assert_eq!(
+            context.turn_state("transport-a").as_deref(),
+            Some("token-a")
+        );
+        assert_eq!(
+            context.turn_state("transport-b").as_deref(),
+            Some("token-b")
+        );
+        assert_eq!(LlmTurnContext::new().turn_state("transport-a"), None);
+    }
+
+    #[tokio::test]
+    async fn codex_turn_state_does_not_cross_transports_in_the_same_turn() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_headers = Arc::new(Mutex::new(Vec::new()));
+        let server_headers = observed_headers.clone();
+        let server = tokio::spawn(async move {
+            for response_number in 1..=4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = read_http_request(&mut socket).await;
+                server_headers.lock().unwrap().push(headers);
+
+                let body = "data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-codex-turn-state: state-{response_number}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{address}/v1");
+        let transport_a = HttpTransport::new(
+            &url,
+            "test-key",
+            Duration::from_secs(2),
+            ApiBackend::Responses,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let transport_b = HttpTransport::new(
+            &url,
+            "test-key",
+            Duration::from_secs(2),
+            ApiBackend::Responses,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let request = conv(ChatCompletionRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("Hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        });
+        let context = LlmTurnContext::new();
+
+        for transport in [&transport_a, &transport_b, &transport_a, &transport_b] {
+            let mut response = transport
+                .request_stream_in_context(&request, &context)
+                .await
+                .unwrap();
+            while response.next().await.is_some() {}
+        }
+        server.await.unwrap();
+
+        let headers = observed_headers.lock().unwrap();
+        let lower: Vec<String> = headers.iter().map(|h| h.to_ascii_lowercase()).collect();
+        assert!(!lower[0].contains("x-codex-turn-state:"));
+        assert!(!lower[1].contains("x-codex-turn-state:"));
+        assert!(lower[2].contains("x-codex-turn-state: state-1"));
+        assert!(lower[3].contains("x-codex-turn-state: state-2"));
+        assert!(!lower[3].contains("x-codex-turn-state: state-1"));
     }
 
     #[test]
@@ -1633,4 +1870,3 @@ mod tests {
         );
     }
 }
-

@@ -625,6 +625,7 @@ impl PhoneBuddyEngine {
         // Shell action-stationarity: identical tool-call step runs.
         // Ported from grok-build `IdenticalToolCallRun` (turn.rs).
         let mut identical = IdenticalToolCallRun::default();
+        let llm_turn = self.client.begin_turn();
 
         loop {
             turns_used += 1;
@@ -650,7 +651,7 @@ impl PhoneBuddyEngine {
                 _ = token.cancelled() => {
                     return Err(EngineError::Cancelled);
                 }
-                res = self.client.complete(&request, observer.as_ref()) => {
+                res = llm_turn.complete(&request, observer.as_ref()) => {
                     res?
                 }
             };

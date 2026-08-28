@@ -116,11 +116,20 @@ chain on the next `createEngine`.
 
 ## 4. Cross-model history
 
-The engine never uses `previous_response_id` / server-stored sessions
-(same as grok-build: that field is always `None`). Every request
-re-encodes the full in-memory `ChatMessage` history for the target
-backend. Continuity comes from replaying the conversation items,
-including Responses reasoning siblings (`rs_*` id + `encrypted_content`).
+Normal user turns do not carry `previous_response_id` across turns. Every
+request can re-encode the full local conversation-item history for the target
+backend, and that local history remains the source of truth. The Responses
+SSE idle-timeout recovery path may reuse a captured response ID once on the
+exact same provider to continue the same logical LLM operation; provider
+failover clears it.
+
+Likewise, the `x-codex-turn-state` routing header is scoped to one logical
+main-agent or subagent turn and one exact transport. It may be reused by
+retries and tool-loop hops inside that turn, but never crosses user turns,
+providers, or concurrently running subagents.
+
+Continuity otherwise comes from replaying the conversation items, including
+Responses reasoning siblings (`rs_*` id + `encrypted_content`).
 
 Assistant turns are tagged with a compatibility key `{provider_group}/{model}`.
 `provider_group` defaults to the client profile name (`grok_build`,

@@ -341,6 +341,7 @@ impl TaskManager {
         let mut total_tool_calls = 0u32;
         let mut final_text = String::new();
         let mut failed = false;
+        let llm_turn = self.client.begin_turn();
 
         while turns_used < max_turns {
             if cancel_token.is_cancelled() {
@@ -399,7 +400,7 @@ impl TaskManager {
             };
 
             let observer = NullObserver;
-            match self.client.complete(&request, &observer).await {
+            match llm_turn.complete(&request, &observer).await {
                 Ok(turn) => {
                     let origin = self.client.origin_fingerprint();
                     let mut turn_items = turn.items.clone();

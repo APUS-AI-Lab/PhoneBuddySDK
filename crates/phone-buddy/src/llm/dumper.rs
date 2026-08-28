@@ -137,6 +137,7 @@ impl HttpDumper {
             || lower == "set-cookie"
             || lower == "proxy-authorization"
             || lower == "x-auth-token"
+            || lower == "x-codex-turn-state"
     }
 
     /// Mask sensitive values (e.g. `Bearer sk-1234567890abcdef` -> `Bearer sk-1***cdef`).
@@ -298,6 +299,10 @@ mod tests {
         assert_eq!(
             dumper.mask_header_value("x-api-key", "secret123456"),
             "secr***3456"
+        );
+        assert_eq!(
+            dumper.mask_header_value("x-codex-turn-state", "turn-state-secret"),
+            "turn***cret"
         );
         assert_eq!(
             dumper.mask_header_value("X-Custom-Header", "unmasked-value"),

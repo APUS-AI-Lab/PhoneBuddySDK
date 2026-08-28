@@ -28,7 +28,7 @@ use crate::llm::retry::{
     RetryClass, RATE_LIMIT_RETRY_THRESHOLD,
 };
 use crate::llm::stream::{collect_stream, CollectStreamError};
-use crate::llm::transport::{retry_class_for_error, LlmTransport};
+use crate::llm::transport::{retry_class_for_error, LlmTransport, LlmTurnContext};
 use crate::llm::types::{
     drop_colliding_function_tools, CollectedTurn, ConversationRequest, HostedTool,
 };
@@ -44,6 +44,28 @@ pub struct LlmClient {
     /// Independent budget for server doom-loop resamples (default 2).
     doom_loop_max_retries: u32,
     last_success: Mutex<Option<String>>,
+}
+
+/// A logical main-agent or subagent turn.
+///
+/// Reusing this value across the tool loop keeps provider-specific ephemeral
+/// state available inside the turn. Creating a new value guarantees that the
+/// state cannot leak into another user turn or concurrently running subagent.
+pub struct LlmTurnSession<'a> {
+    client: &'a LlmClient,
+    context: LlmTurnContext,
+}
+
+impl LlmTurnSession<'_> {
+    pub async fn complete(
+        &self,
+        req: &ConversationRequest,
+        observer: &dyn AgentObserver,
+    ) -> EngineResult<CollectedTurn> {
+        self.client
+            .complete_in_context(req, observer, &self.context)
+            .await
+    }
 }
 
 struct ProviderSlot {
@@ -68,6 +90,13 @@ pub trait LlmTransportObj: Send + Sync {
         &'a self,
         req: &'a ConversationRequest,
     ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>>;
+    fn request_stream_in_context_boxed<'a>(
+        &'a self,
+        req: &'a ConversationRequest,
+        _context: &'a LlmTurnContext,
+    ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>> {
+        self.request_stream_boxed(req)
+    }
     fn name(&self) -> &str;
 }
 
@@ -77,6 +106,13 @@ impl<T: LlmTransport> LlmTransportObj for T {
         req: &'a ConversationRequest,
     ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>> {
         Box::pin(self.request_stream(req))
+    }
+    fn request_stream_in_context_boxed<'a>(
+        &'a self,
+        req: &'a ConversationRequest,
+        context: &'a LlmTurnContext,
+    ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>> {
+        self.request_stream_in_context(req, context)
     }
     fn name(&self) -> &str {
         <Self as LlmTransport>::name(self)
@@ -104,6 +140,14 @@ enum ProviderAttemptError {
 }
 
 impl LlmClient {
+    /// Start an isolated logical agent turn.
+    pub fn begin_turn(&self) -> LlmTurnSession<'_> {
+        LlmTurnSession {
+            client: self,
+            context: LlmTurnContext::new(),
+        }
+    }
+
     pub fn new(transport: Arc<dyn LlmTransportObj>, max_retries: u32) -> Self {
         let fingerprint = transport.name().to_string();
         Self {
@@ -268,6 +312,15 @@ impl LlmClient {
         req: &ConversationRequest,
         observer: &dyn AgentObserver,
     ) -> EngineResult<CollectedTurn> {
+        self.begin_turn().complete(req, observer).await
+    }
+
+    async fn complete_in_context(
+        &self,
+        req: &ConversationRequest,
+        observer: &dyn AgentObserver,
+        context: &LlmTurnContext,
+    ) -> EngineResult<CollectedTurn> {
         let chain_mode = self.chain_mode();
         let mut tried: Vec<usize> = Vec::new();
         let mut last_error: Option<EngineError> = None;
@@ -296,7 +349,7 @@ impl LlmClient {
             };
 
             match self
-                .try_provider(slot, &rewritten, &skipper, chain_mode)
+                .try_provider(slot, &rewritten, &skipper, chain_mode, context)
                 .await
             {
                 Ok(turn) => {
@@ -363,6 +416,7 @@ impl LlmClient {
         req: &ConversationRequest,
         observer: &PrefixSkippingObserver<'_>,
         chain_mode: bool,
+        context: &LlmTurnContext,
     ) -> Result<CollectedTurn, ProviderAttemptError> {
         let max_attempts = if chain_mode {
             self.failover_max_attempts.max(1)
@@ -377,7 +431,11 @@ impl LlmClient {
         let mut prefix: Option<CollectedTurn> = None;
         loop {
             attempt += 1;
-            match slot.transport.request_stream_boxed(&live_req).await {
+            match slot
+                .transport
+                .request_stream_in_context_boxed(&live_req, context)
+                .await
+            {
                 Ok(stream) => match collect_stream(stream, observer).await {
                     Ok(turn) => {
                         let turn = match &prefix {
@@ -1008,6 +1066,58 @@ mod tests {
         }
     }
 
+    struct ContextProbeTransport {
+        observed: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ContextProbeTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                observed: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl LlmTransport for ContextProbeTransport {
+        async fn request_stream(
+            &self,
+            _req: &ConversationRequest,
+        ) -> EngineResult<crate::llm::transport::ChunkStream> {
+            let stream = async_stream::stream! {
+                let mut delta = ChatChunkDelta::default();
+                delta.role = Some(Role::Assistant);
+                delta.content = Some("ok".into());
+                yield Ok(ChatCompletionChunk {
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta,
+                        finish_reason: Some("stop".into()),
+                    }],
+                    ..Default::default()
+                });
+            };
+            Ok(Box::pin(stream))
+        }
+
+        fn request_stream_in_context<'a>(
+            &'a self,
+            req: &'a ConversationRequest,
+            context: &'a LlmTurnContext,
+        ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>>
+        {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(context.turn_state("probe"));
+            context.set_turn_state("probe", "sticky".to_string());
+            Box::pin(self.request_stream(req))
+        }
+
+        fn name(&self) -> &str {
+            "context-probe"
+        }
+    }
+
     fn req() -> ConversationRequest {
         ConversationRequest {
             model: "m".into(),
@@ -1024,6 +1134,54 @@ mod tests {
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn logical_turn_context_is_reused_but_never_crosses_turns() {
+        let transport = ContextProbeTransport::new();
+        let client = LlmClient::new(transport.clone(), 1);
+        let observer = RecordingObserver::new();
+        let request = req();
+
+        // Main agent plus two concurrent subagents each own a context.
+        let main = client.begin_turn();
+        let subagent_one = client.begin_turn();
+        let subagent_two = client.begin_turn();
+
+        let first = tokio::join!(
+            main.complete(&request, &observer),
+            subagent_one.complete(&request, &observer),
+            subagent_two.complete(&request, &observer),
+        );
+        first.0.unwrap();
+        first.1.unwrap();
+        first.2.unwrap();
+
+        let second = tokio::join!(
+            main.complete(&request, &observer),
+            subagent_one.complete(&request, &observer),
+            subagent_two.complete(&request, &observer),
+        );
+        second.0.unwrap();
+        second.1.unwrap();
+        second.2.unwrap();
+
+        // LlmClient::complete starts a fresh turn and must not inherit tokens.
+        client.complete(&request, &observer).await.unwrap();
+
+        let observed = transport.observed.lock().unwrap().clone();
+        assert_eq!(observed.len(), 7);
+        assert!(
+            observed[..3].iter().all(Option::is_none),
+            "concurrent first hops must not share turn state: {observed:?}"
+        );
+        assert!(
+            observed[3..6]
+                .iter()
+                .all(|state| state.as_deref() == Some("sticky")),
+            "same-turn hops must reuse turn state: {observed:?}"
+        );
+        assert_eq!(observed[6], None);
     }
 
     #[tokio::test]
