@@ -286,6 +286,27 @@ impl LlmTransport for HttpTransport {
 
         let mut body = adapter.build_payload(req)?;
 
+        if matches!(self.api_backend, ApiBackend::Messages) {
+            if body
+                .get("output_config")
+                .and_then(|o| o.get("effort"))
+                .is_some()
+            {
+                let beta_key = "anthropic-beta";
+                let effort_beta = "effort-2025-11-24";
+                let current = req_headers_map.get(beta_key).cloned();
+                let new_val = match current {
+                    Some(ref v) if !v.contains(effort_beta) => format!("{v},{effort_beta}"),
+                    Some(v) => v,
+                    None => effort_beta.to_string(),
+                };
+                builder = builder.header(beta_key, &new_val);
+                req_headers_map.insert(
+                    beta_key.to_string(),
+                    self.dumper.mask_header_value(beta_key, &new_val),
+                );
+            }
+        }
 
         merge_extra_body(&mut body, &self.extra_body);
         req_headers_map.insert("content-type".to_string(), "application/json".to_string());
@@ -1025,6 +1046,63 @@ mod tests {
         let msg_payload = crate::llm::wire::messages::build_messages_payload(&conv(req)).unwrap();
         assert_eq!(msg_payload["output_config"]["effort"], "medium");
         assert_eq!(msg_payload["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn messages_payload_model_aware_effort_opus_and_sonnet() {
+        // Opus 4.6 allows 'max' effort
+        let req_opus = ChatCompletionRequest {
+            model: "claude-opus-4-6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some(crate::llm::types::ReasoningEffort::Max),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let opus_payload = crate::llm::wire::messages::build_messages_payload(&conv(req_opus)).unwrap();
+        assert_eq!(opus_payload["output_config"]["effort"], "max");
+        assert_eq!(opus_payload["thinking"]["type"], "adaptive");
+
+        // Sonnet 4.6 clamps 'max' and 'xhigh' to 'high' for Claude Code / API compatibility
+        let req_sonnet = ChatCompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some(crate::llm::types::ReasoningEffort::Max),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let sonnet_payload = crate::llm::wire::messages::build_messages_payload(&conv(req_sonnet)).unwrap();
+        assert_eq!(sonnet_payload["output_config"]["effort"], "high");
+        assert_eq!(sonnet_payload["thinking"]["type"], "adaptive");
+
+        // None reasoning_effort omits output_config and thinking
+        let req_none = ChatCompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some(crate::llm::types::ReasoningEffort::None),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let none_payload = crate::llm::wire::messages::build_messages_payload(&conv(req_none)).unwrap();
+        assert!(none_payload.get("output_config").is_none());
+        assert!(none_payload.get("thinking").is_none());
     }
 
     #[test]

@@ -90,12 +90,35 @@ impl ReasoningEffort {
         }
     }
 
-    /// Convert to Messages API string. None/Minimal are omitted on Anthropic Messages API.
-    pub fn to_messages_api(self) -> Option<&'static str> {
+    /// Convert to Anthropic Messages API effort level string (`output_config.effort`).
+    /// - `None` and `Minimal` omit the effort field.
+    /// - `Low`, `Medium`, `High` map 1:1.
+    /// - `Max` is only supported on Opus 4.6+ models in Anthropic API; on other models
+    ///   (such as Sonnet 4.6) it is clamped to `high` conforming to Claude Code `resolveAppliedEffort`.
+    /// - `XHigh` (from OpenAI/xAI specs) maps to `max` on Opus 4.6+, or clamps to `high` otherwise.
+    pub fn to_messages_api_for_model(self, model: &str) -> Option<&'static str> {
+        let is_opus = {
+            let m = model.to_ascii_lowercase();
+            m.contains("opus-4-6") || m.contains("opus-4")
+        };
         match self {
             Self::None | Self::Minimal => None,
-            _ => Some(self.as_str()),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh | Self::Max => {
+                if is_opus {
+                    Some("max")
+                } else {
+                    Some("high")
+                }
+            }
         }
+    }
+
+    /// Convert to Messages API string (defaults safely to standard levels without model context).
+    pub fn to_messages_api(self) -> Option<&'static str> {
+        self.to_messages_api_for_model("")
     }
 }
 
@@ -1167,4 +1190,38 @@ mod output_item_tests {
             other => panic!("expected backend future_call, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_reasoning_effort_messages_api_model_mapping() {
+        assert_eq!(ReasoningEffort::None.to_messages_api(), None);
+        assert_eq!(ReasoningEffort::Minimal.to_messages_api(), None);
+        assert_eq!(ReasoningEffort::Low.to_messages_api(), Some("low"));
+        assert_eq!(ReasoningEffort::Medium.to_messages_api(), Some("medium"));
+        assert_eq!(ReasoningEffort::High.to_messages_api(), Some("high"));
+
+        // Max and XHigh on Opus 4.6 resolve to "max"
+        assert_eq!(
+            ReasoningEffort::Max.to_messages_api_for_model("claude-opus-4-6"),
+            Some("max")
+        );
+        assert_eq!(
+            ReasoningEffort::XHigh.to_messages_api_for_model("claude-opus-4-6"),
+            Some("max")
+        );
+
+        // Max and XHigh on Sonnet / non-Opus models clamp to "high" (Claude Code resolveAppliedEffort compatibility)
+        assert_eq!(
+            ReasoningEffort::Max.to_messages_api_for_model("claude-sonnet-4-6"),
+            Some("high")
+        );
+        assert_eq!(
+            ReasoningEffort::XHigh.to_messages_api_for_model("claude-sonnet-4-6"),
+            Some("high")
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_messages_api_for_model("claude-3-7-sonnet"),
+            Some("high")
+        );
+    }
 }
+

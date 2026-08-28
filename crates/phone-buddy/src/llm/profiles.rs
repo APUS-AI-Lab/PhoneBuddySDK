@@ -143,7 +143,7 @@ pub fn get_profile_definition(profile: ClientProfile) -> ClientProfileDefinition
             );
             headers.insert(
                 "anthropic-beta".to_string(),
-                "ccr-byoc-2025-07-29,prompt-caching-2024-07-31".to_string(),
+                "ccr-byoc-2025-07-29,prompt-caching-2024-07-31,effort-2025-11-24,claude-code-20250219".to_string(),
             );
             ClientProfileDefinition {
                 profile,
@@ -154,6 +154,8 @@ pub fn get_profile_definition(profile: ClientProfile) -> ClientProfileDefinition
                 anthropic_betas: vec![
                     "ccr-byoc-2025-07-29".to_string(),
                     "prompt-caching-2024-07-31".to_string(),
+                    "effort-2025-11-24".to_string(),
+                    "claude-code-20250219".to_string(),
                 ],
                 default_headers: headers,
             }
@@ -284,6 +286,7 @@ mod tests {
         assert_eq!(h_claude.get("x-app").unwrap(), "cli");
         assert_eq!(h_claude.get("x-claude-code-session-id").unwrap(), "sess-123");
         assert_eq!(h_claude.get("x-api-key").unwrap(), "test_key");
+        assert!(h_claude.get("anthropic-beta").unwrap().contains("effort-2025-11-24"));
 
         let h_grok = build_profile_headers(
             ClientProfile::GrokBuild,

@@ -169,7 +169,10 @@ pub fn build_messages_payload(req: &ConversationRequest) -> EngineResult<serde_j
         payload["tools"] = serde_json::Value::Array(tools_val);
     }
 
-    if let Some(effort) = req.reasoning_effort.and_then(|e| e.to_messages_api()) {
+    if let Some(effort) = req
+        .reasoning_effort
+        .and_then(|e| e.to_messages_api_for_model(&req.model))
+    {
         payload["output_config"] = serde_json::json!({
             "effort": effort
         });
