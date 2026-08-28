@@ -21,10 +21,7 @@ pub enum ApiBackend {
 
 impl ApiBackend {
     pub fn supports_native_schema(&self) -> bool {
-        matches!(
-            self,
-            Self::ChatCompletions | Self::Responses | Self::Gemini
-        )
+        matches!(self, Self::ChatCompletions | Self::Responses | Self::Gemini)
     }
 
     pub fn requires_reasoning_strip(&self) -> bool {
@@ -705,10 +702,11 @@ pub struct XSearchOptions {
 
 impl XSearchOptions {
     pub fn is_empty(&self) -> bool {
-        let from = self
-            .from_date
-            .as_deref()
-            .or_else(|| self.date_bound.as_ref().and_then(|b| b.from_date.as_deref()));
+        let from = self.from_date.as_deref().or_else(|| {
+            self.date_bound
+                .as_ref()
+                .and_then(|b| b.from_date.as_deref())
+        });
         let to = self
             .to_date
             .as_deref()
@@ -717,10 +715,11 @@ impl XSearchOptions {
     }
 
     pub fn to_tool_entry(&self) -> serde_json::Value {
-        let from = self
-            .from_date
-            .as_deref()
-            .or_else(|| self.date_bound.as_ref().and_then(|b| b.from_date.as_deref()));
+        let from = self.from_date.as_deref().or_else(|| {
+            self.date_bound
+                .as_ref()
+                .and_then(|b| b.from_date.as_deref())
+        });
         let to = self
             .to_date
             .as_deref()
@@ -747,9 +746,7 @@ pub struct WebSearchOptions {
 
 impl WebSearchOptions {
     pub fn is_empty(&self) -> bool {
-        self.allowed_domains
-            .as_ref()
-            .map_or(true, |d| d.is_empty())
+        self.allowed_domains.as_ref().map_or(true, |d| d.is_empty())
             && self
                 .excluded_domains
                 .as_ref()
@@ -855,12 +852,8 @@ pub struct CustomToolCallOutputItem {
 /// function tools are dropped from the same request so the two do not collide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostedTool {
-    WebSearch {
-        options: Option<WebSearchOptions>,
-    },
-    XSearch {
-        options: Option<XSearchOptions>,
-    },
+    WebSearch { options: Option<WebSearchOptions> },
+    XSearch { options: Option<XSearchOptions> },
 }
 
 impl HostedTool {
@@ -891,13 +884,7 @@ impl HostedTool {
         enable_x_search: bool,
         api_backend: ApiBackend,
     ) -> Vec<Self> {
-        Self::for_request_with_options(
-            enable_web_search,
-            None,
-            enable_x_search,
-            None,
-            api_backend,
-        )
+        Self::for_request_with_options(enable_web_search, None, enable_x_search, None, api_backend)
     }
 
     /// Creates hosted tools with their respective options for the Responses API request.
@@ -1334,6 +1321,12 @@ pub struct CollectedTurn {
     pub response_id: Option<String>,
     /// Terminal `response.output` snapshot, consumed by `finalize_turn`.
     pub final_output: Option<Vec<OutputItemWire>>,
+    /// Stable app-supplied provider id of the slot that finished this turn.
+    pub provider_id: String,
+    /// Logical LLM operation id (retry/failover grouping).
+    pub operation_id: String,
+    /// Transport requests spent producing this turn (including failovers).
+    pub attempts: u32,
 }
 
 impl CollectedTurn {
@@ -1393,10 +1386,9 @@ impl CollectedTurn {
                 .iter()
                 .find_map(|r| r.encrypted_content.clone())
                 .or_else(|| {
-                    self.items.iter().find_map(|i| {
-                        i.as_assistant()
-                            .and_then(|a| a.encrypted_reasoning.clone())
-                    })
+                    self.items
+                        .iter()
+                        .find_map(|i| i.as_assistant().and_then(|a| a.encrypted_reasoning.clone()))
                 });
         }
         if self.reasoning.is_empty() {
@@ -1454,7 +1446,11 @@ mod output_item_tests {
             "arguments": "{\"path\":\"a\"}"
         });
         match parse_output_item(&fc) {
-            Some(OutputItemWire::FunctionCall { call_id, name, arguments }) => {
+            Some(OutputItemWire::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            }) => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(name, "read_file");
                 assert_eq!(arguments, "{\"path\":\"a\"}");
@@ -1468,7 +1464,11 @@ mod output_item_tests {
             "action": {"type": "search", "query": "apus"}
         });
         match parse_output_item(&ws) {
-            Some(OutputItemWire::Backend { item_type, id, payload }) => {
+            Some(OutputItemWire::Backend {
+                item_type,
+                id,
+                payload,
+            }) => {
                 assert_eq!(item_type, "web_search_call");
                 assert_eq!(id, "ws_1");
                 assert_eq!(payload, ws);
@@ -1482,7 +1482,11 @@ mod output_item_tests {
             "foo": "bar"
         });
         match parse_output_item(&future) {
-            Some(OutputItemWire::Backend { item_type, id, payload }) => {
+            Some(OutputItemWire::Backend {
+                item_type,
+                id,
+                payload,
+            }) => {
                 assert_eq!(item_type, "future_call");
                 assert_eq!(id, "fut_1");
                 assert_eq!(payload, future);
@@ -1524,4 +1528,3 @@ mod output_item_tests {
         );
     }
 }
-

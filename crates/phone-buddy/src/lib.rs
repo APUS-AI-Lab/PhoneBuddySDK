@@ -57,7 +57,7 @@ pub mod prelude {
         RouterHealthConfig, MAIN_POOL_ID, SUBAGENT_POOL_ID,
     };
     pub use crate::llm::types::{ApiBackend, ReasoningEffort};
-    pub use crate::runtime::PhoneBuddyRuntime;
+    pub use crate::runtime::{GenerateTextRequest, GenerateTextResult, PhoneBuddyRuntime};
     pub use crate::session::SessionMeta;
 }
 

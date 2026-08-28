@@ -15,6 +15,10 @@ interface EventListener {
     fun onEvent(eventJson: String)
 }
 
+interface GenerateTextListener {
+    fun onComplete(envelopeJson: String)
+}
+
 interface HostToolListener {
     fun onHostToolRequest(callId: String, name: String, argumentsJson: String)
 }
@@ -49,12 +53,17 @@ data class StoredSessionData(
     val messages: List<StoredChatMessage>
 )
 
-class NativeAgent(configJson: String, context: Context? = null) : AutoCloseable {
+class NativeAgent : AutoCloseable {
     private var enginePtr: Long = 0
     private var hostToolListener: HostToolListener? = null
 
-    init {
+    constructor(configJson: String, context: Context? = null) {
         enginePtr = nativeNewEngine(configJson)
+        context?.let { enableSystemWebView(it) }
+    }
+
+    internal constructor(existingPtr: Long, context: Context? = null) {
+        enginePtr = existingPtr
         context?.let { enableSystemWebView(it) }
     }
 
@@ -309,6 +318,78 @@ class NativeAgent(configJson: String, context: Context? = null) : AutoCloseable 
 
         @JvmStatic
         private external fun nativeSetSystemPromptExtra(enginePtr: Long, extra: String?)
+    }
+}
+
+class NativeRuntime(routingJson: String, rootDir: String) : AutoCloseable {
+    private var runtimePtr: Long = 0
+
+    init {
+        runtimePtr = nativeNew(routingJson, rootDir)
+    }
+
+    fun updateRouting(routingJson: String) {
+        check(runtimePtr != 0L) { "Runtime closed" }
+        nativeUpdateRouting(runtimePtr, routingJson)
+    }
+
+    fun createEngine(configJson: String, mainPoolId: String = "main", context: Context? = null): NativeAgent {
+        check(runtimePtr != 0L) { "Runtime closed" }
+        val ptr = nativeCreateEngine(runtimePtr, configJson, mainPoolId)
+        check(ptr != 0L) { "Engine creation failed" }
+        return NativeAgent(ptr, context)
+    }
+
+    fun generateText(requestJson: String, listener: GenerateTextListener? = null): String {
+        check(runtimePtr != 0L) { "Runtime closed" }
+        return nativeGenerateTextAsync(runtimePtr, requestJson, listener)
+            ?: throw IllegalStateException("generateText returned no operation id")
+    }
+
+    fun cancel(operationId: String) {
+        if (runtimePtr != 0L) {
+            nativeCancelOperation(runtimePtr, operationId)
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        if (runtimePtr != 0L) {
+            nativeFree(runtimePtr)
+            runtimePtr = 0L
+        }
+    }
+
+    companion object {
+        init {
+            System.loadLibrary("phone_buddy_ffi")
+        }
+
+        @JvmStatic
+        private external fun nativeNew(routingJson: String, rootDir: String): Long
+
+        @JvmStatic
+        private external fun nativeFree(runtimePtr: Long)
+
+        @JvmStatic
+        private external fun nativeUpdateRouting(runtimePtr: Long, routingJson: String)
+
+        @JvmStatic
+        private external fun nativeCreateEngine(
+            runtimePtr: Long,
+            configJson: String,
+            mainPoolId: String?
+        ): Long
+
+        @JvmStatic
+        private external fun nativeGenerateTextAsync(
+            runtimePtr: Long,
+            requestJson: String,
+            listener: GenerateTextListener?
+        ): String?
+
+        @JvmStatic
+        private external fun nativeCancelOperation(runtimePtr: Long, operationId: String)
     }
 }
 

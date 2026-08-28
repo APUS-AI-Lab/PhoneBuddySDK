@@ -104,6 +104,73 @@ pub enum EngineError {
         pool_id: String,
         tried_provider_ids: Vec<String>,
     },
+
+    #[error("operation timed out")]
+    OperationTimedOut,
+
+    #[error("operation cancelled")]
+    OperationCancelled,
+}
+
+impl EngineError {
+    /// Stable kind name for FFI / wrapper matching. Does not include secrets.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "Config",
+            Self::Llm(_) => "Llm",
+            Self::Stream(_) => "Stream",
+            Self::StreamIdleTimeout(_) => "StreamIdleTimeout",
+            Self::EmptyResponse => "EmptyResponse",
+            Self::Tool { .. } => "Tool",
+            Self::ToolNotFound(_) => "ToolNotFound",
+            Self::ToolArgs { .. } => "ToolArgs",
+            Self::SandboxEscape(_) => "SandboxEscape",
+            Self::SessionNotFound(_) => "SessionNotFound",
+            Self::Cancelled => "Cancelled",
+            Self::MaxTurnsReached(_) => "MaxTurnsReached",
+            Self::DoomLoop(_) => "DoomLoop",
+            Self::DoomLoopServer(_) => "DoomLoopServer",
+            Self::Script(_) => "Script",
+            Self::Io(_) => "Io",
+            Self::Serde(_) => "Serde",
+            Self::InvalidUserTurn(_) => "InvalidUserTurn",
+            Self::AttachmentMissing(_) => "AttachmentMissing",
+            Self::AttachmentInvalid(_, _) => "AttachmentInvalid",
+            Self::TooManyImages(_) => "TooManyImages",
+            Self::TooManyAudio(_) => "TooManyAudio",
+            Self::VisionUnsupported => "VisionUnsupported",
+            Self::AudioUnsupported => "AudioUnsupported",
+            Self::PayloadTooLarge => "PayloadTooLarge",
+            Self::InvalidRoutingConfig(_) => "InvalidRoutingConfig",
+            Self::RouteNotConfigured { .. } => "RouteNotConfigured",
+            Self::PoolExhausted { .. } => "PoolExhausted",
+            Self::ProviderAttemptsExhausted { .. } => "ProviderAttemptsExhausted",
+            Self::OperationTimedOut => "OperationTimedOut",
+            Self::OperationCancelled => "OperationCancelled",
+        }
+    }
+
+    /// Extra JSON fields for a versioned one-shot error envelope. Never includes API keys.
+    pub fn envelope_fields(&self) -> serde_json::Value {
+        match self {
+            Self::RouteNotConfigured { pool_id } => serde_json::json!({ "pool_id": pool_id }),
+            Self::PoolExhausted {
+                pool_id,
+                retry_after_ms,
+            } => serde_json::json!({
+                "pool_id": pool_id,
+                "retry_after_ms": retry_after_ms,
+            }),
+            Self::ProviderAttemptsExhausted {
+                pool_id,
+                tried_provider_ids,
+            } => serde_json::json!({
+                "pool_id": pool_id,
+                "tried_provider_ids": tried_provider_ids,
+            }),
+            _ => serde_json::json!({}),
+        }
+    }
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

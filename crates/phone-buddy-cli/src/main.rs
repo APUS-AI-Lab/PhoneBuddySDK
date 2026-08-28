@@ -7,6 +7,7 @@
 //! - `chat`      — real LLM mode; reads PHONEBUDDY_API_KEY,
 //!                 PHONEBUDDY_BASE_URL (default https://api.x.ai/v1),
 //!                 PHONEBUDDY_MODEL (default grok-3).
+//! - `generate`  — tool-free one-shot text via PhoneBuddyRuntime (no session).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,7 +135,11 @@ fn run_mock() -> anyhow::Result<()> {
     let transport = MockTransport::new(turns);
     let engine = PhoneBuddyEngine::with_transport(cfg, transport)?;
 
-    let outcome = engine.chat("demo-session", "Analyze the sales data in data/sales.csv", Some(Arc::new(PrintObserver)))?;
+    let outcome = engine.chat(
+        "demo-session",
+        "Analyze the sales data in data/sales.csv",
+        Some(Arc::new(PrintObserver)),
+    )?;
     println!("\n=== final report ===\n{}", outcome.final_text);
     println!("turns used: {}", outcome.turns_used);
     Ok(())
@@ -250,12 +255,65 @@ fn run_chat(
     Ok(())
 }
 
+fn run_generate(input: &str, pool_id: &str) -> anyhow::Result<()> {
+    let api_key = std::env::var("PHONEBUDDY_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("set PHONEBUDDY_API_KEY to use generate mode"))?;
+    let mut builder = EngineConfig::builder()
+        .api_key(api_key)
+        .model(std::env::var("PHONEBUDDY_MODEL").unwrap_or_else(|_| "grok-3".into()))
+        .root_dir(demo_root());
+    if let Ok(url) = std::env::var("PHONEBUDDY_BASE_URL") {
+        builder = builder.url(url);
+    }
+    let cfg = builder.build().map_err(|e| anyhow::anyhow!(e))?;
+    let runtime = PhoneBuddyRuntime::from_engine_config(&cfg)?;
+    let result = runtime.generate_text_blocking(
+        GenerateTextRequest {
+            pool_id: pool_id.to_string(),
+            instructions: None,
+            input: input.to_string(),
+            max_output_tokens: Some(256),
+            temperature: Some(0.2),
+            reasoning_effort: None,
+            response_format: None,
+            timeout_ms: Some(30_000),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )?;
+    println!("{}", result.text);
+    eprintln!(
+        "provider={} model={} attempts={} op={} pool={}",
+        result.provider_id, result.model, result.attempts, result.operation_id, result.pool_id
+    );
+    Ok(())
+}
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None | Some("mock") => run_mock(),
         Some("self-test") => run_self_test(),
+        Some("generate") => {
+            let mut pool_id = MAIN_POOL_ID.to_string();
+            let mut input_parts = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--pool" => {
+                        pool_id = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--pool requires a pool id"))?;
+                    }
+                    _ => input_parts.push(arg),
+                }
+            }
+            let input = input_parts.join(" ");
+            if input.is_empty() {
+                anyhow::bail!("usage: phone-buddy-demo generate [--pool ID] \"<prompt>\"");
+            }
+            run_generate(&input, &pool_id)
+        }
         Some("chat") => {
             let mut fallbacks = Vec::new();
             let mut input_parts = Vec::new();
@@ -271,16 +329,16 @@ fn main() -> anyhow::Result<()> {
                         })?);
                     }
                     "--fallback-url" => {
-                        let url = args.next().ok_or_else(|| {
-                            anyhow::anyhow!("--fallback-url requires a URL")
-                        })?;
+                        let url = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--fallback-url requires a URL"))?;
                         let key = std::env::var("PHONEBUDDY_FALLBACK_API_KEY")
                             .ok()
                             .filter(|s| !s.is_empty())
                             .or_else(|| std::env::var("PHONEBUDDY_API_KEY").ok())
                             .unwrap_or_default();
-                        let model = std::env::var("PHONEBUDDY_FALLBACK_MODEL")
-                            .unwrap_or_else(|_| {
+                        let model =
+                            std::env::var("PHONEBUDDY_FALLBACK_MODEL").unwrap_or_else(|_| {
                                 std::env::var("PHONEBUDDY_MODEL")
                                     .unwrap_or_else(|_| "grok-3".into())
                             });
@@ -292,9 +350,9 @@ fn main() -> anyhow::Result<()> {
                         });
                     }
                     "--fallback-model" => {
-                        let model = args.next().ok_or_else(|| {
-                            anyhow::anyhow!("--fallback-model requires a value")
-                        })?;
+                        let model = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--fallback-model requires a value"))?;
                         if let Some(last) = fallbacks.last_mut() {
                             last.model = model;
                         } else {
@@ -302,9 +360,9 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     "--fallback-key" => {
-                        let key = args.next().ok_or_else(|| {
-                            anyhow::anyhow!("--fallback-key requires a value")
-                        })?;
+                        let key = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--fallback-key requires a value"))?;
                         if let Some(last) = fallbacks.last_mut() {
                             last.api_key = key;
                         } else {
@@ -323,9 +381,9 @@ fn main() -> anyhow::Result<()> {
             run_chat(&input, fallbacks, reasoning_effort)
         }
         Some("dump-items") => {
-            let session_id = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: phone-buddy-demo dump-items <session-id>"))?;
+            let session_id = args.next().ok_or_else(|| {
+                anyhow::anyhow!("usage: phone-buddy-demo dump-items <session-id>")
+            })?;
             let root = demo_root();
             let cfg = EngineConfig {
                 api_key: "dump".into(),

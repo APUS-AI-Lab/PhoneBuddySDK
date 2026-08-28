@@ -14,6 +14,20 @@
 typedef struct PbEngine PbEngine;
 
 /**
+ * Opaque long-lived routing runtime handle.
+ */
+typedef struct PbRuntime PbRuntime;
+
+/**
+ * One-shot `generate_text` completion callback.
+ *
+ * `envelope_json` is a versioned JSON object valid only for the duration of
+ * the call. Copy it if you keep it. Invoked from a background worker thread.
+ * Do not reuse chat session event callbacks for this.
+ */
+typedef void (*PbOperationCallback)(const char *envelope_json, void *user_data);
+
+/**
  * Streaming event callback.
  *
  * `event_json` is a UTF-8 JSON string describing one [`AgentEvent`].
@@ -90,6 +104,70 @@ struct PbEngine *pb_engine_new(const char *config_json, char **err_out);
  * `engine` must be a handle returned by [`pb_engine_new`], or null.
  */
 void pb_engine_free(struct PbEngine *engine);
+
+/**
+ * Create a long-lived routing runtime from a JSON [`LlmRoutingConfig`].
+ *
+ * # Safety
+ * `routing_config_json` and `root_dir` must be valid C strings. `err_out` may be null.
+ */
+struct PbRuntime *pb_runtime_new(const char *routing_config_json,
+                                 const char *root_dir,
+                                 char **err_out);
+
+/**
+ * Replace routing on an existing runtime. In-flight operations may finish
+ * on a previously captured snapshot.
+ *
+ * Returns 0 on success.
+ *
+ * # Safety
+ * `runtime` must be a handle from [`pb_runtime_new`]. `routing_config_json` must be a valid C string.
+ */
+int32_t pb_runtime_update_routing(struct PbRuntime *runtime,
+                                  const char *routing_config_json,
+                                  char **err_out);
+
+/**
+ * Create an engine bound to `runtime`. `main_pool_id` defaults to `"main"` when null.
+ *
+ * # Safety
+ * `runtime` must outlive the returned engine. `agent_config_json` must be valid.
+ */
+struct PbEngine *pb_engine_new_with_runtime(struct PbRuntime *runtime,
+                                            const char *agent_config_json,
+                                            const char *main_pool_id,
+                                            char **err_out);
+
+/**
+ * Start tool-free one-shot generation. Returns `operation_id` immediately.
+ * Completion is delivered through `callback` as a versioned JSON envelope.
+ *
+ * # Safety
+ * `runtime` and `request_json` must be valid. `callback` may be null (result discarded).
+ * The callback and `user_data` must remain valid until the envelope is delivered.
+ */
+char *pb_runtime_generate_text_async(struct PbRuntime *runtime,
+                                     const char *request_json,
+                                     PbOperationCallback callback,
+                                     void *user_data,
+                                     char **err_out);
+
+/**
+ * Cancel a one-shot operation started by [`pb_runtime_generate_text_async`].
+ *
+ * # Safety
+ * `runtime` and `operation_id` may be null (no-op).
+ */
+void pb_runtime_cancel_operation(struct PbRuntime *runtime, const char *operation_id);
+
+/**
+ * Free a runtime handle. Outstanding one-shot operations are cancelled.
+ *
+ * # Safety
+ * `runtime` must be a handle returned by [`pb_runtime_new`], or null.
+ */
+void pb_runtime_free(struct PbRuntime *runtime);
 
 /**
  * Run one chat turn to completion (blocking). Call from a background

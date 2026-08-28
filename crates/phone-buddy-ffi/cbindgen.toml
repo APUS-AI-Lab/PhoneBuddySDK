@@ -37,5 +37,17 @@ exclude = [
     "Java_org_phonebuddy_NativeAgent_nativeWebViewResult",
     "Java_org_phonebuddy_NativeAgent_nativeSetAgentName",
     "Java_org_phonebuddy_NativeAgent_nativeSetSystemPromptExtra",
+    "pb_jni_nativeNewRuntime",
+    "pb_jni_nativeFreeRuntime",
+    "pb_jni_nativeUpdateRouting",
+    "pb_jni_nativeCreateEngine",
+    "pb_jni_nativeGenerateTextAsync",
+    "pb_jni_nativeCancelOperation",
+    "Java_org_phonebuddy_NativeRuntime_nativeNew",
+    "Java_org_phonebuddy_NativeRuntime_nativeFree",
+    "Java_org_phonebuddy_NativeRuntime_nativeUpdateRouting",
+    "Java_org_phonebuddy_NativeRuntime_nativeCreateEngine",
+    "Java_org_phonebuddy_NativeRuntime_nativeGenerateTextAsync",
+    "Java_org_phonebuddy_NativeRuntime_nativeCancelOperation",
 ]
 

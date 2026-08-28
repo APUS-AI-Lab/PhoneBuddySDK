@@ -353,6 +353,191 @@ Java_org_phonebuddy_NativeAgent_nativeWebViewResult(
     return (jint)res;
 }
 
+typedef struct {
+    JavaVM *vm;
+    jobject listener;
+    jmethodID on_complete_mid;
+} GenerateTextJniContext;
+
+static void generate_text_jni_cb(const char *envelope_json, void *user_data) {
+    GenerateTextJniContext *ctx = (GenerateTextJniContext *)user_data;
+    if (!ctx) {
+        return;
+    }
+    JNIEnv *env = NULL;
+    int did_attach = 0;
+    if (ctx->vm) {
+        jint status = (*ctx->vm)->GetEnv(ctx->vm, (void **)&env, JNI_VERSION_1_6);
+        if (status == JNI_EDETACHED) {
+            if ((*ctx->vm)->AttachCurrentThread(ctx->vm, &env, NULL) == 0) {
+                did_attach = 1;
+            } else {
+                env = NULL;
+            }
+        } else if (status != JNI_OK) {
+            env = NULL;
+        }
+    }
+    if (env && ctx->listener && ctx->on_complete_mid && envelope_json) {
+        jstring j_env = (*env)->NewStringUTF(env, envelope_json);
+        if (j_env) {
+            (*env)->CallVoidMethod(env, ctx->listener, ctx->on_complete_mid, j_env);
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+            }
+            (*env)->DeleteLocalRef(env, j_env);
+        }
+    }
+    if (env && ctx->listener) {
+        (*env)->DeleteGlobalRef(env, ctx->listener);
+        ctx->listener = NULL;
+    }
+    if (did_attach && ctx->vm) {
+        (*ctx->vm)->DetachCurrentThread(ctx->vm);
+    }
+    free(ctx);
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeNew(JNIEnv *env, jclass clazz, jstring routing_json, jstring root_dir) {
+    (void)clazz;
+    const char *c_routing = (*env)->GetStringUTFChars(env, routing_json, NULL);
+    const char *c_root = (*env)->GetStringUTFChars(env, root_dir, NULL);
+    char *err_out = NULL;
+    PbRuntime *runtime = pb_runtime_new(c_routing, c_root, &err_out);
+    (*env)->ReleaseStringUTFChars(env, routing_json, c_routing);
+    (*env)->ReleaseStringUTFChars(env, root_dir, c_root);
+    if (err_out != NULL) {
+        jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
+        (*env)->ThrowNew(env, ex_cls, err_out);
+        pb_string_free(err_out);
+        return 0;
+    }
+    return (jlong)runtime;
+}
+
+JNIEXPORT void JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeFree(JNIEnv *env, jclass clazz, jlong runtime_ptr) {
+    (void)env;
+    (void)clazz;
+    if (runtime_ptr != 0) {
+        pb_runtime_free((PbRuntime *)runtime_ptr);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeUpdateRouting(JNIEnv *env, jclass clazz, jlong runtime_ptr, jstring routing_json) {
+    (void)clazz;
+    if (runtime_ptr == 0) {
+        return;
+    }
+    const char *c_routing = (*env)->GetStringUTFChars(env, routing_json, NULL);
+    char *err_out = NULL;
+    int rc = pb_runtime_update_routing((PbRuntime *)runtime_ptr, c_routing, &err_out);
+    (*env)->ReleaseStringUTFChars(env, routing_json, c_routing);
+    if (rc != 0 && err_out != NULL) {
+        jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
+        (*env)->ThrowNew(env, ex_cls, err_out);
+        pb_string_free(err_out);
+    } else if (err_out != NULL) {
+        pb_string_free(err_out);
+    }
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeCreateEngine(
+    JNIEnv *env, jclass clazz, jlong runtime_ptr, jstring config_json, jstring main_pool_id
+) {
+    (void)clazz;
+    if (runtime_ptr == 0) {
+        return 0;
+    }
+    const char *c_config = (*env)->GetStringUTFChars(env, config_json, NULL);
+    const char *c_pool = main_pool_id ? (*env)->GetStringUTFChars(env, main_pool_id, NULL) : NULL;
+    char *err_out = NULL;
+    PbEngine *engine = pb_engine_new_with_runtime(
+        (PbRuntime *)runtime_ptr, c_config, c_pool, &err_out
+    );
+    (*env)->ReleaseStringUTFChars(env, config_json, c_config);
+    if (main_pool_id) {
+        (*env)->ReleaseStringUTFChars(env, main_pool_id, c_pool);
+    }
+    if (err_out != NULL) {
+        jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
+        (*env)->ThrowNew(env, ex_cls, err_out);
+        pb_string_free(err_out);
+        return 0;
+    }
+    return (jlong)engine;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeGenerateTextAsync(
+    JNIEnv *env, jclass clazz, jlong runtime_ptr, jstring request_json, jobject listener
+) {
+    (void)clazz;
+    if (runtime_ptr == 0) {
+        return NULL;
+    }
+    const char *c_req = (*env)->GetStringUTFChars(env, request_json, NULL);
+    char *err_out = NULL;
+    GenerateTextJniContext *ctx = NULL;
+    PbOperationCallback cb = NULL;
+    if (listener != NULL) {
+        ctx = (GenerateTextJniContext *)calloc(1, sizeof(GenerateTextJniContext));
+        if (ctx == NULL) {
+            (*env)->ReleaseStringUTFChars(env, request_json, c_req);
+            return NULL;
+        }
+        (*env)->GetJavaVM(env, &ctx->vm);
+        ctx->listener = (*env)->NewGlobalRef(env, listener);
+        jclass l_cls = (*env)->GetObjectClass(env, listener);
+        ctx->on_complete_mid = (*env)->GetMethodID(env, l_cls, "onComplete", "(Ljava/lang/String;)V");
+        cb = generate_text_jni_cb;
+    }
+    char *op = pb_runtime_generate_text_async(
+        (PbRuntime *)runtime_ptr, c_req, cb, ctx, &err_out
+    );
+    (*env)->ReleaseStringUTFChars(env, request_json, c_req);
+    if (err_out != NULL) {
+        if (ctx) {
+            if (ctx->listener) {
+                (*env)->DeleteGlobalRef(env, ctx->listener);
+            }
+            free(ctx);
+        }
+        jclass ex_cls = (*env)->FindClass(env, "java/lang/RuntimeException");
+        (*env)->ThrowNew(env, ex_cls, err_out);
+        pb_string_free(err_out);
+        return NULL;
+    }
+    if (op == NULL) {
+        if (ctx) {
+            if (ctx->listener) {
+                (*env)->DeleteGlobalRef(env, ctx->listener);
+            }
+            free(ctx);
+        }
+        return NULL;
+    }
+    jstring res = (*env)->NewStringUTF(env, op);
+    pb_string_free(op);
+    return res;
+}
+
+JNIEXPORT void JNICALL
+Java_org_phonebuddy_NativeRuntime_nativeCancelOperation(
+    JNIEnv *env, jclass clazz, jlong runtime_ptr, jstring operation_id
+) {
+    (void)clazz;
+    if (runtime_ptr == 0 || operation_id == NULL) {
+        return;
+    }
+    const char *c_op = (*env)->GetStringUTFChars(env, operation_id, NULL);
+    pb_runtime_cancel_operation((PbRuntime *)runtime_ptr, c_op);
+    (*env)->ReleaseStringUTFChars(env, operation_id, c_op);
+}
+
 void phone_buddy_jni_link_anchor(void) {
 }
 

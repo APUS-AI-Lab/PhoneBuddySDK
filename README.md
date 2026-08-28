@@ -237,7 +237,50 @@ int main(void) {
 
 ---
 
-### 4. Local CLI Testing Tool (`phone-buddy-cli`)
+### 4. Long-lived runtime and one-shot `generate_text`
+
+`PhoneBuddyRuntime` owns routing pools, provider health, and retry/failover. It is longer-lived than a single `PhoneBuddyEngine`. Recreating an engine against the same runtime keeps cooldown state.
+
+`generate_text` is a tool-free, session-free one-shot call. It reuses the SDK router, wire adapters, HTTP dumps, and usage parsing. It does **not** run the agent loop, compaction, or tools. The host supplies the pool id (for example `session_title`). A missing pool returns `RouteNotConfigured` — there is no implicit fallback to `main`.
+
+```rust
+use phone_buddy::prelude::*;
+use tokio_util::sync::CancellationToken;
+
+let runtime = PhoneBuddyRuntime::new(routing_config, root_dir)?;
+let engine = runtime.create_engine(agent_config, "main")?;
+let title = runtime.generate_text_blocking(
+    GenerateTextRequest {
+        pool_id: "session_title".into(),
+        instructions: Some("Return a short conversation title.".into()),
+        input: transcript.into(),
+        max_output_tokens: Some(32),
+        temperature: Some(0.2),
+        reasoning_effort: None,
+        response_format: None,
+        timeout_ms: Some(8_000),
+    },
+    CancellationToken::new(),
+)?;
+println!("{} via {} / {}", title.text, title.provider_id, title.model);
+```
+
+C FFI (async completion + cancel; not the chat session callback):
+
+```c
+PbRuntime *rt = pb_runtime_new(routing_json, root_dir, &err);
+PbEngine *engine = pb_engine_new_with_runtime(rt, agent_config_json, "main", &err);
+char *op = pb_runtime_generate_text_async(rt, request_json, on_done, user, &err);
+/* on_done receives {"version":1,"ok":true,"operation_id":"op_...","result":{...}} */
+pb_runtime_cancel_operation(rt, op);
+pb_runtime_free(rt);
+```
+
+`pb_engine_new` remains the compatibility path: it synthesizes a private runtime from primary + `fallback_providers`.
+
+---
+
+### 5. Local CLI Testing Tool (`phone-buddy-cli`)
 
 Use the built-in CLI for local debugging, automated self-tests, and live chat:
 
@@ -250,6 +293,9 @@ cargo run -p phone-buddy-cli -- self-test
 
 # 3. Run real LLM interactive turn
 PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "Analyze the sales numbers"
+
+# 4. Tool-free one-shot generation (uses the synthesized `main` pool unless --pool is set)
+PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- generate "Name this conversation"
 ```
 
 ---

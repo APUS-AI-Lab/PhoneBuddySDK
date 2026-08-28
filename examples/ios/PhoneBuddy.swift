@@ -505,11 +505,211 @@ public struct ChatOutcome: Codable {
     }
 }
 
+public struct GenerateTextRequest: Codable {
+    public var poolId: String
+    public var instructions: String?
+    public var input: String
+    public var maxOutputTokens: UInt32?
+    public var temperature: Float?
+    public var reasoningEffort: String?
+    public var responseFormat: String?
+    public var timeoutMs: UInt64?
+
+    public init(
+        poolId: String,
+        input: String,
+        instructions: String? = nil,
+        maxOutputTokens: UInt32? = nil,
+        temperature: Float? = nil,
+        reasoningEffort: String? = nil,
+        timeoutMs: UInt64? = nil
+    ) {
+        self.poolId = poolId
+        self.input = input
+        self.instructions = instructions
+        self.maxOutputTokens = maxOutputTokens
+        self.temperature = temperature
+        self.reasoningEffort = reasoningEffort
+        self.timeoutMs = timeoutMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case poolId = "pool_id"
+        case instructions
+        case input
+        case maxOutputTokens = "max_output_tokens"
+        case temperature
+        case reasoningEffort = "reasoning_effort"
+        case responseFormat = "response_format"
+        case timeoutMs = "timeout_ms"
+    }
+}
+
+public struct GenerateTextResult: Codable {
+    public let text: String
+    public let providerId: String
+    public let model: String
+    public let attempts: UInt32
+    public let operationId: String
+    public let poolId: String
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case providerId = "provider_id"
+        case model
+        case attempts
+        case operationId = "operation_id"
+        case poolId = "pool_id"
+    }
+}
+
+private final class GenerateTextContext {
+    let continuation: CheckedContinuation<String, Error>
+    init(continuation: CheckedContinuation<String, Error>) {
+        self.continuation = continuation
+    }
+}
+
+/// Long-lived routing runtime. Outlives individual engines so provider health is shared.
+public final class PhoneBuddyRuntime {
+    fileprivate var runtimePtr: OpaquePointer?
+    public private(set) var lastOperationId: String?
+
+    public init(routingJson: String, rootDir: String) throws {
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let handle = pb_runtime_new(routingJson, rootDir, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.engineCreationFailed(msg)
+        }
+        guard let handle = handle else {
+            throw PhoneBuddyError.engineCreationFailed("Unknown null runtime handle")
+        }
+        self.runtimePtr = handle
+    }
+
+    public func updateRouting(routingJson: String) throws {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let rc = pb_runtime_update_routing(ptr, routingJson, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.chatFailed(msg)
+        }
+        if rc != 0 {
+            throw PhoneBuddyError.chatFailed("Failed to update routing")
+        }
+    }
+
+    public func createEngine(config: PhoneBuddyConfig, mainPoolId: String = "main") throws -> PhoneBuddyEngine {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        var config = config
+        config.pinSandboxRoot(config.rootDir)
+        let data = try JSONEncoder().encode(config)
+        guard let jsonString = String(data: data, encoding: .utf8) else {
+            throw PhoneBuddyError.invalidConfig
+        }
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let handle = pb_engine_new_with_runtime(ptr, jsonString, mainPoolId, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.engineCreationFailed(msg)
+        }
+        guard let handle = handle else {
+            throw PhoneBuddyError.engineCreationFailed("Unknown null engine handle")
+        }
+        return PhoneBuddyEngine(adopted: handle)
+    }
+
+    public func generateText(_ request: GenerateTextRequest) async throws -> GenerateTextResult {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        let data = try JSONEncoder().encode(request)
+        guard let jsonString = String(data: data, encoding: .utf8) else {
+            throw PhoneBuddyError.invalidConfig
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            var errOut: UnsafeMutablePointer<CChar>? = nil
+            let context = GenerateTextContext(continuation: continuation)
+            let unmanaged = Unmanaged.passRetained(context)
+            let callback: PbOperationCallback = { envelopeJson, userData in
+                guard let userData = userData else { return }
+                let ctx = Unmanaged<GenerateTextContext>.fromOpaque(userData).takeRetainedValue()
+                guard let envelopeJson = envelopeJson else {
+                    ctx.continuation.resume(throwing: PhoneBuddyError.chatFailed("Null generate_text envelope"))
+                    return
+                }
+                ctx.continuation.resume(returning: String(cString: envelopeJson))
+            }
+            let opPtr = pb_runtime_generate_text_async(
+                ptr,
+                jsonString,
+                callback,
+                unmanaged.toOpaque(),
+                &errOut
+            )
+            if let err = errOut {
+                unmanaged.release()
+                let msg = String(cString: err)
+                pb_string_free(err)
+                continuation.resume(throwing: PhoneBuddyError.chatFailed(msg))
+                return
+            }
+            if let opPtr = opPtr {
+                self.lastOperationId = String(cString: opPtr)
+                pb_string_free(opPtr)
+            } else {
+                unmanaged.release()
+                continuation.resume(throwing: PhoneBuddyError.chatFailed("Null operation id"))
+            }
+        }.parseGenerateTextEnvelope()
+    }
+
+    public func cancel(operationId: String) {
+        if let ptr = runtimePtr {
+            pb_runtime_cancel_operation(ptr, operationId)
+        }
+    }
+
+    deinit {
+        if let ptr = runtimePtr {
+            pb_runtime_free(ptr)
+        }
+    }
+}
+
+private extension String {
+    func parseGenerateTextEnvelope() throws -> GenerateTextResult {
+        guard let data = data(using: .utf8),
+              let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw PhoneBuddyError.chatFailed("Failed to parse generate_text envelope")
+        }
+        let ok = obj["ok"] as? Bool ?? false
+        if !ok {
+            let error = obj["error"] as? [String: Any]
+            let message = error?["message"] as? String ?? "generate_text failed"
+            throw PhoneBuddyError.chatFailed(message)
+        }
+        guard let result = obj["result"] else {
+            throw PhoneBuddyError.chatFailed("Missing generate_text result")
+        }
+        let resultData = try JSONSerialization.data(withJSONObject: result)
+        return try JSONDecoder().decode(GenerateTextResult.self, from: resultData)
+    }
+}
+
 /// Swift wrapper around the native C PhoneBuddy engine.
 public final class PhoneBuddyEngine {
     private var enginePtr: OpaquePointer?
     private let webViewHost = SystemWebViewHost()
     private var hostToolBox: HostToolBox?
+
+    fileprivate init(adopted handle: OpaquePointer) {
+        self.enginePtr = handle
+        self.webViewHost.attach(engine: handle)
+    }
 
     public init(config: PhoneBuddyConfig) throws {
         var config = config

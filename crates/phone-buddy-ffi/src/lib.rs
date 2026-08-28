@@ -10,10 +10,13 @@
 //! React-Native native modules without binding-codegen.
 
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use phone_buddy::engine::PhoneBuddyEngine;
 use phone_buddy::events::{AgentEvent, AgentObserver};
+use phone_buddy::llm::router::{LlmRoutingConfig, MAIN_POOL_ID};
+use phone_buddy::runtime::{GenerateTextRequest, GenerateTextResult, PhoneBuddyRuntime};
 
 /// Streaming event callback.
 ///
@@ -102,11 +105,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HostLogLayer {
 
         struct Visitor(String);
         impl tracing::field::Visit for Visitor {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     use std::fmt::Write;
                     let _ = write!(self.0, "{:?}", value);
@@ -155,6 +154,19 @@ pub struct PbEngine {
     host_user_data: *mut c_void,
     webview_user_data: *mut c_void,
 }
+
+/// Opaque long-lived routing runtime handle.
+pub struct PbRuntime {
+    inner: Arc<PhoneBuddyRuntime>,
+}
+
+/// One-shot `generate_text` completion callback.
+///
+/// `envelope_json` is a versioned JSON object valid only for the duration of
+/// the call. Copy it if you keep it. Invoked from a background worker thread.
+/// Do not reuse chat session event callbacks for this.
+pub type PbOperationCallback =
+    Option<unsafe extern "C" fn(envelope_json: *const c_char, user_data: *mut c_void)>;
 
 // user_data is an opaque host pointer; the host owns lifetime/thread safety.
 unsafe impl Send for PbEngine {}
@@ -205,6 +217,63 @@ unsafe fn set_err(err_out: *mut *mut c_char, msg: String) {
     if !err_out.is_null() {
         *err_out = to_cstring(msg);
     }
+}
+
+fn catch_ptr<T, F: FnOnce() -> *mut T>(f: F) -> *mut T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(std::ptr::null_mut())
+}
+
+fn catch_i32<F: FnOnce() -> i32>(f: F) -> i32 {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(-100)
+}
+
+fn catch_void<F: FnOnce()>(f: F) {
+    let _ = catch_unwind(AssertUnwindSafe(f));
+}
+
+fn generate_ok_envelope(operation_id: &str, result: &GenerateTextResult) -> String {
+    serde_json::json!({
+        "version": 1,
+        "ok": true,
+        "operation_id": operation_id,
+        "result": result,
+    })
+    .to_string()
+}
+
+fn generate_err_envelope(operation_id: &str, err: &phone_buddy::error::EngineError) -> String {
+    let mut error = serde_json::json!({
+        "kind": err.kind(),
+        "message": err.to_string(),
+    });
+    if let serde_json::Value::Object(extra) = err.envelope_fields() {
+        if let Some(map) = error.as_object_mut() {
+            for (k, v) in extra {
+                map.insert(k, v);
+            }
+        }
+    }
+    serde_json::json!({
+        "version": 1,
+        "ok": false,
+        "operation_id": operation_id,
+        "error": error,
+    })
+    .to_string()
+}
+
+fn invoke_operation_callback(
+    callback: PbOperationCallback,
+    user_data: *mut c_void,
+    envelope: String,
+) {
+    let Some(cb) = callback else {
+        return;
+    };
+    let Ok(cstr) = CString::new(envelope) else {
+        return;
+    };
+    unsafe { cb(cstr.as_ptr(), user_data) };
 }
 
 // ── exported API ─────────────────────────────────────────────────────────
@@ -275,6 +344,234 @@ pub unsafe extern "C" fn pb_engine_free(engine: *mut PbEngine) {
     }
 }
 
+/// Create a long-lived routing runtime from a JSON [`LlmRoutingConfig`].
+///
+/// # Safety
+/// `routing_config_json` and `root_dir` must be valid C strings. `err_out` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_new(
+    routing_config_json: *const c_char,
+    root_dir: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut PbRuntime {
+    catch_ptr(|| {
+        let cfg_str = match str_from(routing_config_json) {
+            Some(s) => s,
+            None => {
+                set_err(
+                    err_out,
+                    "routing_config_json is null or invalid UTF-8".into(),
+                );
+                return std::ptr::null_mut();
+            }
+        };
+        let root = match str_from(root_dir) {
+            Some(s) => s,
+            None => {
+                set_err(err_out, "root_dir is null or invalid UTF-8".into());
+                return std::ptr::null_mut();
+            }
+        };
+        let routing: LlmRoutingConfig = match serde_json::from_str(cfg_str) {
+            Ok(c) => c,
+            Err(e) => {
+                set_err(err_out, format!("invalid routing config JSON: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        match PhoneBuddyRuntime::new(routing, root) {
+            Ok(runtime) => {
+                if !err_out.is_null() {
+                    *err_out = std::ptr::null_mut();
+                }
+                Box::into_raw(Box::new(PbRuntime { inner: runtime }))
+            }
+            Err(e) => {
+                set_err(err_out, e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Replace routing on an existing runtime. In-flight operations may finish
+/// on a previously captured snapshot.
+///
+/// Returns 0 on success.
+///
+/// # Safety
+/// `runtime` must be a handle from [`pb_runtime_new`]. `routing_config_json` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_update_routing(
+    runtime: *mut PbRuntime,
+    routing_config_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    catch_i32(|| {
+        let Some(runtime) = runtime.as_ref() else {
+            set_err(err_out, "runtime is null".into());
+            return -1;
+        };
+        let Some(cfg_str) = str_from(routing_config_json) else {
+            set_err(
+                err_out,
+                "routing_config_json is null or invalid UTF-8".into(),
+            );
+            return -2;
+        };
+        let routing: LlmRoutingConfig = match serde_json::from_str(cfg_str) {
+            Ok(c) => c,
+            Err(e) => {
+                set_err(err_out, format!("invalid routing config JSON: {e}"));
+                return -3;
+            }
+        };
+        match runtime.inner.update_routing(routing) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_err(err_out, e.to_string());
+                -4
+            }
+        }
+    })
+}
+
+/// Create an engine bound to `runtime`. `main_pool_id` defaults to `"main"` when null.
+///
+/// # Safety
+/// `runtime` must outlive the returned engine. `agent_config_json` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_new_with_runtime(
+    runtime: *mut PbRuntime,
+    agent_config_json: *const c_char,
+    main_pool_id: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut PbEngine {
+    catch_ptr(|| {
+        let Some(runtime) = runtime.as_ref() else {
+            set_err(err_out, "runtime is null".into());
+            return std::ptr::null_mut();
+        };
+        let Some(cfg_str) = str_from(agent_config_json) else {
+            set_err(err_out, "agent_config_json is null or invalid UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        let cfg: phone_buddy::config::EngineConfig = match serde_json::from_str(cfg_str) {
+            Ok(c) => c,
+            Err(e) => {
+                set_err(err_out, format!("invalid config JSON: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let pool = str_from(main_pool_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(MAIN_POOL_ID);
+        match runtime.inner.create_engine(cfg, pool) {
+            Ok(engine) => {
+                if !err_out.is_null() {
+                    *err_out = std::ptr::null_mut();
+                }
+                Box::into_raw(Box::new(PbEngine {
+                    inner: engine,
+                    host_user_data: std::ptr::null_mut(),
+                    webview_user_data: std::ptr::null_mut(),
+                }))
+            }
+            Err(e) => {
+                set_err(err_out, e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Start tool-free one-shot generation. Returns `operation_id` immediately.
+/// Completion is delivered through `callback` as a versioned JSON envelope.
+///
+/// # Safety
+/// `runtime` and `request_json` must be valid. `callback` may be null (result discarded).
+/// The callback and `user_data` must remain valid until the envelope is delivered.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_generate_text_async(
+    runtime: *mut PbRuntime,
+    request_json: *const c_char,
+    callback: PbOperationCallback,
+    user_data: *mut c_void,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    catch_ptr(|| {
+        let Some(runtime) = runtime.as_ref() else {
+            set_err(err_out, "runtime is null".into());
+            return std::ptr::null_mut();
+        };
+        let Some(req_str) = str_from(request_json) else {
+            set_err(err_out, "request_json is null or invalid UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        let request: GenerateTextRequest = match serde_json::from_str(req_str) {
+            Ok(r) => r,
+            Err(e) => {
+                set_err(err_out, format!("invalid generate_text request JSON: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let ud = user_data as usize;
+        match runtime
+            .inner
+            .generate_text_async(request, move |op, result| {
+                let envelope = match result {
+                    Ok(ok) => generate_ok_envelope(&op, &ok),
+                    Err(e) => generate_err_envelope(&op, &e),
+                };
+                invoke_operation_callback(callback, ud as *mut c_void, envelope);
+            }) {
+            Ok(op) => {
+                if !err_out.is_null() {
+                    *err_out = std::ptr::null_mut();
+                }
+                to_cstring(op)
+            }
+            Err(e) => {
+                set_err(err_out, e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Cancel a one-shot operation started by [`pb_runtime_generate_text_async`].
+///
+/// # Safety
+/// `runtime` and `operation_id` may be null (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_cancel_operation(
+    runtime: *mut PbRuntime,
+    operation_id: *const c_char,
+) {
+    catch_void(|| {
+        let Some(runtime) = runtime.as_ref() else {
+            return;
+        };
+        let Some(op) = str_from(operation_id) else {
+            return;
+        };
+        runtime.inner.cancel_operation(op);
+    });
+}
+
+/// Free a runtime handle. Outstanding one-shot operations are cancelled.
+///
+/// # Safety
+/// `runtime` must be a handle returned by [`pb_runtime_new`], or null.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_free(runtime: *mut PbRuntime) {
+    catch_void(|| {
+        if !runtime.is_null() {
+            drop(Box::from_raw(runtime));
+        }
+    });
+}
+
 /// Run one chat turn to completion (blocking). Call from a background
 /// thread; streaming events are delivered via `callback` as they happen.
 ///
@@ -316,7 +613,10 @@ pub unsafe extern "C" fn pb_engine_chat(
     };
 
     let observer: Option<Arc<dyn AgentObserver>> = if callback.is_some() {
-        Some(Arc::new(FfiObserver { callback, user_data }))
+        Some(Arc::new(FfiObserver {
+            callback,
+            user_data,
+        }))
     } else {
         None
     };
@@ -380,7 +680,10 @@ pub unsafe extern "C" fn pb_engine_chat_v2(
     };
 
     let observer: Option<Arc<dyn AgentObserver>> = if callback.is_some() {
-        Some(Arc::new(FfiObserver { callback, user_data }))
+        Some(Arc::new(FfiObserver {
+            callback,
+            user_data,
+        }))
     } else {
         None
     };
@@ -538,11 +841,7 @@ pub unsafe extern "C" fn pb_engine_set_host_callbacks(
                 return;
             };
             unsafe {
-                cb(
-                    id_c.as_ptr(),
-                    json_c.as_ptr(),
-                    ud as *mut c_void,
-                );
+                cb(id_c.as_ptr(), json_c.as_ptr(), ud as *mut c_void);
             }
         }) as phone_buddy::llm::HostLlmNotify
     });
@@ -708,11 +1007,7 @@ pub unsafe extern "C" fn pb_engine_host_tool_result(
         return -2;
     };
     let output = str_from(output).unwrap_or("");
-    match engine
-        .inner
-        .host_tools()
-        .complete(call_id, ok != 0, output)
-    {
+    match engine.inner.host_tools().complete(call_id, ok != 0, output) {
         Ok(()) => 0,
         Err(e) => {
             set_err(err_out, e);
@@ -782,7 +1077,11 @@ pub unsafe extern "C" fn pb_engine_webview_result(
         return -2;
     };
     let output = str_from(output).unwrap_or("");
-    match engine.inner.webview_host().complete(call_id, ok != 0, output) {
+    match engine
+        .inner
+        .webview_host()
+        .complete(call_id, ok != 0, output)
+    {
         Ok(()) => 0,
         Err(e) => {
             set_err(err_out, e);
@@ -814,10 +1113,7 @@ pub unsafe extern "C" fn pb_engine_set_system_prompt_extra(
 ///
 /// Pass null or empty `name` to reset to the default (`PhoneBuddy`).
 #[no_mangle]
-pub unsafe extern "C" fn pb_engine_set_agent_name(
-    engine: *mut PbEngine,
-    name: *const c_char,
-) {
+pub unsafe extern "C" fn pb_engine_set_agent_name(engine: *mut PbEngine, name: *const c_char) {
     let Some(engine) = engine.as_ref() else {
         return;
     };
@@ -892,7 +1188,11 @@ pub mod android_jni {
 
     extern "C" {
         fn pb_jni_on_load(vm: *mut c_void, reserved: *mut c_void) -> i32;
-        fn pb_jni_nativeNewEngine(env: *mut c_void, clazz: *mut c_void, config_json: *mut c_void) -> i64;
+        fn pb_jni_nativeNewEngine(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            config_json: *mut c_void,
+        ) -> i64;
         fn pb_jni_nativeFreeEngine(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
         fn pb_jni_nativeChat(
             env: *mut c_void,
@@ -916,7 +1216,11 @@ pub mod android_jni {
             engine_ptr: i64,
             session_id: *mut c_void,
         ) -> *mut c_void;
-        fn pb_jni_nativeListSessions(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64) -> *mut c_void;
+        fn pb_jni_nativeListSessions(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+        ) -> *mut c_void;
         fn pb_jni_nativeDeleteSession(
             env: *mut c_void,
             clazz: *mut c_void,
@@ -925,7 +1229,12 @@ pub mod android_jni {
         ) -> i32;
         fn pb_jni_nativeSetWebViewCallback(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
         fn pb_jni_nativeClearWebViewCallback(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
-        fn pb_jni_nativeCancel(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64, session_id: *mut c_void);
+        fn pb_jni_nativeCancel(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            engine_ptr: i64,
+            session_id: *mut c_void,
+        );
         fn pb_jni_nativeSetHostCallbacks(env: *mut c_void, clazz: *mut c_void, engine_ptr: i64);
         fn pb_jni_nativeHostToolResult(
             env: *mut c_void,
@@ -954,6 +1263,39 @@ pub mod android_jni {
             clazz: *mut c_void,
             engine_ptr: i64,
             extra: *mut c_void,
+        );
+        fn pb_jni_nativeNewRuntime(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            routing_json: *mut c_void,
+            root_dir: *mut c_void,
+        ) -> i64;
+        fn pb_jni_nativeFreeRuntime(env: *mut c_void, clazz: *mut c_void, runtime_ptr: i64);
+        fn pb_jni_nativeUpdateRouting(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            runtime_ptr: i64,
+            routing_json: *mut c_void,
+        );
+        fn pb_jni_nativeCreateEngine(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            runtime_ptr: i64,
+            config_json: *mut c_void,
+            main_pool_id: *mut c_void,
+        ) -> i64;
+        fn pb_jni_nativeGenerateTextAsync(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            runtime_ptr: i64,
+            request_json: *mut c_void,
+            listener: *mut c_void,
+        ) -> *mut c_void;
+        fn pb_jni_nativeCancelOperation(
+            env: *mut c_void,
+            clazz: *mut c_void,
+            runtime_ptr: i64,
+            operation_id: *mut c_void,
         );
     }
 
@@ -1113,6 +1455,67 @@ pub mod android_jni {
     ) {
         pb_jni_nativeSetSystemPromptExtra(env, clazz, engine_ptr, extra);
     }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeNew(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        routing_json: *mut c_void,
+        root_dir: *mut c_void,
+    ) -> i64 {
+        pb_jni_nativeNewRuntime(env, clazz, routing_json, root_dir)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeFree(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        runtime_ptr: i64,
+    ) {
+        pb_jni_nativeFreeRuntime(env, clazz, runtime_ptr);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeUpdateRouting(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        runtime_ptr: i64,
+        routing_json: *mut c_void,
+    ) {
+        pb_jni_nativeUpdateRouting(env, clazz, runtime_ptr, routing_json);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeCreateEngine(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        runtime_ptr: i64,
+        config_json: *mut c_void,
+        main_pool_id: *mut c_void,
+    ) -> i64 {
+        pb_jni_nativeCreateEngine(env, clazz, runtime_ptr, config_json, main_pool_id)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeGenerateTextAsync(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        runtime_ptr: i64,
+        request_json: *mut c_void,
+        listener: *mut c_void,
+    ) -> *mut c_void {
+        pb_jni_nativeGenerateTextAsync(env, clazz, runtime_ptr, request_json, listener)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_org_phonebuddy_NativeRuntime_nativeCancelOperation(
+        env: *mut c_void,
+        clazz: *mut c_void,
+        runtime_ptr: i64,
+        operation_id: *mut c_void,
+    ) {
+        pb_jni_nativeCancelOperation(env, clazz, runtime_ptr, operation_id);
+    }
 }
 
 #[cfg(test)]
@@ -1184,7 +1587,6 @@ mod tests {
             let extra_c = CString::new("Be extremely concise.").unwrap();
             pb_engine_set_system_prompt_extra(engine, extra_c.as_ptr());
             pb_engine_set_system_prompt_extra(engine, std::ptr::null());
-
 
             // 6. Session APIs
             let mut err: *mut c_char = std::ptr::null_mut();
@@ -1339,11 +1741,7 @@ mod tests {
     static TEST_LOGS: std::sync::Mutex<Vec<(i32, String, String)>> =
         std::sync::Mutex::new(Vec::new());
 
-    unsafe extern "C" fn test_log_cb(
-        level: i32,
-        target: *const c_char,
-        message: *const c_char,
-    ) {
+    unsafe extern "C" fn test_log_cb(level: i32, target: *const c_char, message: *const c_char) {
         let t = if target.is_null() {
             ""
         } else {
@@ -1381,7 +1779,169 @@ mod tests {
             "expected INFO log, got: {logs:?}"
         );
     }
+
+    fn title_routing_json(base_url: &str) -> String {
+        format!(
+            r#"{{
+                "providers": [{{
+                    "provider_id": "light-title",
+                    "base_url": "{base_url}",
+                    "api_key": "secret-must-not-appear",
+                    "model": "light-model",
+                    "api_backend": "chat_completions"
+                }}],
+                "pools": {{
+                    "session_title": {{
+                        "members": [{{
+                            "provider_id": "light-title",
+                            "routing_group": "cheap",
+                            "base_score": 10,
+                            "order": 0,
+                            "enabled": true
+                        }}],
+                        "when_exhausted": "fail_fast"
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    unsafe extern "C" fn generate_done_cb(envelope_json: *const c_char, user_data: *mut c_void) {
+        let tx = &*(user_data as *const std::sync::mpsc::Sender<String>);
+        let s = if envelope_json.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(envelope_json)
+                .to_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        let _ = tx.send(s);
+    }
+
+    #[test]
+    fn test_pb_runtime_new_free_and_null_args() {
+        let dir = tempdir().unwrap();
+        unsafe {
+            pb_runtime_free(std::ptr::null_mut());
+            pb_runtime_cancel_operation(std::ptr::null_mut(), std::ptr::null());
+            pb_runtime_update_routing(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut());
+
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let rt = pb_runtime_new(std::ptr::null(), std::ptr::null(), &mut err);
+            assert!(rt.is_null());
+            assert!(!err.is_null());
+            pb_string_free(err);
+
+            let routing = title_routing_json("http://127.0.0.1:1");
+            let routing_c = CString::new(routing).unwrap();
+            let root_c = CString::new(dir.path().to_string_lossy().as_ref()).unwrap();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let runtime = pb_runtime_new(routing_c.as_ptr(), root_c.as_ptr(), &mut err);
+            assert!(err.is_null(), "runtime new err");
+            assert!(!runtime.is_null());
+
+            let op = pb_runtime_generate_text_async(
+                runtime,
+                std::ptr::null(),
+                None,
+                std::ptr::null_mut(),
+                &mut err,
+            );
+            assert!(op.is_null());
+            assert!(!err.is_null());
+            pb_string_free(err);
+
+            pb_runtime_free(runtime);
+        }
+    }
+
+    #[test]
+    fn test_pb_runtime_generate_text_missing_pool_completes() {
+        let dir = tempdir().unwrap();
+        let routing = r#"{"providers":[],"pools":{}}"#;
+        unsafe {
+            let routing_c = CString::new(routing).unwrap();
+            let root_c = CString::new(dir.path().to_string_lossy().as_ref()).unwrap();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let runtime = pb_runtime_new(routing_c.as_ptr(), root_c.as_ptr(), &mut err);
+            assert!(!runtime.is_null());
+
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let req = CString::new(r#"{"pool_id":"session_title","input":"hello"}"#).unwrap();
+            let op = pb_runtime_generate_text_async(
+                runtime,
+                req.as_ptr(),
+                Some(generate_done_cb),
+                &tx as *const _ as *mut c_void,
+                &mut err,
+            );
+            assert!(!op.is_null(), "expected operation id");
+            assert!(err.is_null());
+            let op_str = CStr::from_ptr(op).to_str().unwrap().to_string();
+            pb_string_free(op);
+
+            let envelope = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(
+                !envelope.contains("secret"),
+                "envelope must not include API keys: {envelope}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+            assert_eq!(v["version"], 1);
+            assert_eq!(v["ok"], false);
+            assert_eq!(v["operation_id"], op_str);
+            assert_eq!(v["error"]["kind"], "RouteNotConfigured");
+            assert_eq!(v["error"]["pool_id"], "session_title");
+
+            pb_runtime_free(runtime);
+        }
+    }
+
+    #[test]
+    fn test_pb_runtime_cancel_does_not_hang() {
+        let dir = tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let routing = title_routing_json(&format!("http://{addr}/v1"));
+        unsafe {
+            let routing_c = CString::new(routing).unwrap();
+            let root_c = CString::new(dir.path().to_string_lossy().as_ref()).unwrap();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let runtime = pb_runtime_new(routing_c.as_ptr(), root_c.as_ptr(), &mut err);
+            assert!(!runtime.is_null());
+
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let req =
+                CString::new(r#"{"pool_id":"session_title","input":"title me","timeout_ms":8000}"#)
+                    .unwrap();
+            let op = pb_runtime_generate_text_async(
+                runtime,
+                req.as_ptr(),
+                Some(generate_done_cb),
+                &tx as *const _ as *mut c_void,
+                &mut err,
+            );
+            assert!(!op.is_null());
+            pb_runtime_cancel_operation(runtime, op);
+            let envelope = rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("cancel must complete the callback");
+            let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+            assert_eq!(v["ok"], false);
+            let kind = v["error"]["kind"].as_str().unwrap_or("");
+            assert!(
+                kind == "OperationCancelled" || kind == "OperationTimedOut" || kind == "Llm",
+                "unexpected kind {kind} envelope={envelope}"
+            );
+            pb_string_free(op);
+            pb_runtime_free(runtime);
+        }
+    }
 }
-
-
-

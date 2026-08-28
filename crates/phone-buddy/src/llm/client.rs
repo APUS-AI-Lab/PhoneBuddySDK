@@ -355,15 +355,26 @@ impl LlmClient {
         if let Some(effort) = slot.reasoning_effort {
             out.reasoning_effort = Some(effort);
         }
-        out.hosted_tools = HostedTool::for_request_with_options(
-            slot.enable_web_search,
-            slot.web_search_options.clone(),
-            slot.enable_x_search,
-            slot.x_search_options.clone(),
-            slot.api_backend,
-        );
-        let tools = out.tools.take().unwrap_or_default();
-        out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
+        let tool_choice_none = out
+            .tool_choice
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("none"));
+        if tool_choice_none {
+            out.tools = None;
+            out.hosted_tools.clear();
+            out.tool_choice = Some(serde_json::json!("none"));
+        } else {
+            out.hosted_tools = HostedTool::for_request_with_options(
+                slot.enable_web_search,
+                slot.web_search_options.clone(),
+                slot.enable_x_search,
+                slot.x_search_options.clone(),
+                slot.api_backend,
+            );
+            let tools = out.tools.take().unwrap_or_default();
+            out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
+        }
         let target = slot.compat_key.as_str();
         out.items = crate::llm::failover::sanitize_items_for_provider(
             &out.items,
@@ -485,12 +496,18 @@ impl LlmClient {
                 .await
             {
                 Ok(turn) => {
-                    let turn = match &continue_from {
+                    let mut turn = match &continue_from {
                         Some(partial) => merge_continued_turn(partial, turn),
                         None => turn,
                     };
                     self.router.record_success(provider_id);
                     *self.last_success.lock().unwrap() = Some(slot.compat_key.clone());
+                    turn.provider_id = provider_id.clone();
+                    turn.operation_id = operation_id.clone();
+                    turn.attempts = tried_ids.len() as u32;
+                    if turn.model.is_empty() {
+                        turn.model = slot.model.clone();
+                    }
                     return Ok(turn);
                 }
                 Err(ProviderAttemptError::Veto(e))
@@ -970,6 +987,17 @@ fn merge_continued_turn(partial: &CollectedTurn, cont: CollectedTurn) -> Collect
         },
         response_id: cont.response_id.or_else(|| partial.response_id.clone()),
         final_output: None,
+        provider_id: if cont.provider_id.is_empty() {
+            partial.provider_id.clone()
+        } else {
+            cont.provider_id
+        },
+        operation_id: if cont.operation_id.is_empty() {
+            partial.operation_id.clone()
+        } else {
+            cont.operation_id
+        },
+        attempts: cont.attempts.max(partial.attempts),
     };
     if merged.items.is_empty() {
         merged.items = synthesize_partial_items(&merged);

@@ -118,7 +118,7 @@ struct CancellationState {
 /// tool callback, and cancellation state cannot leak across conversations.
 /// Sharing only the executor avoids creating a separate Tokio worker pool for
 /// every simultaneous cloud chat while keeping all run state isolated.
-fn shared_runtime() -> EngineResult<Arc<tokio::runtime::Runtime>> {
+pub(crate) fn shared_runtime() -> EngineResult<Arc<tokio::runtime::Runtime>> {
     static RUNTIME: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
         return Ok(runtime.clone());
