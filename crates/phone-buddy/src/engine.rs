@@ -409,6 +409,7 @@ impl PhoneBuddyEngine {
             tool_choice: Some(serde_json::json!("auto")),
             temperature: Some(self.config.temperature),
             max_tokens: Some(self.config.max_output_tokens),
+            reasoning_effort: self.config.reasoning_effort,
             search_parameters: None,
             hosted_tools: hosted,
             previous_response_id: None,

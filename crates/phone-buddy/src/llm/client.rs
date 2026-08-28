@@ -54,6 +54,7 @@ struct ProviderSlot {
     compat_key: String,
     model: String,
     api_backend: crate::llm::types::ApiBackend,
+    reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
     enable_web_search: bool,
     health: Mutex<ProviderHealth>,
 }
@@ -109,6 +110,7 @@ impl LlmClient {
                 compat_key: fingerprint,
                 model: String::new(),
                 api_backend: crate::llm::types::ApiBackend::ChatCompletions,
+                reasoning_effort: None,
                 enable_web_search: false,
                 health: Mutex::new(ProviderHealth::default()),
             }],
@@ -135,6 +137,7 @@ impl LlmClient {
                 compat_key: fingerprint,
                 model,
                 api_backend: crate::llm::types::ApiBackend::ChatCompletions,
+                reasoning_effort: None,
                 enable_web_search: false,
                 health: Mutex::new(ProviderHealth::default()),
             })
@@ -230,6 +233,9 @@ impl LlmClient {
         let mut out = req.clone();
         if !slot.model.is_empty() {
             out.model = slot.model.clone();
+        }
+        if let Some(effort) = slot.reasoning_effort {
+            out.reasoning_effort = Some(effort);
         }
         out.hosted_tools = HostedTool::for_request(slot.enable_web_search, slot.api_backend);
         let tools = out.tools.take().unwrap_or_default();
@@ -846,6 +852,7 @@ fn slot_from_primary(cfg: &EngineConfig) -> EngineResult<ProviderSlot> {
         compat_key: compatibility_key(&group, &cfg.model),
         model: cfg.model.clone(),
         api_backend: cfg.api_backend,
+        reasoning_effort: cfg.reasoning_effort,
         enable_web_search: cfg.enable_web_search,
         health: Mutex::new(ProviderHealth::default()),
         transport,
@@ -874,6 +881,7 @@ fn slot_from_endpoint(
         compat_key: compatibility_key(&group, &ep.model),
         model: ep.model.clone(),
         api_backend: ep.api_backend,
+        reasoning_effort: ep.reasoning_effort.or(cfg.reasoning_effort),
         enable_web_search: ep.enable_web_search,
         health: Mutex::new(ProviderHealth::default()),
         transport,
@@ -988,6 +996,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: Vec::new(),
             previous_response_id: None,

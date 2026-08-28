@@ -301,6 +301,7 @@ let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
 | `locale` | String | 否 | `zh` | UI 语言环境，提示模型回答所用的语言 |
 | `max_turns` | Integer | 否 | `24` | 单轮用户任务的最大工具调用循环轮数 |
 | `temperature` | Float | 否 | `0.2` | 模型采样温度 |
+| `reasoning_effort` | String | 否 | `null` | 思考/推理强度级别（`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `none`）。自动跨 Responses、ChatCompletions 及 Messages 协议适配 |
 | `max_output_tokens` | Integer | 否 | `8192` | 单次输出的最大 Token 限制 |
 | `enable_web_search` | Boolean | 否 | `false` | Responses 主请求是否附加 Grok hosted `{type: web_search}`（对齐 Grok Build `supports_backend_search`）。客户端 DuckDuckGo / `web_search` function tool 独立注册。PackyAPI 等不支持 hosted search 的网关请保持关闭。 |
 | `agent_name` | String | 否 | `PhoneBuddy` | 系统提示词中的身份名（`You are {agent_name}…`）。空值回退为 `PhoneBuddy` |

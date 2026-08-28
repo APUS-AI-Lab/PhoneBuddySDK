@@ -258,6 +258,7 @@ mod schema_tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,

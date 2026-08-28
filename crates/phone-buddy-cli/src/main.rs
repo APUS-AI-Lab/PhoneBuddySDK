@@ -185,7 +185,11 @@ fn run_self_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_chat(input: &str, fallbacks: Vec<ProviderEndpoint>) -> anyhow::Result<()> {
+fn run_chat(
+    input: &str,
+    fallbacks: Vec<ProviderEndpoint>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> anyhow::Result<()> {
     let api_key = std::env::var("PHONEBUDDY_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -220,6 +224,15 @@ fn run_chat(input: &str, fallbacks: Vec<ProviderEndpoint>) -> anyhow::Result<()>
         }
     }
 
+    let effort = reasoning_effort.or_else(|| {
+        std::env::var("PHONEBUDDY_REASONING_EFFORT")
+            .ok()
+            .and_then(|s| ReasoningEffort::from_str(&s))
+    });
+    if let Some(eff) = effort {
+        builder = builder.reasoning_effort(eff);
+    }
+
     if std::env::var("PHONEBUDDY_WEB_SEARCH").as_deref() == Ok("1") {
         builder = builder.enable_web_search(true);
     }
@@ -244,8 +257,17 @@ fn main() -> anyhow::Result<()> {
         Some("chat") => {
             let mut fallbacks = Vec::new();
             let mut input_parts = Vec::new();
+            let mut reasoning_effort = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
+                    "--reasoning-effort" => {
+                        let val = args.next().ok_or_else(|| {
+                            anyhow::anyhow!("--reasoning-effort requires a value (none, minimal, low, medium, high, xhigh, max)")
+                        })?;
+                        reasoning_effort = Some(ReasoningEffort::from_str(&val).ok_or_else(|| {
+                            anyhow::anyhow!("unknown reasoning effort '{val}' (expected none, minimal, low, medium, high, xhigh, max)")
+                        })?);
+                    }
                     "--fallback-url" => {
                         let url = args.next().ok_or_else(|| {
                             anyhow::anyhow!("--fallback-url requires a URL")
@@ -293,10 +315,10 @@ fn main() -> anyhow::Result<()> {
             let input = input_parts.join(" ");
             if input.is_empty() {
                 anyhow::bail!(
-                    "usage: phone-buddy-demo chat [--fallback-url URL] [--fallback-model MODEL] [--fallback-key KEY] \"<your task>\""
+                    "usage: phone-buddy-demo chat [--reasoning-effort EFFORT] [--fallback-url URL] [--fallback-model MODEL] [--fallback-key KEY] \"<your task>\""
                 );
             }
-            run_chat(&input, fallbacks)
+            run_chat(&input, fallbacks, reasoning_effort)
         }
         Some("dump-items") => {
             let session_id = args

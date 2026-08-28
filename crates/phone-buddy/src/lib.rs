@@ -49,7 +49,7 @@ pub mod prelude {
     pub use crate::engine::{ChatOutcome, PhoneBuddyEngine};
     pub use crate::error::{EngineError, EngineResult};
     pub use crate::events::{AgentEvent, AgentObserver, NullObserver, RecordingObserver, UsageSummary};
-    pub use crate::llm::types::ApiBackend;
+    pub use crate::llm::types::{ApiBackend, ReasoningEffort};
     pub use crate::session::SessionMeta;
 }
 

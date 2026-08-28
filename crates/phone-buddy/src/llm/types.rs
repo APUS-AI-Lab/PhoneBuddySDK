@@ -47,6 +47,71 @@ pub enum Role {
     Tool,
 }
 
+// ── Reasoning effort ─────────────────────────────────────────────────────
+
+/// Reasoning effort level for reasoning/thinking models (e.g. low, medium, high).
+/// Matches upstream grok-build and codex `ReasoningEffort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh", alias = "x-high", alias = "x_high")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// Convert to Messages API string. None/Minimal are omitted on Anthropic Messages API.
+    pub fn to_messages_api(self) -> Option<&'static str> {
+        match self {
+            Self::None | Self::Minimal => None,
+            _ => Some(self.as_str()),
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str(s).ok_or_else(|| format!("unknown reasoning effort: {s}"))
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 // ── Reasoning items ───────────────────────────────────────────────────────
 // Ported from upstream grok `rs::ReasoningItem` and `conversation.rs`.
 
@@ -660,6 +725,8 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Unused on the wire. Grok Build always sets this to `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_parameters: Option<SearchParameters>,
@@ -687,6 +754,7 @@ pub struct ConversationRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Unused on the wire. Kept so historical tests and extra-body merges
     /// continue to compile.
     pub search_parameters: Option<SearchParameters>,
@@ -706,6 +774,7 @@ impl ConversationRequest {
             tool_choice: req.tool_choice,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            reasoning_effort: req.reasoning_effort,
             search_parameters: req.search_parameters,
             hosted_tools: req.hosted_tools,
             previous_response_id: req.previous_response_id,
@@ -723,6 +792,7 @@ impl ConversationRequest {
             tool_choice: self.tool_choice.clone(),
             temperature: self.temperature,
             max_tokens: self.max_tokens,
+            reasoning_effort: self.reasoning_effort,
             search_parameters: self.search_parameters.clone(),
             hosted_tools: self.hosted_tools.clone(),
             previous_response_id: self.previous_response_id.clone(),

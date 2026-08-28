@@ -305,6 +305,7 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `locale` | String | No | `zh` | UI locale instructing agent response language |
 | `max_turns` | Integer | No | `24` | Maximum tool loop turns per user turn |
 | `temperature` | Float | No | `0.2` | Model sampling temperature |
+| `reasoning_effort` | String | No | `null` | Reasoning effort level for thinking/reasoning models (`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `none`). Automatically mapped across Responses, ChatCompletions, and Messages backends |
 | `max_output_tokens` | Integer | No | `8192` | Maximum output token generation limit |
 | `enable_web_search` | Boolean | No | `false` | Attach Grok hosted `{type: web_search}` on Responses (Grok Build `supports_backend_search`). Client DuckDuckGo/`web_search` function tool stays registered independently. Leave off for gateways that do not implement hosted search (e.g. PackyAPI). |
 | `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |

@@ -9,7 +9,7 @@ pub use crate::llm::profiles::{
     build_profile_headers, get_profile_definition, render_user_agent, ClientProfile,
     ClientProfileDefinition,
 };
-use crate::llm::types::ApiBackend;
+pub use crate::llm::types::{ApiBackend, ReasoningEffort};
 
 pub use crate::llm::types::ApiBackend as ConfigApiBackend;
 
@@ -63,6 +63,9 @@ pub struct EngineConfig {
     pub temperature: f32,
     #[serde(default = "default_max_tokens")]
     pub max_output_tokens: u32,
+    /// Reasoning effort level for thinking models (e.g. Low, Medium, High).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Attach Grok-style backend-hosted search on the Responses API.
     ///
     /// When true and [`api_backend`] is [`ApiBackend::Responses`], the engine
@@ -169,6 +172,9 @@ pub struct ProviderEndpoint {
     /// client-side DuckDuckGo function tool.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Reasoning effort level for thinking models on this fallback provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Compatibility group; empty inherits this endpoint's `client_profile`.
     #[serde(default)]
     pub provider_group: Option<String>,
@@ -226,6 +232,7 @@ impl Default for EngineConfig {
             max_turns: default_max_turns(),
             temperature: default_temperature(),
             max_output_tokens: default_max_tokens(),
+            reasoning_effort: None,
             enable_web_search: false,
             agent_name: default_agent_name(),
             system_prompt_extra: None,
@@ -495,6 +502,18 @@ impl EngineConfigBuilder {
     /// Set max output tokens per turn.
     pub fn max_output_tokens(mut self, tokens: u32) -> Self {
         self.config.max_output_tokens = tokens;
+        self
+    }
+
+    /// Set reasoning effort level for thinking models (e.g. Low, Medium, High).
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.config.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Set optional reasoning effort level for thinking models.
+    pub fn reasoning_effort_opt(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.config.reasoning_effort = effort;
         self
     }
 

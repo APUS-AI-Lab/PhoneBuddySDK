@@ -343,6 +343,7 @@ mod tests {
             tool_choice: None,
             temperature: Some(0.2),
             max_tokens: Some(1024),
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,

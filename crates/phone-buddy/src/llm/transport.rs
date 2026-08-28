@@ -750,6 +750,7 @@ mod tests {
             tool_choice: None,
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -775,6 +776,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: Some("resp_abc".into()),
@@ -806,6 +808,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: Some(SearchParameters {
                 mode: Some("auto".into()),
                 ..Default::default()
@@ -845,6 +848,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![HostedTool::WebSearch],
             previous_response_id: None,
@@ -881,6 +885,7 @@ mod tests {
             tool_choice: None,
             temperature: Some(0.5),
             max_tokens: Some(2048),
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -937,6 +942,7 @@ mod tests {
             tool_choice: None,
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -968,6 +974,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -975,6 +982,49 @@ mod tests {
         let payload = build_responses_payload(&conv(req)).unwrap();
         assert_eq!(payload["reasoning"]["summary"], "concise");
         assert!(payload["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn responses_payload_includes_reasoning_effort_when_configured() {
+        let req = ChatCompletionRequest {
+            model: "grok-4.6".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some(crate::llm::types::ReasoningEffort::High),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let payload = build_responses_payload(&conv(req)).unwrap();
+        assert_eq!(payload["reasoning"]["summary"], "concise");
+        assert_eq!(payload["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn chat_completions_and_messages_payload_carries_reasoning_effort() {
+        let req = ChatCompletionRequest {
+            model: "o3-mini".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some(crate::llm::types::ReasoningEffort::Medium),
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        };
+        let cc_payload = crate::llm::wire::chat_completions::build_chat_completions_payload(&conv(req.clone())).unwrap();
+        assert_eq!(cc_payload["reasoning_effort"], "medium");
+
+        let msg_payload = crate::llm::wire::messages::build_messages_payload(&conv(req)).unwrap();
+        assert_eq!(msg_payload["output_config"]["effort"], "medium");
+        assert_eq!(msg_payload["thinking"]["type"], "adaptive");
     }
 
     #[test]
@@ -1004,6 +1054,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -1052,6 +1103,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -1270,6 +1322,7 @@ mod tests {
             tool_choice: None,
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -1337,6 +1390,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
@@ -1400,6 +1454,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,

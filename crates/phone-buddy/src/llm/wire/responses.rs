@@ -100,13 +100,18 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
         }
     }
 
+    let mut reasoning = serde_json::json!({ "summary": "concise" });
+    if let Some(effort) = req.reasoning_effort {
+        reasoning["effort"] = serde_json::Value::String(effort.as_str().to_string());
+    }
+
     let mut payload = serde_json::json!({
         "model": req.model,
         "input": input,
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"],
-        "reasoning": { "summary": "concise" },
+        "reasoning": reasoning,
     });
     if let Some(ref id) = req.previous_response_id {
         if !id.is_empty() {
@@ -169,6 +174,7 @@ mod tests {
             tool_choice: None,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,

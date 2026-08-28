@@ -48,6 +48,8 @@ public struct PhoneBuddyConfig: Codable {
     public var extraHeaders: [String: String]?
     public var extraBody: [String: String]?
     public var httpDump: HttpDumpConfig?
+    /// Reasoning effort level for thinking models (e.g. "low", "medium", "high").
+    public var reasoningEffort: String?
 
     public init(
         apiKey: String = "",
@@ -60,7 +62,8 @@ public struct PhoneBuddyConfig: Codable {
         agentName: String = "PhoneBuddy",
         extraHeaders: [String: String]? = nil,
         extraBody: [String: String]? = nil,
-        httpDump: HttpDumpConfig? = nil
+        httpDump: HttpDumpConfig? = nil,
+        reasoningEffort: String? = nil
     ) {
         self.apiKey = apiKey
         self.baseUrl = baseUrl
@@ -73,6 +76,7 @@ public struct PhoneBuddyConfig: Codable {
         self.extraHeaders = extraHeaders
         self.extraBody = extraBody
         self.httpDump = httpDump
+        self.reasoningEffort = reasoningEffort
     }
 
     enum CodingKeys: String, CodingKey {
@@ -87,6 +91,7 @@ public struct PhoneBuddyConfig: Codable {
         case extraHeaders = "extra_headers"
         case extraBody = "extra_body"
         case httpDump = "http_dump"
+        case reasoningEffort = "reasoning_effort"
     }
 
     private enum AltCodingKeys: String, CodingKey {
@@ -102,6 +107,7 @@ public struct PhoneBuddyConfig: Codable {
         case extraBody
         case agentName
         case httpDump
+        case reasoningEffort
     }
 
     public init(from decoder: Decoder) throws {
@@ -142,6 +148,8 @@ public struct PhoneBuddyConfig: Codable {
             ?? (try? altContainer?.decodeIfPresent([String: String].self, forKey: .extraBody))
         self.httpDump = (try? container.decodeIfPresent(HttpDumpConfig.self, forKey: .httpDump))
             ?? (try? altContainer?.decodeIfPresent(HttpDumpConfig.self, forKey: .httpDump))
+        self.reasoningEffort = (try? container.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            ?? (try? altContainer?.decodeIfPresent(String.self, forKey: .reasoningEffort))
     }
 
     public static let userDefaultsKey = "phone_buddy_config"

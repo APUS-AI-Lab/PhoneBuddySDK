@@ -128,6 +128,7 @@ pub fn items_to_chat_request(req: &ConversationRequest) -> EngineResult<ChatComp
         tool_choice: req.tool_choice.clone(),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
+        reasoning_effort: req.reasoning_effort,
         search_parameters: req.search_parameters.clone(),
         hosted_tools: Vec::new(),
         previous_response_id: None,
