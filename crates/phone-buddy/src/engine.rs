@@ -392,9 +392,11 @@ impl PhoneBuddyEngine {
         items: Vec<ConversationItem>,
         stream: bool,
     ) -> EngineResult<ConversationRequest> {
-        let hosted = HostedTool::for_request(
+        let hosted = HostedTool::for_request_with_options(
             self.config.enable_web_search,
+            self.config.web_search_options.clone(),
             self.config.enable_x_search,
+            self.config.x_search_options.clone(),
             self.config.api_backend,
         );
         let root = self.config.resolved_attachment_root();
@@ -672,18 +674,41 @@ impl PhoneBuddyEngine {
                 .find_map(|i| i.as_assistant().map(|a| a.tool_calls.clone()))
                 .unwrap_or_default();
 
-            // Backend-only (or empty-call) turns: surface hosted calls and stop.
-            if client_calls.is_empty() {
-                for item in &turn_items {
-                    if let ConversationItem::BackendToolCall(b) = item {
-                        observer.on_event(AgentEvent::ToolCallResult {
-                            call_id: b.id.clone(),
-                            name: crate::conversation::server_tool_function_name(&b.item_type),
-                            ok: true,
-                            output: b.payload.to_string(),
-                        });
+            // Surface hosted/backend tool call results to the observer.
+            for item in &turn_items {
+                if let ConversationItem::BackendToolCall(b) = item {
+                    let name = b.display_name();
+                    if name == "x_thread_fetch" || name.starts_with("x_") || name == "x_search" {
+                        let input_str = b.payload.get("input").map(|v| v.to_string()).unwrap_or_default();
+                        let output_str = b
+                            .payload
+                            .get("output")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| b.payload.to_string());
+                        tracing::info!(
+                            tool = %name,
+                            call_id = %b.id,
+                            input = %input_str,
+                            output = %output_str,
+                            "[{}] Finished tool call '{}' (id: {}): input={}, output={}",
+                            name,
+                            name,
+                            b.id,
+                            input_str,
+                            output_str
+                        );
                     }
+                    observer.on_event(AgentEvent::ToolCallResult {
+                        call_id: b.id.clone(),
+                        name,
+                        ok: true,
+                        output: b.payload.to_string(),
+                    });
                 }
+            }
+
+            // Backend-only (or empty-call) turns: stop and return.
+            if client_calls.is_empty() {
                 session.items.extend(turn_items);
                 let final_text = turn.text.clone();
                 self.sessions.save(&session)?;

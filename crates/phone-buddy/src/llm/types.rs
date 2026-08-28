@@ -891,15 +891,36 @@ impl HostedTool {
         enable_x_search: bool,
         api_backend: ApiBackend,
     ) -> Vec<Self> {
+        Self::for_request_with_options(
+            enable_web_search,
+            None,
+            enable_x_search,
+            None,
+            api_backend,
+        )
+    }
+
+    /// Creates hosted tools with their respective options for the Responses API request.
+    pub fn for_request_with_options(
+        enable_web_search: bool,
+        web_search_options: Option<WebSearchOptions>,
+        enable_x_search: bool,
+        x_search_options: Option<XSearchOptions>,
+        api_backend: ApiBackend,
+    ) -> Vec<Self> {
         if !matches!(api_backend, ApiBackend::Responses) {
             return Vec::new();
         }
         let mut tools = Vec::new();
         if enable_web_search {
-            tools.push(Self::WebSearch { options: None });
+            tools.push(Self::WebSearch {
+                options: web_search_options,
+            });
         }
         if enable_x_search {
-            tools.push(Self::XSearch { options: None });
+            tools.push(Self::XSearch {
+                options: x_search_options,
+            });
         }
         tools
     }
@@ -1135,6 +1156,8 @@ pub enum OutputItemWire {
         name: String,
         input: String,
         status: Option<String>,
+        output: Option<serde_json::Value>,
+        raw: Option<serde_json::Value>,
     },
     Backend {
         item_type: String,
@@ -1262,12 +1285,15 @@ pub fn parse_output_item(v: &serde_json::Value) -> Option<OutputItemWire> {
                 })
                 .unwrap_or_default();
             let status = v.get("status").and_then(|s| s.as_str()).map(str::to_string);
+            let output = v.get("output").cloned();
             Some(OutputItemWire::CustomToolCall {
                 id,
                 call_id,
                 name,
                 input,
                 status,
+                output,
+                raw: Some(v.clone()),
             })
         }
         _ => {

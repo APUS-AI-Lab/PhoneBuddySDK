@@ -304,6 +304,8 @@ let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
 | `reasoning_effort` | String | 否 | `null` | 思考/推理强度级别（`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `none`）。自动跨 Responses、ChatCompletions 及 Messages 协议适配 |
 | `max_output_tokens` | Integer | 否 | `8192` | 单次输出的最大 Token 限制 |
 | `enable_web_search` | Boolean | 否 | `false` | Responses 主请求是否附加 Grok hosted `{type: web_search}`（对齐 Grok Build `supports_backend_search`）。客户端 DuckDuckGo / `web_search` function tool 独立注册。PackyAPI 等不支持 hosted search 的网关请保持关闭。 |
+| `enable_x_search` | Boolean | 否 | `false` | Responses 主请求是否附加 Grok hosted `{type: x_search}`，支持原生 X/Twitter 推文与 Thread 检索（`x_thread_fetch`、`x_keyword_search` 等）。 |
+| `x_search_options` | Object | 否 | `null` | `x_search` 的可选配置（例如 `{"from_date": "2026-01-01", "to_date": "2026-08-28"}` 指定时间范围过滤）。 |
 | `agent_name` | String | 否 | `PhoneBuddy` | 系统提示词中的身份名（`You are {agent_name}…`）。空值回退为 `PhoneBuddy` |
 | `system_prompt_extra` | String | 否 | `null` | 追加到 System Prompt 尾部的自定义人设或业务指令 |
 | `stream_idle_timeout_secs`| Integer | 否 | `120` | 流式连接空闲超时时间（秒） |

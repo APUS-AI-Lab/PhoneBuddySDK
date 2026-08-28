@@ -308,6 +308,8 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `reasoning_effort` | String | No | `null` | Reasoning effort level for thinking/reasoning models (`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `none`). Automatically mapped across Responses, ChatCompletions, and Messages backends |
 | `max_output_tokens` | Integer | No | `8192` | Maximum output token generation limit |
 | `enable_web_search` | Boolean | No | `false` | Attach Grok hosted `{type: web_search}` on Responses (Grok Build `supports_backend_search`). Client DuckDuckGo/`web_search` function tool stays registered independently. Leave off for gateways that do not implement hosted search (e.g. PackyAPI). |
+| `enable_x_search` | Boolean | No | `false` | Attach Grok hosted `{type: x_search}` on Responses for native X/Twitter content search and thread retrieval (`x_thread_fetch`, `x_keyword_search`, etc.). |
+| `x_search_options` | Object | No | `null` | Optional configuration for `x_search` (e.g. `{"from_date": "2026-01-01", "to_date": "2026-08-28"}`). |
 | `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |
 | `system_prompt_extra` | String | No | `null` | Custom persona or product instructions appended to system prompt |
 | `stream_idle_timeout_secs`| Integer | No | `120` | Streaming connection idle timeout in seconds |

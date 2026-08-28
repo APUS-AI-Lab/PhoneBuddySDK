@@ -34,6 +34,22 @@ public struct HttpDumpConfig: Codable {
     }
 }
 
+/// Configuration options for x_search (hosted X/Twitter search & thread fetch).
+public struct XSearchOptions: Codable {
+    public var fromDate: String?
+    public var toDate: String?
+
+    public init(fromDate: String? = nil, toDate: String? = nil) {
+        self.fromDate = fromDate
+        self.toDate = toDate
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case fromDate = "from_date"
+        case toDate = "to_date"
+    }
+}
+
 /// Configuration options for PhoneBuddyEngine.
 public struct PhoneBuddyConfig: Codable {
     public var apiKey: String
@@ -43,6 +59,8 @@ public struct PhoneBuddyConfig: Codable {
     public var rootDir: String
     public var maxTurns: Int
     public var enableWebSearch: Bool
+    public var enableXSearch: Bool
+    public var xSearchOptions: XSearchOptions?
     /// Identity used in the system prompt (`You are {agentName}…`). Default: PhoneBuddy.
     public var agentName: String
     public var extraHeaders: [String: String]?
@@ -59,6 +77,8 @@ public struct PhoneBuddyConfig: Codable {
         rootDir: String,
         maxTurns: Int = 24,
         enableWebSearch: Bool = true,
+        enableXSearch: Bool = false,
+        xSearchOptions: XSearchOptions? = nil,
         agentName: String = "PhoneBuddy",
         extraHeaders: [String: String]? = nil,
         extraBody: [String: String]? = nil,
@@ -72,6 +92,8 @@ public struct PhoneBuddyConfig: Codable {
         self.rootDir = rootDir
         self.maxTurns = maxTurns
         self.enableWebSearch = enableWebSearch
+        self.enableXSearch = enableXSearch
+        self.xSearchOptions = xSearchOptions
         self.agentName = agentName
         self.extraHeaders = extraHeaders
         self.extraBody = extraBody
@@ -87,6 +109,8 @@ public struct PhoneBuddyConfig: Codable {
         case rootDir = "root_dir"
         case maxTurns = "max_turns"
         case enableWebSearch = "enable_web_search"
+        case enableXSearch = "enable_x_search"
+        case xSearchOptions = "x_search_options"
         case agentName = "agent_name"
         case extraHeaders = "extra_headers"
         case extraBody = "extra_body"
@@ -136,6 +160,9 @@ public struct PhoneBuddyConfig: Codable {
         self.enableWebSearch = (try? container.decodeIfPresent(Bool.self, forKey: .enableWebSearch))
             ?? (try? altContainer?.decodeIfPresent(Bool.self, forKey: .enableWebSearch))
             ?? true
+        self.enableXSearch = (try? container.decodeIfPresent(Bool.self, forKey: .enableXSearch))
+            ?? false
+        self.xSearchOptions = try? container.decodeIfPresent(XSearchOptions.self, forKey: .xSearchOptions)
         let decodedName = (try? container.decodeIfPresent(String.self, forKey: .agentName))
             ?? (try? altContainer?.decodeIfPresent(String.self, forKey: .agentName))
             ?? "PhoneBuddy"

@@ -171,6 +171,17 @@ pub async fn collect_stream(
                         } else {
                             entry.2.clone()
                         };
+                        if entry.1 == "x_thread_fetch" || entry.1.starts_with("x_") || entry.1 == "x_search" {
+                            tracing::info!(
+                                tool = %entry.1,
+                                call_id = %call_id,
+                                input = %arguments_json,
+                                "[{}] Invoked: call_id='{}', input={}",
+                                entry.1,
+                                call_id,
+                                arguments_json
+                            );
+                        }
                         observer.on_event(AgentEvent::ToolCallStart {
                             call_id,
                             name: entry.1.clone(),
@@ -346,6 +357,8 @@ fn items_from_canonical_output(
                 call_id,
                 name,
                 input,
+                output,
+                raw,
                 ..
             } => {
                 let cid = if !call_id.is_empty() {
@@ -354,15 +367,45 @@ fn items_from_canonical_output(
                     id.clone().unwrap_or_else(|| "custom_tool_1".into())
                 };
                 if name == "x_search" || name.starts_with("x_") {
-                    let mut payload_obj = serde_json::Map::new();
-                    payload_obj.insert("type".into(), serde_json::Value::String("custom_tool_call".into()));
-                    payload_obj.insert("id".into(), serde_json::Value::String(cid.clone()));
-                    payload_obj.insert("call_id".into(), serde_json::Value::String(cid.clone()));
-                    payload_obj.insert("name".into(), serde_json::Value::String(name.clone()));
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-                        payload_obj.insert("input".into(), v);
+                    let mut payload_obj = if let Some(serde_json::Value::Object(m)) = raw {
+                        m.clone()
                     } else {
-                        payload_obj.insert("input".into(), serde_json::Value::String(input.clone()));
+                        let mut m = serde_json::Map::new();
+                        m.insert("type".into(), serde_json::Value::String("custom_tool_call".into()));
+                        m.insert("id".into(), serde_json::Value::String(cid.clone()));
+                        m.insert("call_id".into(), serde_json::Value::String(cid.clone()));
+                        m.insert("name".into(), serde_json::Value::String(name.clone()));
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+                            m.insert("input".into(), v);
+                        } else {
+                            m.insert("input".into(), serde_json::Value::String(input.clone()));
+                        }
+                        if let Some(ref out) = output {
+                            m.insert("output".into(), out.clone());
+                        }
+                        m
+                    };
+                    if let Some(ref out) = output {
+                        if !payload_obj.contains_key("output") {
+                            payload_obj.insert("output".into(), out.clone());
+                        }
+                    }
+                    let out_display = payload_obj
+                        .get("output")
+                        .map(|o: &serde_json::Value| o.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    if name == "x_thread_fetch" || name.starts_with("x_") || name == "x_search" {
+                        tracing::info!(
+                            tool = %name,
+                            call_id = %cid,
+                            input = %input,
+                            output = %out_display,
+                            "[{}] Fetched content: call_id='{}', input={}, output={}",
+                            name,
+                            cid,
+                            input,
+                            out_display
+                        );
                     }
                     items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
                         item_type: "custom_tool_call".into(),

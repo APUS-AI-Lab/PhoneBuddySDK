@@ -83,6 +83,9 @@ pub struct EngineConfig {
     /// independently.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Optional configuration options for WebSearch (allowed/excluded domains).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_options: Option<WebSearchOptions>,
     /// Attach Grok-style backend-hosted XSearch (`{ "type": "x_search" }`) on the Responses API.
     ///
     /// Because not all models and gateways support XSearch, this is controlled via an explicit
@@ -191,6 +194,9 @@ pub struct ProviderEndpoint {
     /// client-side DuckDuckGo function tool.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Optional configuration options for WebSearch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_options: Option<WebSearchOptions>,
     /// Hosted `{type: x_search}` on Responses.
     #[serde(default)]
     pub enable_x_search: bool,
@@ -259,6 +265,7 @@ impl Default for EngineConfig {
             max_output_tokens: default_max_tokens(),
             reasoning_effort: None,
             enable_web_search: false,
+            web_search_options: None,
             enable_x_search: false,
             x_search_options: None,
             agent_name: default_agent_name(),
@@ -553,6 +560,12 @@ impl EngineConfigBuilder {
     /// Enable or disable backend-hosted search on Responses API.
     pub fn enable_web_search(mut self, enable: bool) -> Self {
         self.config.enable_web_search = enable;
+        self
+    }
+
+    /// Set options for backend-hosted WebSearch (allowed/excluded domains).
+    pub fn web_search_options(mut self, options: WebSearchOptions) -> Self {
+        self.config.web_search_options = Some(options);
         self
     }
 

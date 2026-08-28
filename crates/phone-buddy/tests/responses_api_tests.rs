@@ -207,3 +207,88 @@ async fn test_codex_profile_protocol_conformance() {
     assert_eq!(payload["tools"][0]["name"], "read_file");
     assert_eq!(payload["tools"][0]["type"], "function");
 }
+
+#[tokio::test]
+async fn test_x_thread_fetch_and_x_search_alignment() {
+    use phone_buddy::conversation::{BackendToolCallItem, ConversationItem};
+    use phone_buddy::llm::types::{ConversationRequest, HostedTool, XSearchOptions};
+    use phone_buddy::llm::wire::responses::{build_responses_payload, parse_responses_chunk};
+
+    // 1. Check hosted tool entry generation with options (fromDate / toDate)
+    let hosted = HostedTool::for_request_with_options(
+        false,
+        None,
+        true,
+        Some(XSearchOptions {
+            date_bound: None,
+            from_date: Some("2026-01-01".into()),
+            to_date: Some("2026-08-28".into()),
+        }),
+        phone_buddy::config::ApiBackend::Responses,
+    );
+    assert_eq!(hosted.len(), 1);
+    let entry = hosted[0].to_tool_entry();
+    assert_eq!(entry["type"], "x_search");
+    assert_eq!(entry["from_date"], "2026-01-01");
+    assert_eq!(entry["to_date"], "2026-08-28");
+
+    // 2. Request payload includes { "type": "x_search", "from_date": ..., "to_date": ... }
+    let req = ConversationRequest {
+        model: "grok-4.6".into(),
+        items: vec![ConversationItem::user("Summarize this thread")],
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        temperature: None,
+        max_tokens: None,
+        reasoning_effort: None,
+        search_parameters: None,
+        hosted_tools: hosted,
+        previous_response_id: None,
+        image_bytes: phone_buddy::llm::image::ImageBytesStore::default(),
+        audio_bytes: phone_buddy::llm::image::AudioBytesStore::default(),
+    };
+    let payload = build_responses_payload(&req).unwrap();
+    let tools = payload["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "x_search");
+    assert_eq!(tools[0]["from_date"], "2026-01-01");
+    assert_eq!(tools[0]["to_date"], "2026-08-28");
+
+    // 3. Streaming chunk with custom_tool_call (e.g. x_thread_fetch)
+    let chunk_json = serde_json::json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "custom_tool_call",
+            "id": "ct_12345",
+            "call_id": "call_12345",
+            "name": "x_thread_fetch",
+            "input": "{\"query\": \"status/123456789\"}"
+        }
+    })
+    .to_string();
+
+    let chunk = parse_responses_chunk("response.output_item.added", &chunk_json)
+        .unwrap()
+        .expect("chunk parsed");
+    let delta = &chunk.choices[0].delta;
+    assert_eq!(delta.tool_calls.len(), 1);
+    let tc = &delta.tool_calls[0];
+    assert_eq!(tc.kind.as_deref(), Some("server"));
+    assert_eq!(tc.function.as_ref().unwrap().name.as_deref(), Some("x_thread_fetch"));
+
+    // 4. BackendToolCallItem display_name formatting
+    let backend_item = BackendToolCallItem {
+        item_type: "custom_tool_call".into(),
+        id: "call_12345".into(),
+        payload: serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "x_thread_fetch",
+            "call_id": "call_12345",
+            "input": {"query": "status/123456789"}
+        }),
+    };
+    assert_eq!(backend_item.display_name(), "x_thread_fetch");
+}
+

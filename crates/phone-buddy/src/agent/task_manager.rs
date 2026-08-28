@@ -372,9 +372,11 @@ impl TaskManager {
             req_items.extend(items.clone());
 
             let model = model_override.unwrap_or(&self.config.model).to_string();
-            let hosted = HostedTool::for_request(
+            let hosted = HostedTool::for_request_with_options(
                 self.config.enable_web_search,
+                self.config.web_search_options.clone(),
                 self.config.enable_x_search,
+                self.config.x_search_options.clone(),
                 self.config.api_backend,
             );
             let request = ConversationRequest {

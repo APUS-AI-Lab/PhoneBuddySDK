@@ -388,6 +388,18 @@ pub struct BackendToolCallItem {
     pub payload: serde_json::Value,
 }
 
+impl BackendToolCallItem {
+    /// Returns the descriptive tool name (e.g. `x_thread_fetch`, `x_keyword_search`, `web_search`, `x_search`).
+    pub fn display_name(&self) -> String {
+        if let Some(name) = self.payload.get("name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+        server_tool_function_name(&self.item_type)
+    }
+}
+
 impl ConversationItem {
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
