@@ -705,6 +705,13 @@ pub fn parse_responses_chunk(
                 delta.final_output = Some(parsed);
             }
         }
+    } else if type_str.contains("reasoning_summary_part.added")
+        || json_type.contains("reasoning_summary_part.added")
+    {
+        let summary_index = v.get("summary_index").and_then(|n| n.as_u64()).unwrap_or(0);
+        if summary_index > 0 {
+            delta.reasoning_content = Some("\n\n".to_string());
+        }
     } else if type_str.contains("reasoning_summary_text.delta")
         || json_type.contains("reasoning_summary_text.delta")
     {

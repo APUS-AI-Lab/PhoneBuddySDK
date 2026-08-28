@@ -193,7 +193,7 @@ pub fn reasoning_item_text(r: &ReasoningItem) -> String {
             parts.push(c.text.clone());
         }
     }
-    parts.join("\n")
+    parts.join("\n\n")
 }
 
 /// Construct an `ReasoningItem` carrying a single `SummaryText` part.
