@@ -50,6 +50,7 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
 pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
     let mut instructions = String::new();
     let mut input = Vec::new();
+    let mut call_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for item in &req.items {
         match item {
@@ -80,22 +81,55 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
                     }));
                 }
                 for tc in &a.tool_calls {
-                    let arguments =
-                        sanitize_tool_arguments(&tc.id, &tc.function.name, &tc.function.arguments);
-                    input.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": tc.id,
-                        "name": tc.function.name,
-                        "arguments": arguments
-                    }));
+                    call_kinds.insert(tc.id.clone(), tc.kind.clone());
+                    if tc.kind == "local_shell" {
+                        let action_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({
+                                "type": "exec",
+                                "command": [tc.function.arguments.clone()]
+                            }));
+                        input.push(serde_json::json!({
+                            "type": "local_shell_call",
+                            "call_id": tc.id,
+                            "status": "completed",
+                            "action": action_val
+                        }));
+                    } else if tc.kind == "custom_tool" {
+                        input.push(serde_json::json!({
+                            "type": "custom_tool_call",
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "input": tc.function.arguments
+                        }));
+                    } else {
+                        let arguments =
+                            sanitize_tool_arguments(&tc.id, &tc.function.name, &tc.function.arguments);
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": arguments
+                        }));
+                    }
                 }
             }
             ConversationItem::ToolResult(t) => {
-                input.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": t.tool_call_id,
-                    "output": t.content
-                }));
+                let is_custom = call_kinds.get(&t.tool_call_id).map(|k| k == "custom_tool").unwrap_or(false);
+                if is_custom {
+                    let output_val = serde_json::from_str::<serde_json::Value>(&t.content)
+                        .unwrap_or_else(|_| serde_json::Value::String(t.content.clone()));
+                    input.push(serde_json::json!({
+                        "type": "custom_tool_call_output",
+                        "call_id": t.tool_call_id,
+                        "output": output_val
+                    }));
+                } else {
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": t.tool_call_id,
+                        "output": t.content
+                    }));
+                }
             }
         }
     }
@@ -110,8 +144,15 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
         "input": input,
         "stream": true,
         "store": false,
+        "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
         "reasoning": reasoning,
+        "stream_options": {
+            "reasoning_summary_delivery": "sequential_cutoff"
+        },
+        "text": {
+            "verbosity": "medium"
+        },
     });
     if let Some(ref id) = req.previous_response_id {
         if !id.is_empty() {
@@ -154,142 +195,14 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
     }
     if !tools_val.is_empty() {
         payload["tools"] = serde_json::Value::Array(tools_val);
+        if let Some(ref tc) = req.tool_choice {
+            payload["tool_choice"] = tc.clone();
+        } else {
+            payload["tool_choice"] = serde_json::json!("auto");
+        }
     }
 
     Ok(payload)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conversation::{AssistantItem, BackendToolCallItem, ConversationItem};
-    use crate::llm::types::{ReasoningItem, ToolCall, ToolCallFunction};
-
-    fn req(items: Vec<ConversationItem>) -> ConversationRequest {
-        ConversationRequest {
-            model: "grok-4.6".into(),
-            items,
-            stream: Some(true),
-            tools: None,
-            tool_choice: None,
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
-            search_parameters: None,
-            hosted_tools: vec![],
-            previous_response_id: None,
-            image_bytes: crate::llm::image::ImageBytesStore::default(),
-        }
-    }
-
-    #[test]
-    fn responses_payload_replays_backend_call_verbatim() {
-        let payload_item = serde_json::json!({
-            "type": "web_search_call",
-            "id": "ws_1",
-            "action": {"type": "search", "query": "apus"}
-        });
-        let body = build_responses_payload(&req(vec![
-            ConversationItem::user("q"),
-            ConversationItem::BackendToolCall(BackendToolCallItem {
-                item_type: "web_search_call".into(),
-                id: "ws_1".into(),
-                payload: payload_item.clone(),
-            }),
-            ConversationItem::Assistant(AssistantItem {
-                content: "ok".into(),
-                tool_calls: vec![ToolCall {
-                    id: "c1".into(),
-                    kind: "function".into(),
-                    function: ToolCallFunction {
-                        name: "read_file".into(),
-                        arguments: "{}".into(),
-                    },
-                    thought_signature: None,
-                }],
-                reasoning_content: None,
-                encrypted_reasoning: None,
-                origin: None,
-            }),
-            ConversationItem::tool_result("c1", "out"),
-        ])).unwrap();
-        let input = body["input"].as_array().unwrap();
-        assert_eq!(input[1], payload_item);
-        assert_ne!(input[1]["type"], "function_call");
-        let mut calls = Vec::new();
-        let mut outputs = Vec::new();
-        for item in input {
-            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                calls.push(item["call_id"].as_str().unwrap());
-            }
-            if item.get("type").and_then(|t| t.as_str()) == Some("function_call_output") {
-                outputs.push(item["call_id"].as_str().unwrap());
-            }
-        }
-        assert_eq!(calls, outputs);
-    }
-
-    #[test]
-    fn responses_payload_sets_store_and_include() {
-        let body = build_responses_payload(&req(vec![ConversationItem::user("hi")])).unwrap();
-        assert_eq!(body["store"], false);
-        assert!(body["include"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "reasoning.encrypted_content"));
-    }
-
-    #[test]
-    fn responses_payload_preserves_sibling_order() {
-        let r1 = ReasoningItem {
-            id: "r1".into(),
-            summary: Vec::new(),
-            content: None,
-            encrypted_content: None,
-            status: None,
-        };
-        let r2 = ReasoningItem {
-            id: "r2".into(),
-            summary: Vec::new(),
-            content: None,
-            encrypted_content: None,
-            status: None,
-        };
-        let ws = serde_json::json!({"type":"web_search_call","id":"ws1"});
-        let body = build_responses_payload(&req(vec![
-            ConversationItem::Reasoning(r1),
-            ConversationItem::BackendToolCall(BackendToolCallItem {
-                item_type: "web_search_call".into(),
-                id: "ws1".into(),
-                payload: ws,
-            }),
-            ConversationItem::Reasoning(r2),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new(),
-                tool_calls: vec![ToolCall {
-                    id: "fc1".into(),
-                    kind: "function".into(),
-                    function: ToolCallFunction {
-                        name: "read_file".into(),
-                        arguments: "{}".into(),
-                    },
-                    thought_signature: None,
-                }],
-                reasoning_content: None,
-                encrypted_reasoning: None,
-                origin: None,
-            }),
-        ])).unwrap();
-        let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0]["type"], "reasoning");
-        assert_eq!(input[0]["id"], "r1");
-        assert_eq!(input[1]["type"], "web_search_call");
-        assert_eq!(input[2]["type"], "reasoning");
-        assert_eq!(input[2]["id"], "r2");
-        assert_eq!(input[3]["type"], "function_call");
-        assert_eq!(input[3]["call_id"], "fc1");
-    }
 }
 
 fn reasoning_to_input_item(r: &ReasoningItem) -> serde_json::Value {
@@ -329,6 +242,297 @@ fn output_index_of(v: &serde_json::Value) -> u32 {
         .unwrap_or(0) as u32
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::{AssistantItem, ConversationItem};
+    use crate::llm::types::HostedTool;
+
+    fn req(items: Vec<ConversationItem>) -> ConversationRequest {
+        ConversationRequest {
+            model: "grok-4.6".into(),
+            items,
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+            image_bytes: crate::llm::image::ImageBytesStore::default(),
+            audio_bytes: crate::llm::image::AudioBytesStore::default(),
+        }
+    }
+
+    #[test]
+    fn single_message_history() {
+        let r = req(vec![
+            ConversationItem::Assistant(AssistantItem {
+                content: "ok".into(),
+                tool_calls: vec![],
+                reasoning_content: None,
+                encrypted_reasoning: None,
+                origin: None,
+            }),
+            ConversationItem::User(crate::conversation::UserItem::text("next")),
+        ]);
+        let p = build_responses_payload(&r).unwrap();
+        let inp = p["input"].as_array().unwrap();
+        assert_eq!(inp.len(), 2);
+        assert_eq!(inp[0]["role"], "assistant");
+        assert_eq!(inp[0]["content"], "ok");
+        assert_eq!(inp[1]["role"], "user");
+        assert_eq!(inp[1]["content"], "next");
+    }
+
+    #[test]
+    fn previous_response_id_included() {
+        let mut r = req(vec![ConversationItem::User(
+            crate::conversation::UserItem::text("hi"),
+        )]);
+        r.previous_response_id = Some("resp_xyz".into());
+        let p = build_responses_payload(&r).unwrap();
+        assert_eq!(p["previous_response_id"], "resp_xyz");
+    }
+
+    #[test]
+    fn patch_reasoning_text_types_adds_type_to_content() {
+        let mut p = serde_json::json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "content": [{ "text": "thought" }]
+                }
+            ]
+        });
+        patch_reasoning_text_types(&mut p);
+        assert_eq!(
+            p["input"][0]["content"][0]["type"],
+            "reasoning_text"
+        );
+    }
+
+    #[test]
+    fn responses_payload_multimodal_audio_and_image() {
+        let store_img = crate::llm::image::ImageBytesStore::default();
+        store_img.insert(crate::llm::image::MaterializedImage {
+            attachment_id: "img_1".into(),
+            mime_type: crate::conversation::ImageMimeType::Jpeg,
+            bytes: vec![1, 2, 3],
+            detail: Some(crate::conversation::ImageDetail::High),
+            width: 100,
+            height: 100,
+        });
+        let store_audio = crate::llm::image::AudioBytesStore::default();
+        store_audio.insert(crate::llm::image::MaterializedAudio {
+            attachment_id: "aud_1".into(),
+            mime_type: crate::conversation::AudioMimeType::Wav,
+            bytes: vec![4, 5, 6, 7],
+            format: Some("wav".into()),
+        });
+
+        let mut r = req(vec![
+            ConversationItem::User(crate::conversation::UserItem {
+                parts: vec![
+                    crate::conversation::UserContentPart::Text { text: "listen and look".into() },
+                    crate::conversation::UserContentPart::Image {
+                        attachment_id: "img_1".into(),
+                        local_path: "p.jpg".into(),
+                        mime_type: crate::conversation::ImageMimeType::Jpeg,
+                        byte_size: 3,
+                        width: 100,
+                        height: 100,
+                        detail: Some(crate::conversation::ImageDetail::High),
+                    },
+                    crate::conversation::UserContentPart::Audio {
+                        attachment_id: "aud_1".into(),
+                        local_path: "a.wav".into(),
+                        mime_type: crate::conversation::AudioMimeType::Wav,
+                        byte_size: 4,
+                        format: Some("wav".into()),
+                    },
+                ],
+            }),
+        ]);
+        r.image_bytes = store_img;
+        r.audio_bytes = store_audio;
+
+        let p = build_responses_payload(&r).unwrap();
+        let content = p["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "input_image");
+        assert_eq!(content[0]["detail"], "high");
+        assert_eq!(content[1]["type"], "input_audio");
+        assert!(content[1]["audio_url"].as_str().unwrap().starts_with("data:audio/wav;base64,"));
+        assert_eq!(content[2]["type"], "input_text");
+        assert_eq!(content[2]["text"], "listen and look");
+    }
+
+    #[test]
+    fn responses_payload_x_search_and_web_search_hosted_tools() {
+        let mut r = req(vec![ConversationItem::User(crate::conversation::UserItem::text("search x"))]);
+        r.hosted_tools = vec![
+            HostedTool::WebSearch {
+                options: Some(crate::llm::types::WebSearchOptions {
+                    allowed_domains: Some(vec!["example.com".into()]),
+                    excluded_domains: None,
+                }),
+            },
+            HostedTool::XSearch {
+                options: Some(crate::llm::types::XSearchOptions {
+                    date_bound: None,
+                    from_date: Some("2026-01-01".into()),
+                    to_date: Some("2026-08-01".into()),
+                }),
+            },
+        ];
+
+        let p = build_responses_payload(&r).unwrap();
+        let tools = p["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["filters"]["allowed_domains"][0], "example.com");
+        assert_eq!(tools[1]["type"], "x_search");
+        assert_eq!(tools[1]["from_date"], "2026-01-01");
+        assert_eq!(tools[1]["to_date"], "2026-08-01");
+    }
+
+    #[test]
+    fn responses_payload_local_shell_and_custom_tool_serialization() {
+        let r = req(vec![
+            ConversationItem::Assistant(AssistantItem {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::llm::types::ToolCall {
+                        id: "shell_1".into(),
+                        kind: "local_shell".into(),
+                        function: crate::llm::types::ToolCallFunction {
+                            name: "local_shell".into(),
+                            arguments: serde_json::json!({
+                                "command": ["ls", "-la"]
+                            }).to_string(),
+                        },
+                        thought_signature: None,
+                    },
+                    crate::llm::types::ToolCall {
+                        id: "custom_1".into(),
+                        kind: "custom_tool".into(),
+                        function: crate::llm::types::ToolCallFunction {
+                            name: "my_device_sensor".into(),
+                            arguments: serde_json::json!({ "mode": "accelerometer" }).to_string(),
+                        },
+                        thought_signature: None,
+                    },
+                ],
+                reasoning_content: None,
+                encrypted_reasoning: None,
+                origin: None,
+            }),
+            ConversationItem::ToolResult(crate::conversation::ToolResultItem {
+                tool_call_id: "shell_1".into(),
+                content: "file1.txt".into(),
+            }),
+            ConversationItem::ToolResult(crate::conversation::ToolResultItem {
+                tool_call_id: "custom_1".into(),
+                content: serde_json::json!({ "x": 0.1, "y": 9.8 }).to_string(),
+            }),
+        ]);
+
+        let p = build_responses_payload(&r).unwrap();
+        let input = p["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["type"], "local_shell_call");
+        assert_eq!(input[0]["call_id"], "shell_1");
+        assert_eq!(input[0]["action"]["command"][0], "ls");
+        assert_eq!(input[1]["type"], "custom_tool_call");
+        assert_eq!(input[1]["call_id"], "custom_1");
+        assert_eq!(input[1]["name"], "my_device_sensor");
+
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "shell_1");
+        assert_eq!(input[2]["output"], "file1.txt");
+
+        assert_eq!(input[3]["type"], "custom_tool_call_output");
+        assert_eq!(input[3]["call_id"], "custom_1");
+        assert_eq!(input[3]["output"]["y"], 9.8);
+    }
+
+    #[test]
+    fn parse_responses_chunk_custom_tool_and_local_shell_stream() {
+        // 1. Output item added: local_shell_call
+        let chunk1 = parse_responses_chunk(
+            "response.output_item.added",
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "local_shell_call",
+                    "id": "item_sh_1",
+                    "call_id": "call_sh_1",
+                    "status": "in_progress",
+                    "action": {
+                        "type": "exec",
+                        "command": ["cat", "hello.txt"]
+                    }
+                }
+            }).to_string(),
+        ).unwrap().unwrap();
+        let tc1 = &chunk1.choices[0].delta.tool_calls[0];
+        assert_eq!(tc1.kind.as_deref(), Some("local_shell"));
+        assert_eq!(tc1.id.as_deref(), Some("call_sh_1"));
+
+        // 2. Custom tool call input delta
+        let chunk2 = parse_responses_chunk(
+            "response.custom_tool_call_input.delta",
+            &serde_json::json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 1,
+                "call_id": "call_custom_1",
+                "name": "camera_capture",
+                "delta": "{\"quality\": \"high\"}"
+            }).to_string(),
+        ).unwrap().unwrap();
+        let tc2 = &chunk2.choices[0].delta.tool_calls[0];
+        assert_eq!(tc2.kind.as_deref(), Some("custom_tool"));
+        assert_eq!(tc2.function.as_ref().unwrap().name.as_deref(), Some("camera_capture"));
+
+        // 3. Response completed with final_output
+        let chunk3 = parse_responses_chunk(
+            "response.completed",
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "model": "grok-4.6",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "content": [{ "type": "output_text", "text": "All done." }]
+                        },
+                        {
+                            "type": "local_shell_call",
+                            "id": "item_sh_1",
+                            "call_id": "call_sh_1",
+                            "status": "completed",
+                            "action": { "type": "exec", "command": ["cat", "hello.txt"] }
+                        }
+                    ]
+                }
+            }).to_string(),
+        ).unwrap().unwrap();
+        let final_out = chunk3.choices[0].delta.final_output.as_ref().unwrap();
+        assert_eq!(final_out.len(), 2);
+        assert!(matches!(final_out[0], OutputItemWire::Message { ref text, .. } if text == "All done."));
+        assert!(matches!(final_out[1], OutputItemWire::LocalShellCall { ref call_id, .. } if call_id.as_deref() == Some("call_sh_1")));
+    }
+}
+
+// ── SSE Chunk Parsing ───────────────────────────────────────────────────
+
 fn tool_delta_from_output_item(
     item: &serde_json::Value,
     fallback_index: u32,
@@ -360,14 +564,73 @@ fn tool_delta_from_output_item(
                 thought_signature: None,
             })
         }
-        "web_search_call" | "file_search_call" | "computer_call" | "mcp_call"
-        | "image_generation_call" | "code_interpreter_call" => {
+        "local_shell_call" => {
+            let id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let args = item.get("action").or_else(|| item.get("arguments")).map(|a| {
+                if let Some(s) = a.as_str() {
+                    s.to_string()
+                } else {
+                    a.to_string()
+                }
+            });
+            Some(ToolCallDelta {
+                index: fallback_index,
+                id,
+                kind: Some("local_shell".to_string()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("local_shell".to_string()),
+                    arguments: args,
+                }),
+                thought_signature: None,
+            })
+        }
+        "custom_tool_call" => {
+            let id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let name = item
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("custom_tool")
+                .to_string();
+            let args = item.get("input").or_else(|| item.get("arguments")).map(|a| {
+                if let Some(s) = a.as_str() {
+                    s.to_string()
+                } else {
+                    a.to_string()
+                }
+            });
+            let kind = if name == "x_search" || name.starts_with("x_") {
+                "server"
+            } else {
+                "custom_tool"
+            };
+            Some(ToolCallDelta {
+                index: fallback_index,
+                id,
+                kind: Some(kind.to_string()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some(name),
+                    arguments: args,
+                }),
+                thought_signature: None,
+            })
+        }
+        "x_search" | "x_search_call" | "web_search_call" | "file_search_call" | "computer_call"
+        | "mcp_call" | "image_generation_call" | "code_interpreter_call" => {
             let id = item
                 .get("id")
                 .or_else(|| item.get("call_id"))
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
             let name = match item_type {
+                "x_search" | "x_search_call" => "x_search",
                 "web_search_call" => "web_search",
                 "file_search_call" => "file_search",
                 "computer_call" => "computer",
@@ -377,7 +640,7 @@ fn tool_delta_from_output_item(
                 other => other,
             }
             .to_string();
-            let args = item.get("action").or_else(|| item.get("arguments")).map(|a| {
+            let args = item.get("action").or_else(|| item.get("arguments")).or_else(|| item.get("input")).map(|a| {
                 if let Some(s) = a.as_str() {
                     s.to_string()
                 } else {
@@ -427,7 +690,9 @@ pub fn parse_responses_chunk(
     let is_completed = type_str.contains("response.completed")
         || json_type.contains("response.completed")
         || type_str.contains("response.incomplete")
-        || json_type.contains("response.incomplete");
+        || json_type.contains("response.incomplete")
+        || type_str.contains("response.done")
+        || json_type.contains("response.done");
 
     if is_completed {
         let output = v
@@ -475,6 +740,33 @@ pub fn parse_responses_chunk(
             index: output_index_of(&v),
             id,
             kind: Some("function".to_string()),
+            function: Some(ToolCallFunctionDelta {
+                name,
+                arguments: args,
+            }),
+            thought_signature: None,
+        });
+    } else if type_str.contains("custom_tool_call_input.delta")
+        || json_type.contains("custom_tool_call_input.delta")
+    {
+        let id = v
+            .get("call_id")
+            .or_else(|| v.get("id"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let name = v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
+        let args = v
+            .get("delta")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let kind = name
+            .as_deref()
+            .map(|n| if n == "x_search" || n.starts_with("x_") { "server" } else { "custom_tool" })
+            .unwrap_or("custom_tool");
+        delta.tool_calls.push(ToolCallDelta {
+            index: output_index_of(&v),
+            id,
+            kind: Some(kind.to_string()),
             function: Some(ToolCallFunctionDelta {
                 name,
                 arguments: args,

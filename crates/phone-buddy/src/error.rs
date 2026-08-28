@@ -72,11 +72,18 @@ pub enum EngineError {
     #[error("too many images: {0} (max 5)")]
     TooManyImages(usize),
 
+    #[error("too many audio attachments: {0} (max 5)")]
+    TooManyAudio(usize),
+
     #[error("current model does not support image input")]
     VisionUnsupported,
+
+    #[error("current model does not support audio input")]
+    AudioUnsupported,
 
     #[error("inline request payload too large")]
     PayloadTooLarge,
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
+

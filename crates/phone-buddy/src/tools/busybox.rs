@@ -56,47 +56,125 @@ impl Tool for BusyboxTool {
             })
             .unwrap_or_default();
 
-        match applet.as_str() {
-            "ls" => applet_ls(&argv, ctx),
-            "cat" => applet_cat(&argv, ctx),
-            "head" => applet_head_tail(&argv, ctx, true),
-            "tail" => applet_head_tail(&argv, ctx, false),
-            "wc" => applet_wc(&argv, ctx),
-            "sort" => applet_sort(&argv, ctx),
-            "uniq" => applet_uniq(&argv, ctx),
-            "find" => applet_find(&argv, ctx),
-            "mkdir" => applet_mkdir(&argv, ctx),
-            "cp" => applet_cp(&argv, ctx),
-            "mv" => applet_mv(&argv, ctx),
-            "rm" => applet_rm(&argv, ctx),
-            "touch" => applet_touch(&argv, ctx),
-            "du" => applet_du(&argv, ctx),
-            "echo" => Ok(ToolOutput::new(argv.join(" "))),
-            "pwd" => Ok(ToolOutput::new(ctx.sandbox.root().display().to_string())),
-            "basename" => {
-                let p = argv.first().cloned().unwrap_or_default();
-                Ok(ToolOutput::new(
-                    Path::new(&p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or(p),
-                ))
+        run_applet(&applet, &argv, ctx)
+    }
+}
+
+/// Execute a single applet by name with arguments against the sandbox.
+pub fn run_applet(applet: &str, argv: &[String], ctx: &ToolCtx) -> EngineResult<ToolOutput> {
+    match applet {
+        "ls" => applet_ls(argv, ctx),
+        "cat" => applet_cat(argv, ctx),
+        "head" => applet_head_tail(argv, ctx, true),
+        "tail" => applet_head_tail(argv, ctx, false),
+        "wc" => applet_wc(argv, ctx),
+        "sort" => applet_sort(argv, ctx),
+        "uniq" => applet_uniq(argv, ctx),
+        "find" => applet_find(argv, ctx),
+        "mkdir" => applet_mkdir(argv, ctx),
+        "cp" => applet_cp(argv, ctx),
+        "mv" => applet_mv(argv, ctx),
+        "rm" => applet_rm(argv, ctx),
+        "touch" => applet_touch(argv, ctx),
+        "du" => applet_du(argv, ctx),
+        "echo" => Ok(ToolOutput::new(argv.join(" "))),
+        "pwd" => Ok(ToolOutput::new(ctx.sandbox.root().display().to_string())),
+        "basename" => {
+            let p = argv.first().cloned().unwrap_or_default();
+            Ok(ToolOutput::new(
+                Path::new(&p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(p),
+            ))
+        }
+        "dirname" => {
+            let p = argv.first().cloned().unwrap_or_default();
+            Ok(ToolOutput::new(
+                Path::new(&p)
+                    .parent()
+                    .map(|n| n.display().to_string())
+                    .unwrap_or_default(),
+            ))
+        }
+        other => Err(EngineError::Tool {
+            name: "busybox".into(),
+            message: format!("unknown applet '{other}'. {APPLET_DOC}"),
+        }),
+    }
+}
+
+/// Execute a shell-like command argument vector inside the sandbox.
+pub fn execute_command_argv(command: &[String], ctx: &ToolCtx) -> EngineResult<ToolOutput> {
+    if command.is_empty() {
+        return Ok(ToolOutput::new(""));
+    }
+    let cmd = command[0].as_str();
+    let argv = &command[1..];
+
+    // If shell invocation: "sh -c ..." or "bash -c ..." or "/bin/sh -c ..."
+    if (cmd == "sh" || cmd == "bash" || cmd == "/bin/sh" || cmd == "/bin/bash")
+        && argv.len() >= 2
+        && argv[0] == "-c"
+    {
+        return execute_command_line(&argv[1], ctx);
+    }
+
+    // Strip leading path like /bin/ls -> ls, /usr/bin/cat -> cat
+    let applet = Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cmd);
+
+    run_applet(applet, argv, ctx)
+}
+
+/// Execute a shell command string by tokenizing into arguments and running applet.
+pub fn execute_command_line(cmd_line: &str, ctx: &ToolCtx) -> EngineResult<ToolOutput> {
+    let tokens = tokenize_command_line(cmd_line);
+    if tokens.is_empty() {
+        return Ok(ToolOutput::new(""));
+    }
+    execute_command_argv(&tokens, ctx)
+}
+
+fn tokenize_command_line(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in s.chars() {
+        if escape {
+            cur.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escape = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
             }
-            "dirname" => {
-                let p = argv.first().cloned().unwrap_or_default();
-                Ok(ToolOutput::new(
-                    Path::new(&p)
-                        .parent()
-                        .map(|n| n.display().to_string())
-                        .unwrap_or_default(),
-                ))
-            }
-            other => Err(EngineError::Tool {
-                name: "busybox".into(),
-                message: format!("unknown applet '{other}'. {APPLET_DOC}"),
-            }),
+        } else {
+            cur.push(ch);
         }
     }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

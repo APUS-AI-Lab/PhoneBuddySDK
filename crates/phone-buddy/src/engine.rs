@@ -392,7 +392,11 @@ impl PhoneBuddyEngine {
         items: Vec<ConversationItem>,
         stream: bool,
     ) -> EngineResult<ConversationRequest> {
-        let hosted = HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
+        let hosted = HostedTool::for_request(
+            self.config.enable_web_search,
+            self.config.enable_x_search,
+            self.config.api_backend,
+        );
         let root = self.config.resolved_attachment_root();
         let image_bytes = if items.iter().any(|i| {
             matches!(i, ConversationItem::User(u) if u.has_images())
@@ -400,6 +404,13 @@ impl PhoneBuddyEngine {
             crate::llm::image::materialize_items(&items, &root)?
         } else {
             crate::llm::image::ImageBytesStore::default()
+        };
+        let audio_bytes = if items.iter().any(|i| {
+            matches!(i, ConversationItem::User(u) if u.has_audio())
+        }) {
+            crate::llm::image::materialize_audio_items(&items, &root)?
+        } else {
+            crate::llm::image::AudioBytesStore::default()
         };
         Ok(ConversationRequest {
             model,
@@ -414,6 +425,7 @@ impl PhoneBuddyEngine {
             hosted_tools: hosted,
             previous_response_id: None,
             image_bytes,
+            audio_bytes,
         })
     }
 
@@ -555,6 +567,9 @@ impl PhoneBuddyEngine {
         if user.has_images() && !self.config.supports_image_input {
             return Err(EngineError::VisionUnsupported);
         }
+        if user.has_audio() && !self.config.supports_audio_input {
+            return Err(EngineError::AudioUnsupported);
+        }
         if user.has_images() {
             let root = self.config.resolved_attachment_root();
             crate::llm::image::materialize_user_item(
@@ -563,10 +578,24 @@ impl PhoneBuddyEngine {
                 &crate::llm::image::ImageBytesStore::default(),
             )?;
         }
+        if user.has_audio() {
+            let root = self.config.resolved_attachment_root();
+            crate::llm::image::materialize_audio_user_item(
+                &user,
+                &root,
+                &crate::llm::image::AudioBytesStore::default(),
+            )?;
+        }
 
         let title_src = user.text_content();
         let title = if title_src.trim().is_empty() {
-            "Image".to_string()
+            if user.has_images() {
+                "Image".to_string()
+            } else if user.has_audio() {
+                "Audio".to_string()
+            } else {
+                "Turn".to_string()
+            }
         } else {
             truncate_title(&title_src)
         };
@@ -736,6 +765,32 @@ impl PhoneBuddyEngine {
         };
 
         // Built-in tools take priority over host tools on name clash.
+        if name == "local_shell" || name == "local_shell_call" || call.kind == "local_shell" {
+            let ctx = ToolCtx {
+                sandbox: self.sandbox.clone(),
+                cancel: token.clone(),
+            };
+            if let Some(cmd_arr) = args.as_array() {
+                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                return crate::tools::busybox::execute_command_argv(&argv, &ctx);
+            }
+            if let Some(cmd_arr) = args.get("command").and_then(|v| v.as_array()) {
+                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                return crate::tools::busybox::execute_command_argv(&argv, &ctx);
+            }
+            if let Some(cmd_arr) = args.pointer("/action/command").and_then(|v| v.as_array()) {
+                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                return crate::tools::busybox::execute_command_argv(&argv, &ctx);
+            }
+            if let Some(cmd_str) = args.get("command").and_then(|v| v.as_str()) {
+                return crate::tools::busybox::execute_command_line(cmd_str, &ctx);
+            }
+            if let Some(cmd_str) = args.get("cmd").and_then(|v| v.as_str()) {
+                return crate::tools::busybox::execute_command_line(cmd_str, &ctx);
+            }
+            return crate::tools::busybox::execute_command_argv(&[], &ctx);
+        }
+
         if let Some(tool) = self.tools.get(&name) {
             let ctx = ToolCtx {
                 sandbox: self.sandbox.clone(),

@@ -348,6 +348,7 @@ mod tests {
             hosted_tools: vec![],
             previous_response_id: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
+            audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }
     }
 

@@ -9,7 +9,9 @@ pub use crate::llm::profiles::{
     build_profile_headers, get_profile_definition, render_user_agent, ClientProfile,
     ClientProfileDefinition,
 };
-pub use crate::llm::types::{ApiBackend, ReasoningEffort};
+pub use crate::llm::types::{
+    ApiBackend, ReasoningEffort, SearchDateBound, WebSearchOptions, XSearchOptions,
+};
 
 pub use crate::llm::types::ApiBackend as ConfigApiBackend;
 
@@ -81,6 +83,16 @@ pub struct EngineConfig {
     /// independently.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Attach Grok-style backend-hosted XSearch (`{ "type": "x_search" }`) on the Responses API.
+    ///
+    /// Because not all models and gateways support XSearch, this is controlled via an explicit
+    /// toggle. When true and [`api_backend`] is [`ApiBackend::Responses`], `{ "type": "x_search" }`
+    /// is added to the request `tools` array.
+    #[serde(default)]
+    pub enable_x_search: bool,
+    /// Optional configuration options for XSearch (date bounds etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_search_options: Option<XSearchOptions>,
     /// Identity used in the system prompt (`You are {agent_name}…`).
     /// Empty or whitespace falls back to [`DEFAULT_AGENT_NAME`].
     #[serde(default = "default_agent_name")]
@@ -142,9 +154,16 @@ pub struct EngineConfig {
     /// When false, a user turn with images fails with [`crate::error::EngineError::VisionUnsupported`].
     #[serde(default = "default_supports_image_input")]
     pub supports_image_input: bool,
+    /// When false, a user turn with audio attachments fails with [`crate::error::EngineError::AudioUnsupported`].
+    #[serde(default = "default_supports_audio_input")]
+    pub supports_audio_input: bool,
 }
 
 fn default_supports_image_input() -> bool {
+    true
+}
+
+fn default_supports_audio_input() -> bool {
     true
 }
 
@@ -172,6 +191,12 @@ pub struct ProviderEndpoint {
     /// client-side DuckDuckGo function tool.
     #[serde(default)]
     pub enable_web_search: bool,
+    /// Hosted `{type: x_search}` on Responses.
+    #[serde(default)]
+    pub enable_x_search: bool,
+    /// Optional configuration options for XSearch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_search_options: Option<XSearchOptions>,
     /// Reasoning effort level for thinking models on this fallback provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -234,6 +259,8 @@ impl Default for EngineConfig {
             max_output_tokens: default_max_tokens(),
             reasoning_effort: None,
             enable_web_search: false,
+            enable_x_search: false,
+            x_search_options: None,
             agent_name: default_agent_name(),
             system_prompt_extra: None,
             stream_idle_timeout_secs: default_idle_timeout_secs(),
@@ -251,6 +278,7 @@ impl Default for EngineConfig {
             provider_group: None,
             attachment_root: None,
             supports_image_input: true,
+            supports_audio_input: true,
         }
     }
 }
@@ -315,6 +343,11 @@ impl EngineConfig {
     /// True when hosted `{type: web_search}` should ride the Responses request.
     pub fn backend_search_active(&self) -> bool {
         self.enable_web_search && matches!(self.api_backend, ApiBackend::Responses)
+    }
+
+    /// True when hosted `{type: x_search}` should ride the Responses request.
+    pub fn backend_x_search_active(&self) -> bool {
+        self.enable_x_search && matches!(self.api_backend, ApiBackend::Responses)
     }
 
     /// Identity interpolated into the system prompt.
@@ -520,6 +553,24 @@ impl EngineConfigBuilder {
     /// Enable or disable backend-hosted search on Responses API.
     pub fn enable_web_search(mut self, enable: bool) -> Self {
         self.config.enable_web_search = enable;
+        self
+    }
+
+    /// Enable or disable backend-hosted XSearch on Responses API.
+    pub fn enable_x_search(mut self, enable: bool) -> Self {
+        self.config.enable_x_search = enable;
+        self
+    }
+
+    /// Set options for backend-hosted XSearch.
+    pub fn x_search_options(mut self, options: XSearchOptions) -> Self {
+        self.config.x_search_options = Some(options);
+        self
+    }
+
+    /// Set whether audio input is supported by the engine / model.
+    pub fn supports_audio_input(mut self, supports: bool) -> Self {
+        self.config.supports_audio_input = supports;
         self
     }
 

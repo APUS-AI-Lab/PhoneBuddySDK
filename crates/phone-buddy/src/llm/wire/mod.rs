@@ -31,12 +31,21 @@ fn require_image(
         .ok_or_else(|| EngineError::AttachmentMissing(attachment_id.to_string()))
 }
 
-/// OpenAI Responses user `content`: string, or `[input_image, input_text]`.
+fn require_audio(
+    req: &ConversationRequest,
+    attachment_id: &str,
+) -> EngineResult<crate::llm::image::MaterializedAudio> {
+    req.audio_bytes
+        .get(attachment_id)
+        .ok_or_else(|| EngineError::AttachmentMissing(attachment_id.to_string()))
+}
+
+/// OpenAI Responses user `content`: string, or `[input_image, input_audio, input_text]`.
 pub fn responses_user_content(
     u: &UserItem,
     req: &ConversationRequest,
 ) -> EngineResult<serde_json::Value> {
-    if !u.has_images() {
+    if !u.has_media() {
         return Ok(serde_json::Value::String(u.text_content()));
     }
     let mut content = Vec::new();
@@ -55,6 +64,13 @@ pub fn responses_user_content(
                     "detail": d.as_str(),
                 }));
             }
+            UserContentPart::Audio { attachment_id, .. } => {
+                let audio = require_audio(req, attachment_id)?;
+                content.push(serde_json::json!({
+                    "type": "input_audio",
+                    "audio_url": audio.data_url(),
+                }));
+            }
             UserContentPart::Text { text } => {
                 content.push(serde_json::json!({
                     "type": "input_text",
@@ -66,12 +82,12 @@ pub fn responses_user_content(
     Ok(serde_json::Value::Array(content))
 }
 
-/// Chat Completions user `content`: string, or `[image_url, text]`.
+/// Chat Completions user `content`: string, or `[image_url, input_audio, text]`.
 pub fn chat_completions_user_content(
     u: &UserItem,
     req: &ConversationRequest,
 ) -> EngineResult<serde_json::Value> {
-    if !u.has_images() {
+    if !u.has_media() {
         return Ok(serde_json::Value::String(u.text_content()));
     }
     let mut content = Vec::new();
@@ -92,6 +108,16 @@ pub fn chat_completions_user_content(
                     }
                 }));
             }
+            UserContentPart::Audio { attachment_id, .. } => {
+                let audio = require_audio(req, attachment_id)?;
+                content.push(serde_json::json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": audio.raw_b64(),
+                        "format": audio.format_str(),
+                    }
+                }));
+            }
             UserContentPart::Text { text } => {
                 content.push(serde_json::json!({
                     "type": "text",
@@ -108,7 +134,7 @@ pub fn messages_user_content(
     u: &UserItem,
     req: &ConversationRequest,
 ) -> EngineResult<serde_json::Value> {
-    if !u.has_images() {
+    if !u.has_media() {
         return Ok(serde_json::Value::String(u.text_content()));
     }
     let mut content = Vec::new();
@@ -122,6 +148,17 @@ pub fn messages_user_content(
                         "type": "base64",
                         "media_type": img.mime_type.as_str(),
                         "data": img.raw_b64(),
+                    }
+                }));
+            }
+            UserContentPart::Audio { attachment_id, .. } => {
+                let audio = require_audio(req, attachment_id)?;
+                content.push(serde_json::json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": audio.mime_type.as_str(),
+                        "data": audio.raw_b64(),
                     }
                 }));
             }
@@ -150,6 +187,15 @@ pub fn gemini_user_parts(
                     "inlineData": {
                         "mimeType": img.mime_type.as_str(),
                         "data": img.raw_b64(),
+                    }
+                }));
+            }
+            UserContentPart::Audio { attachment_id, .. } => {
+                let audio = require_audio(req, attachment_id)?;
+                parts.push(serde_json::json!({
+                    "inlineData": {
+                        "mimeType": audio.mime_type.as_str(),
+                        "data": audio.raw_b64(),
                     }
                 }));
             }
@@ -263,6 +309,7 @@ mod schema_tests {
             hosted_tools: vec![],
             previous_response_id: None,
             image_bytes: store,
+            audio_bytes: crate::llm::image::AudioBytesStore::default(),
         };
 
         let responses = super::responses::build_responses_payload(&req).unwrap();

@@ -93,6 +93,8 @@ pub struct HttpTransport {
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     /// Opt into server doom-loop recovery (Responses API).
     doom_loop_enabled: bool,
+    /// Sticky routing state (x-codex-turn-state) captured from server response headers
+    turn_state: Arc<std::sync::RwLock<Option<String>>>,
     /// HTTP Traffic Dumper for diagnostics
     dumper: crate::llm::dumper::HttpDumper,
 }
@@ -208,8 +210,26 @@ impl HttpTransport {
             extra_body,
             doom_loop_enabled: doom_loop_enabled
                 && matches!(api_backend, ApiBackend::Responses),
+            turn_state: Arc::new(std::sync::RwLock::new(None)),
             dumper,
         })
+    }
+
+    /// Retrieve the current sticky routing token (`x-codex-turn-state`), if recorded.
+    pub fn turn_state(&self) -> Option<String> {
+        self.turn_state.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Explicitly set the sticky routing token (`x-codex-turn-state`).
+    pub fn set_turn_state(&self, state: Option<String>) {
+        if let Ok(mut g) = self.turn_state.write() {
+            *g = state;
+        }
+    }
+
+    /// Clear the sticky routing token (`x-codex-turn-state`).
+    pub fn clear_turn_state(&self) {
+        self.set_turn_state(None);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -269,6 +289,15 @@ impl LlmTransport for HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
         }
 
+        // Attach sticky routing token (x-codex-turn-state) if present
+        if let Some(ts) = self.turn_state() {
+            builder = builder.header("x-codex-turn-state", &ts);
+            req_headers_map.insert(
+                "x-codex-turn-state".into(),
+                self.dumper.mask_header_value("x-codex-turn-state", &ts),
+            );
+        }
+
         // Gemini uses x-goog-api-key rather than Bearer.
         if matches!(self.api_backend, ApiBackend::Gemini) && !self.api_key.is_empty() {
             builder = builder.header("x-goog-api-key", &self.api_key);
@@ -285,6 +314,27 @@ impl LlmTransport for HttpTransport {
         }
 
         let mut body = adapter.build_payload(req)?;
+
+        // Attach Codex client_metadata if ClientProfile::Codex
+        if self.client_profile == ClientProfile::Codex {
+            let sess_id = self
+                .client_session_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if let Some(obj) = body.as_object_mut() {
+                if !obj.contains_key("client_metadata") {
+                    obj.insert(
+                        "client_metadata".into(),
+                        serde_json::json!({
+                            "session_id": sess_id,
+                            "thread_id": sess_id,
+                            "x-codex-installation-id": sess_id,
+                            "x-codex-window-id": sess_id,
+                        }),
+                    );
+                }
+            }
+        }
 
         if matches!(self.api_backend, ApiBackend::Messages) {
             if body
@@ -348,6 +398,13 @@ impl LlmTransport for HttpTransport {
                 return Err(EngineError::Llm(full_err));
             }
         };
+
+        // Capture sticky routing token from response headers if present
+        if let Some(ts_val) = resp.headers().get("x-codex-turn-state") {
+            if let Ok(ts_str) = ts_val.to_str() {
+                self.set_turn_state(Some(ts_str.to_string()));
+            }
+        }
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -871,7 +928,7 @@ mod tests {
             max_tokens: None,
             reasoning_effort: None,
             search_parameters: None,
-            hosted_tools: vec![HostedTool::WebSearch],
+            hosted_tools: vec![HostedTool::WebSearch { options: None }],
             previous_response_id: None,
         };
         let payload = build_responses_payload(&conv(req)).unwrap();
@@ -886,11 +943,25 @@ mod tests {
 
     #[test]
     fn hosted_search_tools_only_on_responses() {
-        assert!(HostedTool::for_request(true, ApiBackend::Responses) == vec![HostedTool::WebSearch]);
-        assert!(HostedTool::for_request(true, ApiBackend::ChatCompletions).is_empty());
-        assert!(HostedTool::for_request(true, ApiBackend::Messages).is_empty());
-        assert!(HostedTool::for_request(true, ApiBackend::Gemini).is_empty());
-        assert!(HostedTool::for_request(false, ApiBackend::Responses).is_empty());
+        assert_eq!(
+            HostedTool::for_request(true, false, ApiBackend::Responses),
+            vec![HostedTool::WebSearch { options: None }]
+        );
+        assert_eq!(
+            HostedTool::for_request(false, true, ApiBackend::Responses),
+            vec![HostedTool::XSearch { options: None }]
+        );
+        assert_eq!(
+            HostedTool::for_request(true, true, ApiBackend::Responses),
+            vec![
+                HostedTool::WebSearch { options: None },
+                HostedTool::XSearch { options: None }
+            ]
+        );
+        assert!(HostedTool::for_request(true, true, ApiBackend::ChatCompletions).is_empty());
+        assert!(HostedTool::for_request(true, true, ApiBackend::Messages).is_empty());
+        assert!(HostedTool::for_request(true, true, ApiBackend::Gemini).is_empty());
+        assert!(HostedTool::for_request(false, false, ApiBackend::Responses).is_empty());
     }
 
     #[test]

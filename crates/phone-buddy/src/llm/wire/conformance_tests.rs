@@ -87,6 +87,7 @@ fn fixture() -> ConversationRequest {
         hosted_tools: vec![],
         previous_response_id: None,
         image_bytes: crate::llm::image::ImageBytesStore::default(),
+        audio_bytes: crate::llm::image::AudioBytesStore::default(),
     }
 }
 
@@ -385,6 +386,7 @@ fn multimodal_image_conformance_all_backends() {
         hosted_tools: vec![],
         previous_response_id: None,
         image_bytes: store,
+        audio_bytes: crate::llm::image::AudioBytesStore::default(),
     };
 
     // 1. OpenAI / xAI Responses API

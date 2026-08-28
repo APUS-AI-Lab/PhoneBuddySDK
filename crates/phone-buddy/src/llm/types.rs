@@ -683,38 +683,225 @@ pub struct SearchParameters {
     pub max_search_results: Option<i32>,
 }
 
+/// Search date bounds (from/to dates).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchDateBound {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_date: Option<String>,
+}
+
+/// `x_search` tool configuration options (e.g. fromDate / toDate content-date bounds).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XSearchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_bound: Option<SearchDateBound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_date: Option<String>,
+}
+
+impl XSearchOptions {
+    pub fn is_empty(&self) -> bool {
+        let from = self
+            .from_date
+            .as_deref()
+            .or_else(|| self.date_bound.as_ref().and_then(|b| b.from_date.as_deref()));
+        let to = self
+            .to_date
+            .as_deref()
+            .or_else(|| self.date_bound.as_ref().and_then(|b| b.to_date.as_deref()));
+        from.is_none() && to.is_none()
+    }
+
+    pub fn to_tool_entry(&self) -> serde_json::Value {
+        let from = self
+            .from_date
+            .as_deref()
+            .or_else(|| self.date_bound.as_ref().and_then(|b| b.from_date.as_deref()));
+        let to = self
+            .to_date
+            .as_deref()
+            .or_else(|| self.date_bound.as_ref().and_then(|b| b.to_date.as_deref()));
+        let mut obj = serde_json::json!({ "type": "x_search" });
+        if let Some(f) = from {
+            obj["from_date"] = serde_json::Value::String(f.to_string());
+        }
+        if let Some(t) = to {
+            obj["to_date"] = serde_json::Value::String(t.to_string());
+        }
+        obj
+    }
+}
+
+/// `web_search` tool configuration options (e.g. domain allowlist / blocklist).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_domains: Option<Vec<String>>,
+}
+
+impl WebSearchOptions {
+    pub fn is_empty(&self) -> bool {
+        self.allowed_domains
+            .as_ref()
+            .map_or(true, |d| d.is_empty())
+            && self
+                .excluded_domains
+                .as_ref()
+                .map_or(true, |d| d.is_empty())
+    }
+
+    pub fn to_tool_entry(&self) -> serde_json::Value {
+        let mut obj = serde_json::json!({ "type": "web_search" });
+        if let Some(ref allowed) = self.allowed_domains {
+            if !allowed.is_empty() {
+                obj["filters"] = serde_json::json!({
+                    "allowed_domains": allowed
+                });
+            }
+        } else if let Some(ref excluded) = self.excluded_domains {
+            if !excluded.is_empty() {
+                obj["filters"] = serde_json::json!({
+                    "excluded_domains": excluded
+                });
+            }
+        }
+        obj
+    }
+}
+
+/// Local shell call execution status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalShellStatus {
+    #[default]
+    Completed,
+    InProgress,
+    Incomplete,
+}
+
+/// Local shell execution action payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LocalShellExecAction {
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Local shell action container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LocalShellAction {
+    Exec(LocalShellExecAction),
+}
+
+impl Default for LocalShellAction {
+    fn default() -> Self {
+        Self::Exec(LocalShellExecAction::default())
+    }
+}
+
+/// Local shell call item matching OpenAI / Codex Responses API specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalShellCallItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub status: LocalShellStatus,
+    pub action: LocalShellAction,
+}
+
+/// Custom tool call item matching OpenAI / Grok Responses API specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomToolCallItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub call_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Custom tool call output matching Responses API specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomToolCallOutputItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub output: serde_json::Value,
+}
+
 /// Backend-hosted Responses API tools, matching Grok Build `HostedTool`.
 ///
 /// These are spliced into the Responses `tools` array as native types
-/// (e.g. `{ "type": "web_search" }`), not as function tools. The client
-/// `web_search` function tool is dropped from the same request so the
-/// two do not collide (the API rejects duplicates).
+/// (e.g. `{ "type": "web_search" }`, `{ "type": "x_search" }`), not as function tools. The client
+/// function tools are dropped from the same request so the two do not collide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostedTool {
-    WebSearch,
+    WebSearch {
+        options: Option<WebSearchOptions>,
+    },
+    XSearch {
+        options: Option<XSearchOptions>,
+    },
 }
 
 impl HostedTool {
     pub fn wire_name(&self) -> &'static str {
         match self {
-            HostedTool::WebSearch => "web_search",
+            HostedTool::WebSearch { .. } => "web_search",
+            HostedTool::XSearch { .. } => "x_search",
         }
     }
 
     pub fn to_tool_entry(&self) -> serde_json::Value {
         match self {
-            HostedTool::WebSearch => serde_json::json!({ "type": "web_search" }),
+            HostedTool::WebSearch { options } => match options {
+                Some(o) => o.to_tool_entry(),
+                None => serde_json::json!({ "type": "web_search" }),
+            },
+            HostedTool::XSearch { options } => match options {
+                Some(o) => o.to_tool_entry(),
+                None => serde_json::json!({ "type": "x_search" }),
+            },
         }
     }
 
-    /// Grok Build sends hosted search only on the Responses API when the
-    /// model/gateway supports backend search (`supports_backend_search`).
-    pub fn for_request(enable_web_search: bool, api_backend: ApiBackend) -> Vec<Self> {
-        if enable_web_search && matches!(api_backend, ApiBackend::Responses) {
-            vec![Self::WebSearch]
-        } else {
-            Vec::new()
+    /// Grok Build sends hosted search on the Responses API when enabled.
+    /// `enable_x_search` enables the xAI `x_search` hosted tool.
+    pub fn for_request(
+        enable_web_search: bool,
+        enable_x_search: bool,
+        api_backend: ApiBackend,
+    ) -> Vec<Self> {
+        if !matches!(api_backend, ApiBackend::Responses) {
+            return Vec::new();
         }
+        let mut tools = Vec::new();
+        if enable_web_search {
+            tools.push(Self::WebSearch { options: None });
+        }
+        if enable_x_search {
+            tools.push(Self::XSearch { options: None });
+        }
+        tools
     }
 }
 
@@ -785,6 +972,8 @@ pub struct ConversationRequest {
     pub previous_response_id: Option<String>,
     /// Request-scoped image bytes. Never serialized to session storage.
     pub image_bytes: crate::llm::image::ImageBytesStore,
+    /// Request-scoped audio bytes. Never serialized to session storage.
+    pub audio_bytes: crate::llm::image::AudioBytesStore,
 }
 
 impl ConversationRequest {
@@ -802,6 +991,7 @@ impl ConversationRequest {
             hosted_tools: req.hosted_tools,
             previous_response_id: req.previous_response_id,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
+            audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }
     }
 
@@ -923,12 +1113,28 @@ pub struct ChatChunkDelta {
 /// raw and becomes a BackendToolCall — never dropped, never guessed at.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputItemWire {
-    Message { id: String, text: String },
+    Message {
+        id: String,
+        text: String,
+    },
     Reasoning(ReasoningItem),
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    LocalShellCall {
+        id: Option<String>,
+        call_id: Option<String>,
+        status: LocalShellStatus,
+        action: LocalShellAction,
+    },
+    CustomToolCall {
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        input: String,
+        status: Option<String>,
     },
     Backend {
         item_type: String,
@@ -994,6 +1200,74 @@ pub fn parse_output_item(v: &serde_json::Value) -> Option<OutputItemWire> {
                 call_id,
                 name,
                 arguments,
+            })
+        }
+        "local_shell_call" => {
+            let id = v.get("id").and_then(|s| s.as_str()).map(str::to_string);
+            let call_id = v
+                .get("call_id")
+                .or_else(|| v.get("id"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let status = serde_json::from_value::<LocalShellStatus>(
+                v.get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::json!("completed")),
+            )
+            .unwrap_or(LocalShellStatus::Completed);
+            let action = serde_json::from_value::<LocalShellAction>(
+                v.get("action").cloned().unwrap_or(serde_json::json!({
+                    "type": "exec",
+                    "command": []
+                })),
+            )
+            .unwrap_or_else(|_| {
+                LocalShellAction::Exec(LocalShellExecAction {
+                    command: Vec::new(),
+                    timeout_ms: None,
+                    working_directory: None,
+                    env: None,
+                    user: None,
+                })
+            });
+            Some(OutputItemWire::LocalShellCall {
+                id,
+                call_id,
+                status,
+                action,
+            })
+        }
+        "custom_tool_call" => {
+            let id = v.get("id").and_then(|s| s.as_str()).map(str::to_string);
+            let call_id = v
+                .get("call_id")
+                .or_else(|| v.get("id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = v
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input = v
+                .get("input")
+                .or_else(|| v.get("arguments"))
+                .map(|a| {
+                    if let Some(s) = a.as_str() {
+                        s.to_string()
+                    } else {
+                        a.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            let status = v.get("status").and_then(|s| s.as_str()).map(str::to_string);
+            Some(OutputItemWire::CustomToolCall {
+                id,
+                call_id,
+                name,
+                input,
+                status,
             })
         }
         _ => {

@@ -372,8 +372,11 @@ impl TaskManager {
             req_items.extend(items.clone());
 
             let model = model_override.unwrap_or(&self.config.model).to_string();
-            let hosted =
-                HostedTool::for_request(self.config.enable_web_search, self.config.api_backend);
+            let hosted = HostedTool::for_request(
+                self.config.enable_web_search,
+                self.config.enable_x_search,
+                self.config.api_backend,
+            );
             let request = ConversationRequest {
                 model,
                 items: req_items,
@@ -390,6 +393,7 @@ impl TaskManager {
                 hosted_tools: hosted,
                 previous_response_id: None,
                 image_bytes: crate::llm::image::ImageBytesStore::default(),
+                audio_bytes: crate::llm::image::AudioBytesStore::default(),
             };
 
             let observer = NullObserver;

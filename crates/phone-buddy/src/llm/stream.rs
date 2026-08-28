@@ -320,6 +320,67 @@ fn items_from_canonical_output(
                     thought_signature,
                 });
             }
+            OutputItemWire::LocalShellCall {
+                id,
+                call_id,
+                action,
+                ..
+            } => {
+                let cid = call_id
+                    .clone()
+                    .or(id.clone())
+                    .unwrap_or_else(|| "local_shell_1".into());
+                let args = serde_json::to_string(&action).unwrap_or_default();
+                client_calls.push(ToolCall {
+                    id: cid,
+                    kind: "local_shell".into(),
+                    function: ToolCallFunction {
+                        name: "local_shell".into(),
+                        arguments: args,
+                    },
+                    thought_signature: None,
+                });
+            }
+            OutputItemWire::CustomToolCall {
+                id,
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let cid = if !call_id.is_empty() {
+                    call_id.clone()
+                } else {
+                    id.clone().unwrap_or_else(|| "custom_tool_1".into())
+                };
+                if name == "x_search" || name.starts_with("x_") {
+                    let mut payload_obj = serde_json::Map::new();
+                    payload_obj.insert("type".into(), serde_json::Value::String("custom_tool_call".into()));
+                    payload_obj.insert("id".into(), serde_json::Value::String(cid.clone()));
+                    payload_obj.insert("call_id".into(), serde_json::Value::String(cid.clone()));
+                    payload_obj.insert("name".into(), serde_json::Value::String(name.clone()));
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+                        payload_obj.insert("input".into(), v);
+                    } else {
+                        payload_obj.insert("input".into(), serde_json::Value::String(input.clone()));
+                    }
+                    items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                        item_type: "custom_tool_call".into(),
+                        id: cid,
+                        payload: serde_json::Value::Object(payload_obj),
+                    }));
+                } else {
+                    client_calls.push(ToolCall {
+                        id: cid,
+                        kind: "custom_tool".into(),
+                        function: ToolCallFunction {
+                            name: name.clone(),
+                            arguments: if input.trim().is_empty() { "{}".into() } else { input.clone() },
+                        },
+                        thought_signature: None,
+                    });
+                }
+            }
             OutputItemWire::Backend {
                 item_type,
                 id,

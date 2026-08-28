@@ -22,6 +22,10 @@ pub const MAX_IMAGE_WIDTH: u32 = MAX_IMAGE_LONG_EDGE;
 pub const MAX_IMAGE_HEIGHT: u32 = MAX_IMAGE_SHORT_EDGE;
 /// Max image parts on a single user turn.
 pub const MAX_IMAGES_PER_TURN: usize = 5;
+/// Max audio parts on a single user turn.
+pub const MAX_AUDIOS_PER_TURN: usize = 5;
+/// Max audio bytes accepted per file (25MB).
+pub const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
 /// A single item in a conversation — the unified internal representation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,7 +37,7 @@ pub enum ConversationItem {
     ToolResult(ToolResultItem),
     /// Sibling reasoning item (Responses `rs_*` / synthesized).
     Reasoning(ReasoningItem),
-    /// Server-executed hosted tool call (`web_search_call`, …), stored as the
+    /// Server-executed hosted tool call (`web_search_call`, `custom_tool_call`, …), stored as the
     /// raw wire item so Responses replay is verbatim.
     BackendToolCall(BackendToolCallItem),
 }
@@ -56,6 +60,63 @@ impl ImageMimeType {
         match self {
             Self::Jpeg => "image/jpeg",
             Self::Png => "image/png",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioMimeType {
+    #[serde(rename = "audio/wav", alias = "audio/x-wav")]
+    Wav,
+    #[serde(rename = "audio/mp3", alias = "audio/mpeg")]
+    Mp3,
+    #[serde(rename = "audio/ogg")]
+    Ogg,
+    #[serde(rename = "audio/m4a", alias = "audio/mp4", alias = "audio/x-m4a")]
+    M4a,
+    #[serde(rename = "audio/aac")]
+    Aac,
+    #[serde(rename = "audio/flac", alias = "audio/x-flac")]
+    Flac,
+    #[serde(rename = "audio/webm")]
+    Webm,
+}
+
+impl AudioMimeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wav => "audio/wav",
+            Self::Mp3 => "audio/mp3",
+            Self::Ogg => "audio/ogg",
+            Self::M4a => "audio/m4a",
+            Self::Aac => "audio/aac",
+            Self::Flac => "audio/flac",
+            Self::Webm => "audio/webm",
+        }
+    }
+
+    pub fn from_mime_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "audio/wav" | "audio/x-wav" | "wav" => Some(Self::Wav),
+            "audio/mp3" | "audio/mpeg" | "mp3" => Some(Self::Mp3),
+            "audio/ogg" | "ogg" => Some(Self::Ogg),
+            "audio/m4a" | "audio/mp4" | "audio/x-m4a" | "m4a" => Some(Self::M4a),
+            "audio/aac" | "aac" => Some(Self::Aac),
+            "audio/flac" | "audio/x-flac" | "flac" => Some(Self::Flac),
+            "audio/webm" | "webm" => Some(Self::Webm),
+            _ => None,
+        }
+    }
+
+    pub fn default_extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Ogg => "ogg",
+            Self::M4a => "m4a",
+            Self::Aac => "aac",
+            Self::Flac => "flac",
+            Self::Webm => "webm",
         }
     }
 }
@@ -95,6 +156,14 @@ pub enum UserContentPart {
         height: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
+    },
+    Audio {
+        attachment_id: String,
+        local_path: String,
+        mime_type: AudioMimeType,
+        byte_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
     },
 }
 
@@ -159,18 +228,35 @@ impl UserItem {
             .count()
     }
 
+    pub fn has_audio(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, UserContentPart::Audio { .. }))
+    }
+
+    pub fn audio_count(&self) -> usize {
+        self.parts
+            .iter()
+            .filter(|p| matches!(p, UserContentPart::Audio { .. }))
+            .count()
+    }
+
+    pub fn has_media(&self) -> bool {
+        self.has_images() || self.has_audio()
+    }
+
     pub fn normalized_parts(&self) -> Vec<&UserContentPart> {
-        let mut images = Vec::new();
+        let mut media = Vec::new();
         let mut texts = Vec::new();
         for p in &self.parts {
             match p {
-                UserContentPart::Image { .. } => images.push(p),
+                UserContentPart::Image { .. } | UserContentPart::Audio { .. } => media.push(p),
                 UserContentPart::Text { text } if !text.trim().is_empty() => texts.push(p),
                 UserContentPart::Text { .. } => {}
             }
         }
-        images.extend(texts);
-        images
+        media.extend(texts);
+        media
     }
 
     pub fn validate_shape(&self) -> EngineResult<()> {
@@ -178,36 +264,60 @@ impl UserItem {
         if images > MAX_IMAGES_PER_TURN {
             return Err(EngineError::TooManyImages(images));
         }
+        let audios = self.audio_count();
+        if audios > MAX_AUDIOS_PER_TURN {
+            return Err(EngineError::TooManyAudio(audios));
+        }
         let has_text = self.parts.iter().any(|p| {
             matches!(p, UserContentPart::Text { text } if !text.trim().is_empty())
         });
-        if images == 0 && !has_text {
+        if images == 0 && audios == 0 && !has_text {
             return Err(EngineError::InvalidUserTurn(
-                "turn has no text or image parts".into(),
+                "turn has no text, image, or audio parts".into(),
             ));
         }
         for p in &self.parts {
-            if let UserContentPart::Image {
-                width,
-                height,
-                attachment_id,
-                ..
-            } = p
-            {
-                if *width == 0 || *height == 0 {
-                    return Err(EngineError::AttachmentInvalid(
-                        attachment_id.clone(),
-                        "invalid dimensions".into(),
-                    ));
+            match p {
+                UserContentPart::Image {
+                    width,
+                    height,
+                    attachment_id,
+                    ..
+                } => {
+                    if *width == 0 || *height == 0 {
+                        return Err(EngineError::AttachmentInvalid(
+                            attachment_id.clone(),
+                            "invalid dimensions".into(),
+                        ));
+                    }
+                    let max_dim = (*width).max(*height);
+                    let min_dim = (*width).min(*height);
+                    if max_dim > MAX_IMAGE_LONG_EDGE || min_dim > MAX_IMAGE_SHORT_EDGE {
+                        return Err(EngineError::AttachmentInvalid(
+                            attachment_id.clone(),
+                            format!("exceeds {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}"),
+                        ));
+                    }
                 }
-                let max_dim = (*width).max(*height);
-                let min_dim = (*width).min(*height);
-                if max_dim > MAX_IMAGE_LONG_EDGE || min_dim > MAX_IMAGE_SHORT_EDGE {
-                    return Err(EngineError::AttachmentInvalid(
-                        attachment_id.clone(),
-                        format!("exceeds {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}"),
-                    ));
+                UserContentPart::Audio {
+                    attachment_id,
+                    byte_size,
+                    ..
+                } => {
+                    if *byte_size == 0 {
+                        return Err(EngineError::AttachmentInvalid(
+                            attachment_id.clone(),
+                            "empty audio file (0 bytes)".into(),
+                        ));
+                    }
+                    if *byte_size > MAX_AUDIO_BYTES {
+                        return Err(EngineError::AttachmentInvalid(
+                            attachment_id.clone(),
+                            format!("audio exceeds maximum size ({} > {MAX_AUDIO_BYTES})", byte_size),
+                        ));
+                    }
                 }
+                UserContentPart::Text { .. } => {}
             }
         }
         Ok(())

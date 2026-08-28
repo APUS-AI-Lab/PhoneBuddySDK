@@ -56,6 +56,7 @@ struct ProviderSlot {
     api_backend: crate::llm::types::ApiBackend,
     reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
     enable_web_search: bool,
+    enable_x_search: bool,
     health: Mutex<ProviderHealth>,
 }
 
@@ -112,6 +113,7 @@ impl LlmClient {
                 api_backend: crate::llm::types::ApiBackend::ChatCompletions,
                 reasoning_effort: None,
                 enable_web_search: false,
+                enable_x_search: false,
                 health: Mutex::new(ProviderHealth::default()),
             }],
             max_retries,
@@ -139,6 +141,7 @@ impl LlmClient {
                 api_backend: crate::llm::types::ApiBackend::ChatCompletions,
                 reasoning_effort: None,
                 enable_web_search: false,
+                enable_x_search: false,
                 health: Mutex::new(ProviderHealth::default()),
             })
             .collect();
@@ -237,7 +240,7 @@ impl LlmClient {
         if let Some(effort) = slot.reasoning_effort {
             out.reasoning_effort = Some(effort);
         }
-        out.hosted_tools = HostedTool::for_request(slot.enable_web_search, slot.api_backend);
+        out.hosted_tools = HostedTool::for_request(slot.enable_web_search, slot.enable_x_search, slot.api_backend);
         let tools = out.tools.take().unwrap_or_default();
         out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
         let primary = self.primary_compat_key();
@@ -854,6 +857,7 @@ fn slot_from_primary(cfg: &EngineConfig) -> EngineResult<ProviderSlot> {
         api_backend: cfg.api_backend,
         reasoning_effort: cfg.reasoning_effort,
         enable_web_search: cfg.enable_web_search,
+        enable_x_search: cfg.enable_x_search,
         health: Mutex::new(ProviderHealth::default()),
         transport,
     })
@@ -883,6 +887,7 @@ fn slot_from_endpoint(
         api_backend: ep.api_backend,
         reasoning_effort: ep.reasoning_effort.or(cfg.reasoning_effort),
         enable_web_search: ep.enable_web_search,
+        enable_x_search: ep.enable_x_search,
         health: Mutex::new(ProviderHealth::default()),
         transport,
     })
@@ -1001,6 +1006,7 @@ mod tests {
             hosted_tools: Vec::new(),
             previous_response_id: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
+            audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }
     }
 

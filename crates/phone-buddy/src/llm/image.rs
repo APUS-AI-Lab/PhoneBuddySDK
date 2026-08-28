@@ -11,8 +11,9 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::conversation::{
-    ImageDetail, ImageMimeType, UserContentPart, UserItem, MAX_IMAGE_HEIGHT, MAX_IMAGE_LONG_EDGE,
-    MAX_IMAGE_SHORT_EDGE, MAX_IMAGE_WIDTH, MAX_IMAGES_PER_TURN,
+    AudioMimeType, ImageDetail, ImageMimeType, UserContentPart, UserItem, MAX_AUDIO_BYTES,
+    MAX_AUDIOS_PER_TURN, MAX_IMAGE_HEIGHT, MAX_IMAGE_LONG_EDGE, MAX_IMAGE_SHORT_EDGE,
+    MAX_IMAGE_WIDTH, MAX_IMAGES_PER_TURN,
 };
 use crate::error::{EngineError, EngineResult};
 
@@ -20,6 +21,7 @@ use crate::error::{EngineError, EngineResult};
 pub const GEMINI_INLINE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 const DATA_URL_PREFIX: &str = "data:image/";
+const AUDIO_DATA_URL_PREFIX: &str = "data:audio/";
 
 /// In-memory bytes for one image, valid only for the current request + retries.
 #[derive(Debug, Clone)]
@@ -80,6 +82,72 @@ impl ImageBytesStore {
 
     pub fn is_empty(&self) -> bool {
         self.inner.lock().expect("image store lock").is_empty()
+    }
+}
+
+/// In-memory bytes for one audio attachment, valid only for the current request + retries.
+#[derive(Debug, Clone)]
+pub struct MaterializedAudio {
+    pub attachment_id: String,
+    pub mime_type: AudioMimeType,
+    pub bytes: Vec<u8>,
+    pub format: Option<String>,
+}
+
+impl MaterializedAudio {
+    pub fn data_url(&self) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&self.bytes);
+        format!("data:{};base64,{}", self.mime_type.as_str(), b64)
+    }
+
+    pub fn raw_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(&self.bytes)
+    }
+
+    pub fn format_str(&self) -> String {
+        self.format
+            .clone()
+            .unwrap_or_else(|| self.mime_type.default_extension().to_string())
+    }
+
+    pub fn sha256_prefix(&self) -> String {
+        sha256_prefix(&self.bytes)
+    }
+}
+
+/// Request-scoped audio bytes. Cheap to clone (shared map).
+#[derive(Debug, Clone, Default)]
+pub struct AudioBytesStore {
+    inner: Arc<Mutex<HashMap<String, MaterializedAudio>>>,
+}
+
+impl AudioBytesStore {
+    pub fn insert(&self, audio: MaterializedAudio) {
+        self.inner
+            .lock()
+            .expect("audio store lock")
+            .insert(audio.attachment_id.clone(), audio);
+    }
+
+    pub fn get(&self, attachment_id: &str) -> Option<MaterializedAudio> {
+        self.inner
+            .lock()
+            .expect("audio store lock")
+            .get(attachment_id)
+            .cloned()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("audio store lock")
+            .values()
+            .map(|i| i.bytes.len() as u64)
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().expect("audio store lock").is_empty()
     }
 }
 
@@ -305,6 +373,126 @@ pub fn materialize_items(
     Ok(store)
 }
 
+/// Detect audio MIME type from magic bytes or file extension fallback.
+pub fn detect_audio_mime(bytes: &[u8], path: &Path) -> EngineResult<AudioMimeType> {
+    if let Some(kind) = infer::get(bytes) {
+        if let Some(mime) = AudioMimeType::from_mime_str(kind.mime_type()) {
+            return Ok(mime);
+        }
+    }
+    // Check common audio magic bytes
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Ok(AudioMimeType::Wav);
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"OggS" {
+        return Ok(AudioMimeType::Ogg);
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"fLaC" {
+        return Ok(AudioMimeType::Flac);
+    }
+    if bytes.len() >= 3 && &bytes[0..3] == b"ID3" {
+        return Ok(AudioMimeType::Mp3);
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
+        return Ok(AudioMimeType::Mp3);
+    }
+    if bytes.len() >= 8 && (&bytes[4..8] == b"ftyp" || &bytes[4..8] == b"M4A ") {
+        return Ok(AudioMimeType::M4a);
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"\x1a\x45\xdf\xa3" {
+        return Ok(AudioMimeType::Webm);
+    }
+    // Fallback to path extension
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if let Some(mime) = AudioMimeType::from_mime_str(ext) {
+            return Ok(mime);
+        }
+    }
+    Err(EngineError::AttachmentInvalid(
+        path.display().to_string(),
+        "unrecognized audio format".into(),
+    ))
+}
+
+/// Read, validate, and cache every audio part on `item`.
+pub fn materialize_audio_user_item(
+    item: &UserItem,
+    attachment_root: &Path,
+    store: &AudioBytesStore,
+) -> EngineResult<()> {
+    if item.audio_count() > MAX_AUDIOS_PER_TURN {
+        return Err(EngineError::TooManyAudio(item.audio_count()));
+    }
+    for part in &item.parts {
+        let UserContentPart::Audio {
+            attachment_id,
+            local_path,
+            mime_type,
+            byte_size,
+            format,
+        } = part
+        else {
+            continue;
+        };
+        if store.get(attachment_id).is_some() {
+            continue;
+        }
+        let canon = assert_path_in_root(Path::new(local_path), attachment_root)?;
+        let bytes = std::fs::read(&canon).map_err(|e| {
+            EngineError::AttachmentMissing(format!("{attachment_id} ({e})"))
+        })?;
+        if bytes.len() as u64 != *byte_size {
+            return Err(EngineError::AttachmentInvalid(
+                attachment_id.clone(),
+                format!("byte_size mismatch: declared {byte_size}, file {}", bytes.len()),
+            ));
+        }
+        if bytes.len() as u64 > MAX_AUDIO_BYTES {
+            return Err(EngineError::AttachmentInvalid(
+                attachment_id.clone(),
+                format!("audio exceeds maximum size ({} > {MAX_AUDIO_BYTES})", bytes.len()),
+            ));
+        }
+        let detected = detect_audio_mime(&bytes, &canon).map_err(|e| match e {
+            EngineError::AttachmentInvalid(_, msg) => {
+                EngineError::AttachmentInvalid(attachment_id.clone(), msg)
+            }
+            other => other,
+        })?;
+        if detected != *mime_type {
+            return Err(EngineError::AttachmentInvalid(
+                attachment_id.clone(),
+                format!(
+                    "mime mismatch: declared {}, magic/extension {}",
+                    mime_type.as_str(),
+                    detected.as_str()
+                ),
+            ));
+        }
+        store.insert(MaterializedAudio {
+            attachment_id: attachment_id.clone(),
+            mime_type: detected,
+            bytes,
+            format: format.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Materialize every user audio in a conversation (current turn + history).
+pub fn materialize_audio_items(
+    items: &[crate::conversation::ConversationItem],
+    attachment_root: &Path,
+) -> EngineResult<AudioBytesStore> {
+    let store = AudioBytesStore::default();
+    for item in items {
+        if let crate::conversation::ConversationItem::User(u) = item {
+            materialize_audio_user_item(u, attachment_root, &store)?;
+        }
+    }
+    Ok(store)
+}
+
 pub fn sha256_prefix(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
     hash.iter().take(4).map(|b| format!("{b:02x}")).collect()
@@ -361,9 +549,9 @@ pub fn redact_image_json(value: &mut serde_json::Value) {
             }
         }
         serde_json::Value::String(s) => {
-            if s.starts_with(DATA_URL_PREFIX) {
+            if s.starts_with(DATA_URL_PREFIX) || s.starts_with(AUDIO_DATA_URL_PREFIX) {
                 *s = "[REDACTED]".into();
-            } else if s.contains(DATA_URL_PREFIX) {
+            } else if s.contains(DATA_URL_PREFIX) || s.contains(AUDIO_DATA_URL_PREFIX) {
                 *s = redact_text(s);
             } else if looks_like_raw_image_b64(s) {
                 *s = "[REDACTED]".into();
@@ -374,6 +562,30 @@ pub fn redact_image_json(value: &mut serde_json::Value) {
 }
 
 fn redact_object(map: &mut serde_json::Map<String, serde_json::Value>) {
+    match map.get("audio_url") {
+        Some(serde_json::Value::String(s)) if s.starts_with(AUDIO_DATA_URL_PREFIX) => {
+            let mime = mime_from_data_url(s);
+            let decoded = decoded_len_from_data_url(s);
+            let prefix = sha_prefix_from_data_url(s);
+            map.insert(
+                "audio_url".into(),
+                serde_json::json!({
+                    "type": "audio",
+                    "mime_type": mime,
+                    "data": "[REDACTED]",
+                    "decoded_bytes": decoded,
+                    "sha256_prefix": prefix,
+                }),
+            );
+        }
+        Some(serde_json::Value::String(s)) => {
+            if let Some(redacted) = redact_signed_url(s) {
+                map.insert("audio_url".into(), serde_json::Value::String(redacted));
+            }
+        }
+        _ => {}
+    }
+
     match map.get("image_url") {
         Some(serde_json::Value::String(s)) if s.starts_with(DATA_URL_PREFIX) => {
             let mime = mime_from_data_url(s);

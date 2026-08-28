@@ -123,6 +123,7 @@ pub fn get_profile_definition(profile: ClientProfile) -> ClientProfileDefinition
         }
         ClientProfile::Codex => {
             let mut headers = BTreeMap::new();
+            headers.insert("originator".to_string(), "codex_cli_rs".to_string());
             headers.insert("openai-beta".to_string(), "responses=true".to_string());
             ClientProfileDefinition {
                 profile,
@@ -181,8 +182,8 @@ pub fn render_user_agent(profile: ClientProfile, custom_version: Option<&str>) -
         }
         ClientProfile::Codex => {
             // Mirrors upstream codex-rs login/src/auth/default_client.rs: get_codex_user_agent
-            // e.g. "codex-cli/0.1.0 (macos; aarch64) codex_cli"
-            format!("codex-cli/{version} ({os}; {arch}) codex_cli")
+            // e.g. "codex_cli_rs/0.1.0 (macos; aarch64) codex_cli"
+            format!("codex_cli_rs/{version} ({os}; {arch}) codex_cli")
         }
         ClientProfile::ClaudeCode => {
             // Mirrors upstream cc-src utils/http.ts: getUserAgent
@@ -234,9 +235,12 @@ pub fn build_profile_headers(
             if !api_key.is_empty() {
                 headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
             }
+            headers.insert("originator".to_string(), "codex_cli_rs".to_string());
             headers.insert("session-id".to_string(), resolved_session_id.clone());
             headers.insert("thread-id".to_string(), resolved_session_id.clone());
-            headers.insert("x-client-request-id".to_string(), resolved_session_id);
+            headers.insert("x-client-request-id".to_string(), resolved_session_id.clone());
+            headers.insert("x-codex-installation-id".to_string(), resolved_session_id.clone());
+            headers.insert("x-codex-window-id".to_string(), resolved_session_id);
         }
         ClientProfile::ClaudeCode => {
             if !api_key.is_empty() {
@@ -266,7 +270,7 @@ mod tests {
         let ua_codex = render_user_agent(ClientProfile::Codex, Some("1.2.3"));
         assert_eq!(
             ua_codex,
-            format!("codex-cli/1.2.3 ({}; {}) codex_cli", platform_os(), platform_arch())
+            format!("codex_cli_rs/1.2.3 ({}; {}) codex_cli", platform_os(), platform_arch())
         );
 
         let ua_claude = render_user_agent(ClientProfile::ClaudeCode, None);
@@ -298,5 +302,21 @@ mod tests {
         assert_eq!(h_grok.get("x-grok-client-identifier").unwrap(), "grok-cli");
         assert_eq!(h_grok.get("x-grok-doom-loop-check").unwrap(), "1");
         assert_eq!(h_grok.get("authorization").unwrap(), "Bearer test_key");
+
+        let h_codex = build_profile_headers(
+            ClientProfile::Codex,
+            "test_key",
+            Some("sess-456"),
+            None,
+            false,
+        );
+        assert_eq!(h_codex.get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(h_codex.get("session-id").unwrap(), "sess-456");
+        assert_eq!(h_codex.get("thread-id").unwrap(), "sess-456");
+        assert_eq!(h_codex.get("x-client-request-id").unwrap(), "sess-456");
+        assert_eq!(h_codex.get("x-codex-installation-id").unwrap(), "sess-456");
+        assert_eq!(h_codex.get("x-codex-window-id").unwrap(), "sess-456");
+        assert_eq!(h_codex.get("openai-beta").unwrap(), "responses=true");
+        assert_eq!(h_codex.get("authorization").unwrap(), "Bearer test_key");
     }
 }
