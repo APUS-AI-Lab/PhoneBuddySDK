@@ -37,22 +37,48 @@ pub enum AgentEvent {
     /// Turn failed.
     Failed { message: String },
     /// The current provider failed and the engine is waiting before retrying
-    /// the same provider. `provider` is a desensitized host/model id.
+    /// the same provider. `provider` is a desensitized host/model label
+    /// (legacy). `provider_id` is the stable join key.
     Retrying {
         provider: String,
         attempt: u32,
         max_attempts: u32,
         wait_ms: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// The current provider was marked degraded and the engine switched to
-    /// the next endpoint in the fallback chain. `from` / `to` are
-    /// desensitized host/model ids; they never carry an API key.
+    /// the next endpoint. `from` / `to` are desensitized host/model labels
+    /// kept during deprecation; `from_provider_id` / `to_provider_id` are
+    /// the stable join keys. They never carry an API key.
     ProviderSwitched {
         from: String,
         to: String,
         reason: String,
         cooldown_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_label: Option<String>,
     },
 }
 
@@ -119,10 +145,16 @@ mod tests {
             max_attempts: 3,
             wait_ms: 2000,
             reason: "status=503".into(),
+            provider_id: Some("legacy-primary".into()),
+            pool_id: Some("main".into()),
+            operation_id: None,
+            failure_class: Some("retryable_http".into()),
+            label: Some("cf.api.fan/grok-4.6".into()),
         };
         let json = serde_json::to_string(&retrying).unwrap();
         assert!(json.contains("\"Retrying\""));
         assert!(json.contains("cf.api.fan/grok-4.6"));
+        assert!(json.contains("legacy-primary"));
         assert!(!json.to_ascii_lowercase().contains("sk-"));
 
         let switched = AgentEvent::ProviderSwitched {
@@ -130,9 +162,21 @@ mod tests {
             to: "api.openai.com/gpt-5.6".into(),
             reason: "status=503".into(),
             cooldown_ms: 120_000,
+            from_provider_id: Some("legacy-primary".into()),
+            to_provider_id: Some("legacy-fallback-0".into()),
+            pool_id: Some("main".into()),
+            operation_id: None,
+            failure_class: Some("retryable_http".into()),
+            from_label: Some("cf.api.fan/grok-4.6".into()),
+            to_label: Some("api.openai.com/gpt-5.6".into()),
         };
         let json = serde_json::to_string(&switched).unwrap();
         assert!(json.contains("\"ProviderSwitched\""));
+        assert!(json.contains("from_provider_id"));
+        assert!(json.contains("legacy-fallback-0"));
+        let legacy =
+            r#"{"ProviderSwitched":{"from":"a/m","to":"b/m","reason":"x","cooldown_ms":1}}"#;
+        let _legacy_back: AgentEvent = serde_json::from_str(legacy).unwrap();
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             AgentEvent::ProviderSwitched { cooldown_ms, .. } => {

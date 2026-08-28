@@ -9,20 +9,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::agent::doom_loop::{
-    step_signature, stationarity_nudge_message, IdenticalToolCallRun,
-};
+use crate::agent::doom_loop::{stationarity_nudge_message, step_signature, IdenticalToolCallRun};
 use crate::config::{EngineConfig, LlmMode};
+use crate::conversation::{user_assistant_count, ConversationItem};
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
-use crate::conversation::{user_assistant_count, ConversationItem};
+use crate::llm::router::MAIN_POOL_ID;
 use crate::llm::types::{
     drop_colliding_function_tools, ConversationRequest, HostedTool, ToolCall, ToolDefinitionWire,
     Usage,
 };
 use crate::prompt::{build_system_prompt, PromptRuntime};
+use crate::runtime::PhoneBuddyRuntime;
 use crate::session::{SessionStore, StoredSession};
 use crate::tools::fs::Sandbox;
 use crate::tools::host::{HostToolHub, HostToolNotify};
@@ -144,6 +144,9 @@ pub struct PhoneBuddyEngine {
     tools: Arc<ToolRegistry>,
     sandbox: Arc<Sandbox>,
     client: Arc<LlmClient>,
+    /// Present when this engine was created from a [`PhoneBuddyRuntime`]
+    /// (including the private runtime synthesized by [`Self::new`]).
+    buddy_runtime: Option<Arc<PhoneBuddyRuntime>>,
     sessions: SessionStore,
     plan_state: Arc<PlanState>,
     task_manager: Arc<crate::agent::task_manager::TaskManager>,
@@ -157,26 +160,71 @@ pub struct PhoneBuddyEngine {
 
 impl PhoneBuddyEngine {
     /// Build an engine with HTTP or Host transport and the full toolset.
+    ///
+    /// HTTP mode synthesizes a private [`PhoneBuddyRuntime`] from
+    /// primary + `fallback_providers` so existing callers keep working.
     pub fn new(config: EngineConfig) -> EngineResult<Arc<Self>> {
-        config
-            .validate()
-            .map_err(|e| EngineError::Config(e))?;
+        config.validate().map_err(EngineError::Config)?;
 
-        // Force the ring crypto provider (iOS/Android-friendly).
+        match config.llm_mode {
+            LlmMode::Http => {
+                let runtime = PhoneBuddyRuntime::from_engine_config(&config)?;
+                Self::from_runtime(runtime, config, MAIN_POOL_ID)
+            }
+            LlmMode::Host => {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let host_llm = HostLlmHub::new();
+                let host_tools = HostToolHub::new();
+                let webview = WebViewHost::new();
+                let sandbox = Arc::new(Sandbox::new(&config.root_dir)?);
+                let client = Arc::new(LlmClient::new(
+                    Arc::new(HostLlmTransport::new(host_llm.clone())),
+                    config.max_retries,
+                ));
+                Self::assemble(config, client, host_llm, host_tools, webview, sandbox, None)
+            }
+        }
+    }
+
+    /// Bind an engine to an existing runtime's named pool. Recreating an
+    /// engine against the same runtime keeps provider health.
+    pub fn from_runtime(
+        runtime: Arc<PhoneBuddyRuntime>,
+        config: EngineConfig,
+        main_pool_id: &str,
+    ) -> EngineResult<Arc<Self>> {
+        config.validate().map_err(EngineError::Config)?;
         let _ = rustls::crypto::ring::default_provider().install_default();
+        if !runtime.router().has_pool(main_pool_id) {
+            return Err(EngineError::RouteNotConfigured {
+                pool_id: main_pool_id.to_string(),
+            });
+        }
 
         let host_llm = HostLlmHub::new();
         let host_tools = HostToolHub::new();
         let webview = WebViewHost::new();
         let sandbox = Arc::new(Sandbox::new(&config.root_dir)?);
         let client = match config.llm_mode {
-            LlmMode::Http => Arc::new(LlmClient::from_http(&config)?),
+            LlmMode::Http => Arc::new(LlmClient::from_router(
+                runtime.router(),
+                main_pool_id,
+                &config,
+            )?),
             LlmMode::Host => Arc::new(LlmClient::new(
                 Arc::new(HostLlmTransport::new(host_llm.clone())),
                 config.max_retries,
             )),
         };
-        Self::assemble(config, client, host_llm, host_tools, webview, sandbox)
+        Self::assemble(
+            config,
+            client,
+            host_llm,
+            host_tools,
+            webview,
+            sandbox,
+            Some(runtime),
+        )
     }
 
     /// Build an engine around a custom transport (used for the mock/demo
@@ -190,7 +238,7 @@ impl PhoneBuddyEngine {
         let webview = WebViewHost::new();
         let sandbox = Arc::new(Sandbox::new(&config.root_dir)?);
         let client = Arc::new(LlmClient::new(transport, config.max_retries));
-        Self::assemble(config, client, host_llm, host_tools, webview, sandbox)
+        Self::assemble(config, client, host_llm, host_tools, webview, sandbox, None)
     }
 
     fn assemble(
@@ -200,6 +248,7 @@ impl PhoneBuddyEngine {
         host_tools: Arc<HostToolHub>,
         webview: Arc<WebViewHost>,
         sandbox: Arc<Sandbox>,
+        buddy_runtime: Option<Arc<PhoneBuddyRuntime>>,
     ) -> EngineResult<Arc<Self>> {
         let sessions = SessionStore::new(config.sessions_dir())?;
         let plan_state = PlanState::new();
@@ -247,10 +296,9 @@ impl PhoneBuddyEngine {
         registry.register(crate::tools::grep::arc());
         registry.register(crate::tools::busybox::arc());
         registry.register(crate::tools::script::arc());
-        registry.register(crate::tools::web_search::arc_from_engine_config_with_webview(
-            &config,
-            webview.clone(),
-        ));
+        registry.register(
+            crate::tools::web_search::arc_from_engine_config_with_webview(&config, webview.clone()),
+        );
         registry.register(crate::tools::web_fetch::arc_with_allow_local_and_webview(
             config.web_fetch_allow_local,
             webview.clone(),
@@ -264,7 +312,9 @@ impl PhoneBuddyEngine {
         registry.register(crate::tools::ask_user_question::arc(host_tools.clone()));
         registry.register(crate::tools::task::task_arc(task_manager.clone()));
         registry.register(crate::tools::task::task_output_arc(task_manager.clone()));
-        registry.register(crate::tools::task::get_task_output_arc(task_manager.clone()));
+        registry.register(crate::tools::task::get_task_output_arc(
+            task_manager.clone(),
+        ));
         registry.register(crate::tools::task::kill_task_arc(task_manager.clone()));
         registry.register(crate::tools::task::wait_tasks_arc(task_manager.clone()));
         registry.register(crate::tools::monitor::arc(
@@ -282,6 +332,7 @@ impl PhoneBuddyEngine {
             tools: registry,
             sandbox,
             client,
+            buddy_runtime,
             sessions,
             plan_state,
             task_manager,
@@ -295,6 +346,10 @@ impl PhoneBuddyEngine {
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    pub fn phone_buddy_runtime(&self) -> Option<&Arc<PhoneBuddyRuntime>> {
+        self.buddy_runtime.as_ref()
     }
 
     pub fn sandbox(&self) -> &Arc<Sandbox> {
@@ -335,11 +390,7 @@ impl PhoneBuddyEngine {
     }
 
     /// Register host callbacks for LLM streaming and host-tool execution.
-    pub fn set_host_callbacks(
-        &self,
-        llm: Option<HostLlmNotify>,
-        tool: Option<HostToolNotify>,
-    ) {
+    pub fn set_host_callbacks(&self, llm: Option<HostLlmNotify>, tool: Option<HostToolNotify>) {
         if let Some(cb) = llm {
             self.host_llm.set_notify(cb);
         } else {
@@ -400,16 +451,18 @@ impl PhoneBuddyEngine {
             self.config.api_backend,
         );
         let root = self.config.resolved_attachment_root();
-        let image_bytes = if items.iter().any(|i| {
-            matches!(i, ConversationItem::User(u) if u.has_images())
-        }) {
+        let image_bytes = if items
+            .iter()
+            .any(|i| matches!(i, ConversationItem::User(u) if u.has_images()))
+        {
             crate::llm::image::materialize_items(&items, &root)?
         } else {
             crate::llm::image::ImageBytesStore::default()
         };
-        let audio_bytes = if items.iter().any(|i| {
-            matches!(i, ConversationItem::User(u) if u.has_audio())
-        }) {
+        let audio_bytes = if items
+            .iter()
+            .any(|i| matches!(i, ConversationItem::User(u) if u.has_audio()))
+        {
             crate::llm::image::materialize_audio_items(&items, &root)?
         } else {
             crate::llm::image::AudioBytesStore::default()
@@ -536,11 +589,7 @@ impl PhoneBuddyEngine {
             }
         };
 
-        self.cancellation
-            .lock()
-            .unwrap()
-            .active
-            .remove(session_id);
+        self.cancellation.lock().unwrap().active.remove(session_id);
 
         match &result {
             Ok(outcome) => {
@@ -680,7 +729,11 @@ impl PhoneBuddyEngine {
                 if let ConversationItem::BackendToolCall(b) = item {
                     let name = b.display_name();
                     if name == "x_thread_fetch" || name.starts_with("x_") || name == "x_search" {
-                        let input_str = b.payload.get("input").map(|v| v.to_string()).unwrap_or_default();
+                        let input_str = b
+                            .payload
+                            .get("input")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
                         let output_str = b
                             .payload
                             .get("output")
@@ -762,8 +815,7 @@ impl PhoneBuddyEngine {
 
             // Once-per-run nudge after results are committed (upstream latch).
             if identical.take_nudge() {
-                let nudge =
-                    stationarity_nudge_message(&identical.tool_name, identical.run_len);
+                let nudge = stationarity_nudge_message(&identical.tool_name, identical.run_len);
                 session.items.push(ConversationItem::system(nudge));
             }
 
@@ -782,11 +834,9 @@ impl PhoneBuddyEngine {
         let args: serde_json::Value = if call.function.arguments.trim().is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(&call.function.arguments).map_err(|e| {
-                EngineError::ToolArgs {
-                    name: name.clone(),
-                    message: format!("invalid JSON arguments: {e}"),
-                }
+            serde_json::from_str(&call.function.arguments).map_err(|e| EngineError::ToolArgs {
+                name: name.clone(),
+                message: format!("invalid JSON arguments: {e}"),
             })?
         };
 
@@ -797,15 +847,24 @@ impl PhoneBuddyEngine {
                 cancel: token.clone(),
             };
             if let Some(cmd_arr) = args.as_array() {
-                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                let argv: Vec<String> = cmd_arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
                 return crate::tools::busybox::execute_command_argv(&argv, &ctx);
             }
             if let Some(cmd_arr) = args.get("command").and_then(|v| v.as_array()) {
-                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                let argv: Vec<String> = cmd_arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
                 return crate::tools::busybox::execute_command_argv(&argv, &ctx);
             }
             if let Some(cmd_arr) = args.pointer("/action/command").and_then(|v| v.as_array()) {
-                let argv: Vec<String> = cmd_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                let argv: Vec<String> = cmd_arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
                 return crate::tools::busybox::execute_command_argv(&argv, &ctx);
             }
             if let Some(cmd_str) = args.get("command").and_then(|v| v.as_str()) {

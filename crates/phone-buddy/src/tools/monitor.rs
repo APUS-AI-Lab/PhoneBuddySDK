@@ -15,7 +15,7 @@ use crate::agent::task_manager::TaskManager;
 use crate::error::{EngineError, EngineResult};
 use crate::tools::host::HostToolHub;
 use crate::tools::{
-    arg_opt_str, arg_opt_usize, schema_object, s_boolean, s_enum, s_integer, s_string, Tool,
+    arg_opt_str, arg_opt_usize, s_boolean, s_enum, s_integer, s_string, schema_object, Tool,
     ToolCtx, ToolOutput, ToolSpec,
 };
 
@@ -64,7 +64,10 @@ impl Tool for MonitorTool {
         let path = arg_opt_str(&args, "path");
         let task_id = arg_opt_str(&args, "task_id");
         let event_type = arg_opt_str(&args, "event_type");
-        let offset = args.get("offset").and_then(Value::as_u64).map(|v| v as usize);
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
         let max_lines = arg_opt_usize(&args, "lines", 50).min(500);
         let filter = arg_opt_str(&args, "filter");
         let tail = args.get("tail").and_then(Value::as_bool).unwrap_or(true);
@@ -85,12 +88,23 @@ impl Tool for MonitorTool {
         };
 
         match target {
-            "task" => self.execute_task_monitor(task_id, offset, max_lines, filter, tail).await,
-            "file" => self.execute_file_monitor(ctx, path, offset, max_lines, filter, tail).await,
-            "host" => self.execute_host_monitor(ctx, event_type, offset, max_lines, filter).await,
+            "task" => {
+                self.execute_task_monitor(task_id, offset, max_lines, filter, tail)
+                    .await
+            }
+            "file" => {
+                self.execute_file_monitor(ctx, path, offset, max_lines, filter, tail)
+                    .await
+            }
+            "host" => {
+                self.execute_host_monitor(ctx, event_type, offset, max_lines, filter)
+                    .await
+            }
             _ => Err(EngineError::ToolArgs {
                 name: "monitor".into(),
-                message: format!("unsupported target '{target}', must be 'file', 'task', or 'host'"),
+                message: format!(
+                    "unsupported target '{target}', must be 'file', 'task', or 'host'"
+                ),
             }),
         }
     }
@@ -115,8 +129,12 @@ impl MonitorTool {
             }
         };
 
-        let result = self.task_manager.get_task_logs(&tid, offset, max_lines, filter.as_deref(), tail)?;
-        Ok(ToolOutput::new(serde_json::to_string_pretty(&result).unwrap()))
+        let result =
+            self.task_manager
+                .get_task_logs(&tid, offset, max_lines, filter.as_deref(), tail)?;
+        Ok(ToolOutput::new(
+            serde_json::to_string_pretty(&result).unwrap(),
+        ))
     }
 
     async fn execute_file_monitor(
@@ -213,7 +231,9 @@ impl MonitorTool {
             "content": if formatted_content.is_empty() { "(no matching log lines found)".to_string() } else { formatted_content }
         });
 
-        Ok(ToolOutput::new(serde_json::to_string_pretty(&response).unwrap()))
+        Ok(ToolOutput::new(
+            serde_json::to_string_pretty(&response).unwrap(),
+        ))
     }
 
     async fn execute_host_monitor(
@@ -234,7 +254,10 @@ impl MonitorTool {
                 "lines": max_lines,
                 "filter": filter,
             });
-            return self.host_tools.execute("monitor", host_args, &ctx.cancel).await;
+            return self
+                .host_tools
+                .execute("monitor", host_args, &ctx.cancel)
+                .await;
         } else if self.host_tools.has("host_monitor") {
             let host_args = serde_json::json!({
                 "event_type": event_name,
@@ -242,7 +265,10 @@ impl MonitorTool {
                 "lines": max_lines,
                 "filter": filter,
             });
-            return self.host_tools.execute("host_monitor", host_args, &ctx.cancel).await;
+            return self
+                .host_tools
+                .execute("host_monitor", host_args, &ctx.cancel)
+                .await;
         }
 
         // Notify host via HostToolHub notify_event for passive observation
@@ -251,7 +277,8 @@ impl MonitorTool {
             "event_type": event_name,
             "filter": filter,
         });
-        self.host_tools.notify_event("monitor", &notify_payload.to_string());
+        self.host_tools
+            .notify_event("monitor", &notify_payload.to_string());
 
         let res = serde_json::json!({
             "target": "host",
@@ -274,13 +301,25 @@ mod tests {
     use crate::tools::ToolRegistry;
     use tempfile::tempdir;
 
-    fn setup_env() -> (Arc<TaskManager>, Arc<HostToolHub>, Arc<Sandbox>, tempfile::TempDir) {
+    fn setup_env() -> (
+        Arc<TaskManager>,
+        Arc<HostToolHub>,
+        Arc<Sandbox>,
+        tempfile::TempDir,
+    ) {
         let dir = tempdir().unwrap();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        let config = EngineConfig::default();
+        let mut config = EngineConfig::default();
+        config.api_key = "test".into();
+        config.root_dir = dir.path().to_path_buf();
         let client = Arc::new(LlmClient::from_http(&config).unwrap());
         let subagent_tools = Arc::new(ToolRegistry::new());
-        let task_manager = Arc::new(TaskManager::new(config, client, sandbox.clone(), subagent_tools));
+        let task_manager = Arc::new(TaskManager::new(
+            config,
+            client,
+            sandbox.clone(),
+            subagent_tools,
+        ));
         let host_tools = HostToolHub::new();
         (task_manager, host_tools, sandbox, dir)
     }

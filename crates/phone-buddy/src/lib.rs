@@ -38,6 +38,7 @@ pub mod error;
 pub mod events;
 pub mod llm;
 pub mod prompt;
+pub mod runtime;
 pub mod session;
 pub mod tools;
 
@@ -48,11 +49,17 @@ pub mod prelude {
     };
     pub use crate::engine::{ChatOutcome, PhoneBuddyEngine};
     pub use crate::error::{EngineError, EngineResult};
-    pub use crate::events::{AgentEvent, AgentObserver, NullObserver, RecordingObserver, UsageSummary};
+    pub use crate::events::{
+        AgentEvent, AgentObserver, NullObserver, RecordingObserver, UsageSummary,
+    };
+    pub use crate::llm::router::{
+        ExhaustionPolicy, LlmRoutingConfig, PoolMember, ProviderPool, ProviderTarget, RetryPolicy,
+        RouterHealthConfig, MAIN_POOL_ID, SUBAGENT_POOL_ID,
+    };
     pub use crate::llm::types::{ApiBackend, ReasoningEffort};
+    pub use crate::runtime::PhoneBuddyRuntime;
     pub use crate::session::SessionMeta;
 }
-
 
 pub use prelude::*;
 

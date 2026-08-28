@@ -83,7 +83,27 @@ pub enum EngineError {
 
     #[error("inline request payload too large")]
     PayloadTooLarge,
+
+    #[error("invalid routing configuration: {0}")]
+    InvalidRoutingConfig(String),
+
+    #[error("route not configured: pool '{pool_id}'")]
+    RouteNotConfigured { pool_id: String },
+
+    #[error("pool '{pool_id}' exhausted (retry-after {retry_after_ms}ms)")]
+    PoolExhausted {
+        pool_id: String,
+        retry_after_ms: u64,
+    },
+
+    #[error(
+        "provider attempts exhausted in pool '{pool_id}' (tried: {})",
+        tried_provider_ids.join(", ")
+    )]
+    ProviderAttemptsExhausted {
+        pool_id: String,
+        tried_provider_ids: Vec<String>,
+    },
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
-

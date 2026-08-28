@@ -52,6 +52,7 @@ impl AgentObserver for PrintObserver {
                 max_attempts,
                 wait_ms,
                 reason,
+                ..
             } => {
                 eprintln!(
                     "\x1b[33m  ⟳ retry {provider} {attempt}/{max_attempts} wait={wait_ms}ms ({reason})\x1b[0m"
@@ -62,6 +63,7 @@ impl AgentObserver for PrintObserver {
                 to,
                 reason,
                 cooldown_ms,
+                ..
             } => {
                 eprintln!(
                     "\x1b[36m  ⇄ switch {from} → {to} cooldown={cooldown_ms}ms ({reason})\x1b[0m"

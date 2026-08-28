@@ -1,0 +1,330 @@
+//! SDK-owned LLM router: named pools, shared health, deterministic selection.
+
+mod config;
+mod health;
+mod select;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
+pub use config::{
+    synthesize_legacy_routing, ExhaustionPolicy, LlmRoutingConfig, PoolMember,
+    ProviderCapabilities, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig,
+    DEFAULT_BASE_SCORE, DEFAULT_ROUTING_GROUP, LEGACY_PRIMARY_PROVIDER_ID, MAIN_POOL_ID,
+    SUBAGENT_POOL_ID,
+};
+pub use health::{health_file_path, FailureClass, ProviderHealthRecord};
+pub use select::VisitPlan;
+
+use config::resolve_compat_key;
+use health::{load_health_file, reconcile_health, save_health_file};
+use select::{select_visit_order, SelectError};
+
+use crate::error::{EngineError, EngineResult};
+
+/// Shared router state. Longer-lived than an engine; not [`Clone`].
+pub struct LlmRouter {
+    inner: Mutex<RouterInner>,
+    persist_path: Option<PathBuf>,
+}
+
+struct RouterInner {
+    config: LlmRoutingConfig,
+    health: HashMap<String, ProviderHealthRecord>,
+}
+
+impl LlmRouter {
+    /// In-memory router (tests and injected transports). Does not persist.
+    pub fn in_memory(config: LlmRoutingConfig) -> EngineResult<Arc<Self>> {
+        Self::open(config, None)
+    }
+
+    /// Router that loads and stores health under `root_dir`.
+    pub fn persist(
+        config: LlmRoutingConfig,
+        root_dir: impl Into<PathBuf>,
+    ) -> EngineResult<Arc<Self>> {
+        Self::open(config, Some(root_dir.into()))
+    }
+
+    fn open(config: LlmRoutingConfig, root_dir: Option<PathBuf>) -> EngineResult<Arc<Self>> {
+        config
+            .validate()
+            .map_err(EngineError::InvalidRoutingConfig)?;
+        let persist_path = root_dir.as_ref().map(|d| health_file_path(d));
+        let mut health = persist_path
+            .as_ref()
+            .map(|p| load_health_file(p))
+            .unwrap_or_default();
+        let now = Utc::now();
+        reconcile_health(&mut health, &config, now);
+        let router = Arc::new(Self {
+            inner: Mutex::new(RouterInner { config, health }),
+            persist_path,
+        });
+        router.persist_locked();
+        Ok(router)
+    }
+
+    pub fn snapshot_config(&self) -> LlmRoutingConfig {
+        self.inner.lock().unwrap().config.clone()
+    }
+
+    pub fn has_pool(&self, pool_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .config
+            .pools
+            .contains_key(pool_id)
+    }
+
+    pub fn health_record(&self, provider_id: &str) -> Option<ProviderHealthRecord> {
+        self.inner.lock().unwrap().health.get(provider_id).cloned()
+    }
+
+    pub fn resolved_compat_key(&self, provider_id: &str) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .config
+            .provider(provider_id)
+            .map(|p| p.resolved_compat_key())
+            .unwrap_or_else(|| resolve_compat_key(None, provider_id))
+    }
+
+    /// Replace routing policy. In-flight operations may finish on a
+    /// previously captured visit plan; health is reconciled by `provider_id`.
+    pub fn update_config(&self, config: LlmRoutingConfig) -> EngineResult<()> {
+        config
+            .validate()
+            .map_err(EngineError::InvalidRoutingConfig)?;
+        let mut inner = self.inner.lock().unwrap();
+        let now = Utc::now();
+        reconcile_health(&mut inner.health, &config, now);
+        inner.config = config;
+        self.write_health(&inner);
+        Ok(())
+    }
+
+    /// Capture a visit order for one operation. Health timestamps are pruned
+    /// under the router lock before ranking.
+    pub fn plan_visit(&self, pool_id: &str) -> EngineResult<VisitPlan> {
+        self.plan_visit_at(pool_id, Utc::now())
+    }
+
+    pub fn plan_visit_at(&self, pool_id: &str, now: DateTime<Utc>) -> EngineResult<VisitPlan> {
+        let mut inner = self.inner.lock().unwrap();
+        let pool = inner.config.pools.get(pool_id).cloned().ok_or_else(|| {
+            EngineError::RouteNotConfigured {
+                pool_id: pool_id.to_string(),
+            }
+        })?;
+        let health_cfg = inner.config.health.clone();
+        let live_config = inner.config.clone();
+        reconcile_health(&mut inner.health, &live_config, now);
+        match select_visit_order(pool_id, &pool, &inner.health, &health_cfg, now) {
+            Ok(plan) => Ok(plan),
+            Err(SelectError::FailFast { retry_after_ms }) => Err(EngineError::PoolExhausted {
+                pool_id: pool_id.to_string(),
+                retry_after_ms,
+            }),
+        }
+    }
+
+    pub fn record_trip(
+        &self,
+        operation_id: &str,
+        provider_id: &str,
+        class: FailureClass,
+        retry_after: Option<Duration>,
+    ) -> Duration {
+        self.record_trip_at(operation_id, provider_id, class, retry_after, Utc::now())
+    }
+
+    pub fn record_trip_at(
+        &self,
+        operation_id: &str,
+        provider_id: &str,
+        class: FailureClass,
+        retry_after: Option<Duration>,
+        now: DateTime<Utc>,
+    ) -> Duration {
+        let mut inner = self.inner.lock().unwrap();
+        let health_cfg = inner.config.health.clone();
+        let rec = inner.health.entry(provider_id.to_string()).or_default();
+        rec.last_seen_in_config = Some(now);
+        let wait = rec.trip(now, operation_id, class, &health_cfg, retry_after);
+        self.write_health(&inner);
+        wait
+    }
+
+    pub fn record_success(&self, provider_id: &str) {
+        self.record_success_at(provider_id, Utc::now());
+    }
+
+    pub fn record_success_at(&self, provider_id: &str, now: DateTime<Utc>) {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner.health.entry(provider_id.to_string()).or_default();
+        rec.recover(now);
+        rec.last_seen_in_config = Some(now);
+        self.write_health(&inner);
+    }
+
+    fn persist_locked(&self) {
+        let inner = self.inner.lock().unwrap();
+        self.write_health(&inner);
+    }
+
+    fn write_health(&self, inner: &RouterInner) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Err(e) = save_health_file(path, &inner.health) {
+            tracing::warn!("failed to persist router health at {}: {e}", path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::router::config::{
+        PoolMember, ProviderPool, ProviderTarget, DEFAULT_ROUTING_GROUP,
+    };
+    use chrono::TimeZone;
+
+    fn target(id: &str, url: &str) -> ProviderTarget {
+        ProviderTarget {
+            provider_id: id.into(),
+            base_url: url.into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            api_backend: Default::default(),
+            client_profile: Default::default(),
+            client_version: None,
+            client_session_id: None,
+            reasoning_compatibility_key: None,
+            capabilities: Default::default(),
+            extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
+            enable_web_search: false,
+            web_search_options: None,
+            enable_x_search: false,
+            x_search_options: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn member(id: &str, order: u32) -> PoolMember {
+        PoolMember {
+            provider_id: id.into(),
+            routing_group: DEFAULT_ROUTING_GROUP.into(),
+            base_score: 10,
+            order,
+            enabled: true,
+        }
+    }
+
+    fn two_provider_config(same_url: bool) -> LlmRoutingConfig {
+        let url_a = "https://api.example.com/v1";
+        let url_b = if same_url {
+            url_a
+        } else {
+            "https://backup.example.com/v1"
+        };
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            "main".into(),
+            ProviderPool {
+                members: vec![member("p-a", 0), member("p-b", 1)],
+                ..Default::default()
+            },
+        );
+        pools.insert(
+            "subagent".into(),
+            ProviderPool {
+                members: vec![member("p-a", 0)],
+                ..Default::default()
+            },
+        );
+        LlmRoutingConfig {
+            providers: vec![target("p-a", url_a), target("p-b", url_b)],
+            pools,
+            health: RouterHealthConfig::default(),
+        }
+    }
+
+    #[test]
+    fn same_provider_id_in_two_pools_shares_trips() {
+        let router = LlmRouter::in_memory(two_provider_config(false)).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        router.record_trip_at("op1", "p-a", FailureClass::RetryableHttp, None, t);
+        assert!(router.health_record("p-a").unwrap().is_cooling(t));
+        let main = router.plan_visit_at("main", t).unwrap();
+        assert_eq!(main.provider_ids[0], "p-b");
+        let sub = router.plan_visit_at("subagent", t).unwrap();
+        // Only member is cooling; probe_earliest still returns it.
+        assert_eq!(sub.provider_ids[0], "p-a");
+        assert!(router.health_record("p-a").unwrap().is_cooling(t));
+    }
+
+    #[test]
+    fn distinct_ids_same_url_have_independent_health() {
+        let router = LlmRouter::in_memory(two_provider_config(true)).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        router.record_trip_at("op1", "p-a", FailureClass::RetryableHttp, None, t);
+        assert!(router.health_record("p-a").unwrap().is_cooling(t));
+        assert!(!router
+            .health_record("p-b")
+            .map(|h| h.is_cooling(t))
+            .unwrap_or(false));
+        let plan = router.plan_visit_at("main", t).unwrap();
+        assert_eq!(plan.provider_ids[0], "p-b");
+    }
+
+    #[test]
+    fn config_update_reconciles_by_stable_id() {
+        let router = LlmRouter::in_memory(two_provider_config(false)).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        router.record_trip_at("op1", "p-a", FailureClass::Fatal, None, t);
+        let trips = router.health_record("p-a").unwrap().consecutive_trips;
+
+        let mut next = two_provider_config(false);
+        next.providers[0].model = "m2".into();
+        router.update_config(next).unwrap();
+        assert_eq!(
+            router.health_record("p-a").unwrap().consecutive_trips,
+            trips
+        );
+    }
+
+    #[test]
+    fn persistence_reloads_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = Utc::now();
+        let router = LlmRouter::persist(two_provider_config(false), dir.path()).unwrap();
+        router.record_trip_at("op1", "p-a", FailureClass::RetryableHttp, None, t);
+        drop(router);
+
+        let reloaded = LlmRouter::persist(two_provider_config(false), dir.path()).unwrap();
+        let rec = reloaded.health_record("p-a").unwrap();
+        assert_eq!(rec.consecutive_trips, 1);
+        assert!(rec.is_cooling(t));
+    }
+
+    #[test]
+    fn missing_pool_is_not_configured() {
+        let router = LlmRouter::in_memory(two_provider_config(false)).unwrap();
+        let err = router.plan_visit("session_title").unwrap_err();
+        match err {
+            EngineError::RouteNotConfigured { pool_id } => {
+                assert_eq!(pool_id, "session_title");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

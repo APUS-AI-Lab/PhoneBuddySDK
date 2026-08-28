@@ -1,46 +1,49 @@
-//! Retrying LLM client with optional provider failover.
+//! Retrying LLM client bound to a named provider pool.
 //!
 //! Wraps one or more [`LlmTransport`]s with the retry/backoff policy ported
-//! from the grok sampler. When `fallback_providers` is empty, behaviour is
-//! unchanged: a single provider spends the full `max_retries` budget.
-//! When a chain is configured, each provider is limited to a small
-//! `failover_max_attempts` budget (~6s) before the next endpoint is tried,
-//! and a tripped provider sits out for a cooldown so later requests stick
-//! to the backup.
+//! from the grok sampler. Selection and health live on the shared
+//! [`crate::llm::router::LlmRouter`]. A single-member pool spends the full
+//! `max_retries` budget; a multi-member pool uses `failover_max_attempts`
+//! per visit before the next endpoint is tried.
 //!
 //! Retries and failovers only happen before any content has been streamed
 //! to the observer, so the UI never sees duplicated deltas — except for
 //! SSE idle-timeout prefix continuation (same provider once, then failover).
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver};
 use crate::llm::doom_loop_wire::DoomLoopRecoveryPolicy;
-use crate::llm::failover::{
-    compatibility_key, provider_fingerprint, resolve_provider_group, select_index,
-    ProviderHealth, FAILOVER_RETRY_AFTER_INLINE_CAP,
-};
+use crate::llm::failover::{provider_fingerprint, FAILOVER_RETRY_AFTER_INLINE_CAP};
 use crate::llm::retry::{
     doom_loop_backoff, is_retry_vetoed_message, parse_retry_after, retry_backoff_with_jitter,
     RetryClass, RATE_LIMIT_RETRY_THRESHOLD,
 };
+use crate::llm::router::{
+    synthesize_legacy_routing, ExhaustionPolicy, FailureClass, LlmRouter, LlmRoutingConfig,
+    PoolMember, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, MAIN_POOL_ID,
+};
 use crate::llm::stream::{collect_stream, CollectStreamError};
-use crate::llm::transport::{retry_class_for_error, LlmTransport, LlmTurnContext};
+use crate::llm::transport::{
+    retry_class_for_error, status_from_error, LlmTransport, LlmTurnContext,
+};
 use crate::llm::types::{
     drop_colliding_function_tools, CollectedTurn, ConversationRequest, HostedTool,
 };
 
 pub struct LlmClient {
-    providers: Vec<ProviderSlot>,
+    providers: HashMap<String, ProviderSlot>,
+    router: Arc<LlmRouter>,
+    pool_id: String,
     /// Single-provider retry budget (`EngineConfig.max_retries`).
     max_retries: u32,
     /// Chain-mode per-provider attempt budget (total tries, including the
-    /// first). Ignored when `providers.len() == 1`.
+    /// first). Ignored when the bound pool has a single member.
     failover_max_attempts: u32,
-    provider_cooldown_secs: u64,
     /// Independent budget for server doom-loop resamples (default 2).
     doom_loop_max_retries: u32,
     last_success: Mutex<Option<String>>,
@@ -69,10 +72,11 @@ impl LlmTurnSession<'_> {
 }
 
 struct ProviderSlot {
+    provider_id: String,
     transport: Arc<dyn LlmTransportObj>,
-    /// Desensitized `host/model` for events.
+    /// Desensitized `host/model` label for humans / legacy events.
     fingerprint: String,
-    /// `{group}/{model}` — same key keeps encrypted thinking on failover.
+    /// Reasoning compatibility key — same key keeps encrypted thinking.
     compat_key: String,
     model: String,
     api_backend: crate::llm::types::ApiBackend,
@@ -81,7 +85,6 @@ struct ProviderSlot {
     web_search_options: Option<crate::llm::types::WebSearchOptions>,
     enable_x_search: bool,
     x_search_options: Option<crate::llm::types::XSearchOptions>,
-    health: Mutex<ProviderHealth>,
 }
 
 /// Object-safe wrapper so the client can hold `Arc<dyn ...>`.
@@ -148,23 +151,35 @@ impl LlmClient {
 
     pub fn new(transport: Arc<dyn LlmTransportObj>, max_retries: u32) -> Self {
         let fingerprint = transport.name().to_string();
+        let provider_id = "inline".to_string();
+        let slot = ProviderSlot {
+            provider_id: provider_id.clone(),
+            transport,
+            fingerprint: fingerprint.clone(),
+            compat_key: fingerprint,
+            model: String::new(),
+            api_backend: crate::llm::types::ApiBackend::ChatCompletions,
+            reasoning_effort: None,
+            enable_web_search: false,
+            web_search_options: None,
+            enable_x_search: false,
+            x_search_options: None,
+        };
+        let router = synthetic_router(
+            std::slice::from_ref(&slot),
+            max_retries,
+            crate::llm::failover::DEFAULT_FAILOVER_MAX_ATTEMPTS,
+            crate::llm::failover::DEFAULT_PROVIDER_COOLDOWN_SECS,
+        )
+        .expect("synthetic single-provider router");
+        let mut providers = HashMap::new();
+        providers.insert(provider_id, slot);
         Self {
-            providers: vec![ProviderSlot {
-                transport,
-                fingerprint: fingerprint.clone(),
-                compat_key: fingerprint,
-                model: String::new(),
-                api_backend: crate::llm::types::ApiBackend::ChatCompletions,
-                reasoning_effort: None,
-                enable_web_search: false,
-                web_search_options: None,
-                enable_x_search: false,
-                x_search_options: None,
-                health: Mutex::new(ProviderHealth::default()),
-            }],
+            providers,
+            router,
+            pool_id: MAIN_POOL_ID.to_string(),
             max_retries,
             failover_max_attempts: crate::llm::failover::DEFAULT_FAILOVER_MAX_ATTEMPTS,
-            provider_cooldown_secs: crate::llm::failover::DEFAULT_PROVIDER_COOLDOWN_SECS,
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         }
@@ -177,9 +192,12 @@ impl LlmClient {
         failover_max_attempts: u32,
         provider_cooldown_secs: u64,
     ) -> Self {
-        let slots = providers
-            .into_iter()
-            .map(|(fingerprint, model, transport)| ProviderSlot {
+        let mut slots = HashMap::new();
+        let mut ordered = Vec::new();
+        for (fingerprint, model, transport) in providers {
+            let provider_id = fingerprint.clone();
+            ordered.push(ProviderSlot {
+                provider_id: provider_id.clone(),
                 transport,
                 fingerprint: fingerprint.clone(),
                 compat_key: fingerprint,
@@ -190,33 +208,72 @@ impl LlmClient {
                 web_search_options: None,
                 enable_x_search: false,
                 x_search_options: None,
-                health: Mutex::new(ProviderHealth::default()),
-            })
-            .collect();
-        Self {
-            providers: slots,
+            });
+            // Keep insertion order via the vec; HashMap is the lookup.
+            let slot = ordered.last().unwrap().clone_slot();
+            slots.insert(provider_id, slot);
+        }
+        let router = synthetic_router(
+            &ordered,
             max_retries,
             failover_max_attempts,
             provider_cooldown_secs,
+        )
+        .expect("synthetic chain router");
+        Self {
+            providers: slots,
+            router,
+            pool_id: MAIN_POOL_ID.to_string(),
+            max_retries,
+            failover_max_attempts,
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         }
     }
 
     pub fn from_http(cfg: &EngineConfig) -> EngineResult<Self> {
-        let mut slots = Vec::new();
-        slots.push(slot_from_primary(cfg)?);
-        for ep in &cfg.fallback_providers {
-            slots.push(slot_from_endpoint(cfg, ep)?);
+        let routing = synthesize_legacy_routing(cfg).map_err(EngineError::InvalidRoutingConfig)?;
+        let router = LlmRouter::persist(routing, cfg.root_dir.clone())?;
+        Self::from_router(router, MAIN_POOL_ID, cfg)
+    }
+
+    /// Bind this client to `pool_id` on a shared router, building HTTP
+    /// transports from the current routing snapshot.
+    pub fn from_router(
+        router: Arc<LlmRouter>,
+        pool_id: impl Into<String>,
+        cfg: &EngineConfig,
+    ) -> EngineResult<Self> {
+        let pool_id = pool_id.into();
+        if !router.has_pool(&pool_id) {
+            return Err(EngineError::RouteNotConfigured { pool_id });
+        }
+        let snapshot = router.snapshot_config();
+        let pool = snapshot
+            .pools
+            .get(&pool_id)
+            .expect("pool existence checked");
+        let mut providers = HashMap::new();
+        for target in &snapshot.providers {
+            providers.insert(target.provider_id.clone(), slot_from_target(cfg, target)?);
         }
         Ok(Self {
-            providers: slots,
-            max_retries: cfg.max_retries,
-            failover_max_attempts: cfg.failover_max_attempts.max(1),
-            provider_cooldown_secs: cfg.provider_cooldown_secs,
+            providers,
+            router,
+            pool_id,
+            max_retries: pool.retry.max_retries.max(1),
+            failover_max_attempts: pool.retry.failover_max_attempts.max(1),
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         })
+    }
+
+    pub fn pool_id(&self) -> &str {
+        &self.pool_id
+    }
+
+    pub fn router(&self) -> &Arc<LlmRouter> {
+        &self.router
     }
 
     /// Compatibility key (`group/model`) of the provider that last
@@ -228,52 +285,27 @@ impl LlmClient {
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| {
-                self.providers
-                    .first()
-                    .map(|p| p.compat_key.clone())
-                    .unwrap_or_default()
-            })
+            .unwrap_or_else(|| self.primary_compat_key())
     }
 
-    fn chain_mode(&self) -> bool {
-        self.providers.len() > 1
-    }
-
-    fn primary_compat_key(&self) -> &str {
+    fn primary_compat_key(&self) -> String {
+        let snapshot = self.router.snapshot_config();
+        if let Some(pool) = snapshot.pools.get(&self.pool_id) {
+            if let Some(first) = pool.members.first() {
+                if let Some(slot) = self.providers.get(&first.provider_id) {
+                    return slot.compat_key.clone();
+                }
+                return snapshot
+                    .provider(&first.provider_id)
+                    .map(|p| p.resolved_compat_key())
+                    .unwrap_or_else(|| first.provider_id.clone());
+            }
+        }
         self.providers
-            .first()
-            .map(|p| p.compat_key.as_str())
-            .unwrap_or("")
-    }
-
-    fn select_next(&self, tried: &[usize]) -> Option<usize> {
-        let now = Instant::now();
-        let n = self.providers.len();
-        if n == 0 {
-            return None;
-        }
-        let snapshots: Vec<ProviderHealth> = self
-            .providers
-            .iter()
-            .map(|p| p.health.lock().unwrap().clone())
-            .collect();
-        // Prefer an untried, not-cooling provider in chain order.
-        if let Some(i) = snapshots
-            .iter()
-            .enumerate()
-            .position(|(i, h)| !tried.contains(&i) && !h.is_cooling(now))
-        {
-            return Some(i);
-        }
-        // Any untried provider, even if cooling.
-        let untried: Vec<usize> = (0..n).filter(|i| !tried.contains(i)).collect();
-        if untried.is_empty() {
-            return None;
-        }
-        let subset: Vec<ProviderHealth> = untried.iter().map(|&i| snapshots[i].clone()).collect();
-        let local = select_index(&subset, now);
-        Some(untried[local])
+            .values()
+            .next()
+            .map(|p| p.compat_key.clone())
+            .unwrap_or_default()
     }
 
     fn rewrite_request_for(
@@ -299,7 +331,7 @@ impl LlmClient {
         out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
         let primary = self.primary_compat_key();
         let target = slot.compat_key.as_str();
-        out.items = crate::llm::failover::sanitize_items_for_provider(&out.items, target, primary);
+        out.items = crate::llm::failover::sanitize_items_for_provider(&out.items, target, &primary);
         out
     }
 
@@ -319,23 +351,19 @@ impl LlmClient {
         observer: &dyn AgentObserver,
         context: &LlmTurnContext,
     ) -> EngineResult<CollectedTurn> {
-        let chain_mode = self.chain_mode();
-        let mut tried: Vec<usize> = Vec::new();
+        let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
+        let plan = self.router.plan_visit(&self.pool_id)?;
+        let chain_mode = plan.chain_mode;
         let mut last_error: Option<EngineError> = None;
-        let mut tried_fps: Vec<String> = Vec::new();
+        let mut tried_ids: Vec<String> = Vec::new();
         let skipper = PrefixSkippingObserver::new(observer);
         let mut continue_from: Option<CollectedTurn> = None;
 
-        loop {
-            let Some(idx) = self.select_next(&tried) else {
-                let err = last_error.unwrap_or_else(|| {
-                    EngineError::Llm("no LLM providers configured".into())
-                });
-                return Err(annotate_tried(err, &tried_fps));
+        for (visit_idx, provider_id) in plan.provider_ids.iter().enumerate() {
+            let Some(slot) = self.providers.get(provider_id) else {
+                continue;
             };
-            tried.push(idx);
-            let slot = &self.providers[idx];
-            tried_fps.push(slot.fingerprint.clone());
+            tried_ids.push(provider_id.clone());
             let rewritten = self.rewrite_request_for(req, slot);
             let rewritten = if let Some(ref partial) = continue_from {
                 skipper.set_skip(&partial.text, &partial.reasoning);
@@ -347,7 +375,14 @@ impl LlmClient {
             };
 
             match self
-                .try_provider(slot, &rewritten, &skipper, chain_mode, context)
+                .try_provider(
+                    slot,
+                    &rewritten,
+                    &skipper,
+                    chain_mode,
+                    context,
+                    &operation_id,
+                )
                 .await
             {
                 Ok(turn) => {
@@ -355,7 +390,7 @@ impl LlmClient {
                         Some(partial) => merge_continued_turn(partial, turn),
                         None => turn,
                     };
-                    slot.health.lock().unwrap().recover();
+                    self.router.record_success(provider_id);
                     *self.last_success.lock().unwrap() = Some(slot.compat_key.clone());
                     return Ok(turn);
                 }
@@ -382,30 +417,54 @@ impl LlmClient {
                     if !chain_mode {
                         return Err(last_error.take().unwrap());
                     }
-                    let cooldown = slot.health.lock().unwrap().trip(
-                        Instant::now(),
-                        self.provider_cooldown_secs,
+                    let class = last_error
+                        .as_ref()
+                        .map(failure_class_of)
+                        .unwrap_or(FailureClass::Other);
+                    let cooldown = self.router.record_trip(
+                        &operation_id,
+                        provider_id,
+                        class,
                         cooldown_override,
                     );
-                    let Some(next_idx) = self.select_next(&tried) else {
-                        return Err(annotate_tried(
-                            last_error.take().unwrap(),
-                            &tried_fps,
-                        ));
+                    let next = plan.provider_ids[visit_idx + 1..]
+                        .iter()
+                        .find(|id| self.providers.contains_key(*id));
+                    let Some(next_id) = next else {
+                        return Err(EngineError::ProviderAttemptsExhausted {
+                            pool_id: self.pool_id.clone(),
+                            tried_provider_ids: tried_ids,
+                        });
                     };
+                    let next_slot = self.providers.get(next_id).unwrap();
                     let reason = last_error
                         .as_ref()
                         .map(|e| e.to_string())
                         .unwrap_or_default();
                     skipper.on_event(AgentEvent::ProviderSwitched {
                         from: slot.fingerprint.clone(),
-                        to: self.providers[next_idx].fingerprint.clone(),
+                        to: next_slot.fingerprint.clone(),
                         reason,
                         cooldown_ms: cooldown.as_millis() as u64,
+                        from_provider_id: Some(provider_id.clone()),
+                        to_provider_id: Some(next_id.clone()),
+                        pool_id: Some(self.pool_id.clone()),
+                        operation_id: Some(operation_id.clone()),
+                        failure_class: Some(class.as_str().to_string()),
+                        from_label: Some(slot.fingerprint.clone()),
+                        to_label: Some(next_slot.fingerprint.clone()),
                     });
                 }
             }
         }
+
+        if last_error.is_some() {
+            return Err(EngineError::ProviderAttemptsExhausted {
+                pool_id: self.pool_id.clone(),
+                tried_provider_ids: tried_ids,
+            });
+        }
+        Err(EngineError::Llm("no LLM providers configured".into()))
     }
 
     async fn try_provider(
@@ -415,6 +474,7 @@ impl LlmClient {
         observer: &PrefixSkippingObserver<'_>,
         chain_mode: bool,
         context: &LlmTurnContext,
+        operation_id: &str,
     ) -> Result<CollectedTurn, ProviderAttemptError> {
         let max_attempts = if chain_mode {
             self.failover_max_attempts.max(1)
@@ -461,6 +521,9 @@ impl LlmClient {
                                     max_attempts,
                                     wait,
                                     "empty",
+                                    &self.pool_id,
+                                    operation_id,
+                                    Some(FailureClass::EmptyResponse),
                                 );
                                 tokio::time::sleep(wait).await;
                                 continue;
@@ -492,9 +555,9 @@ impl LlmClient {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        return Err(ProviderAttemptError::DoomLoop(
-                            EngineError::DoomLoopServer(triggers.clone()),
-                        ));
+                        return Err(ProviderAttemptError::DoomLoop(EngineError::DoomLoopServer(
+                            triggers.clone(),
+                        )));
                     }
                     Err(CollectStreamError::IdleTimeout { partial, timeout }) => {
                         let combined = match &prefix {
@@ -521,6 +584,9 @@ impl LlmClient {
                                 max_attempts,
                                 Duration::from_millis(0),
                                 "idle-timeout-continue",
+                                &self.pool_id,
+                                operation_id,
+                                Some(FailureClass::StreamIdle),
                             );
                             continue;
                         }
@@ -529,8 +595,7 @@ impl LlmClient {
                             return Err(ProviderAttemptError::Failover {
                                 error: err,
                                 cooldown_override: None,
-                                continue_from: can_prefix_continue(&combined)
-                                    .then_some(combined),
+                                continue_from: can_prefix_continue(&combined).then_some(combined),
                             });
                         }
                         return Err(ProviderAttemptError::Terminal(err));
@@ -560,12 +625,10 @@ impl LlmClient {
                             rate_limit_retries += 1;
                             let wait = retry_after_from_error(&e)
                                 .unwrap_or_else(|| retry_backoff_with_jitter(attempt));
-                            let budget_exhausted = rate_limit_retries
-                                > RATE_LIMIT_RETRY_THRESHOLD
+                            let budget_exhausted = rate_limit_retries > RATE_LIMIT_RETRY_THRESHOLD
                                 || (!chain_mode && attempt > self.max_retries)
                                 || (chain_mode && attempt >= max_attempts);
-                            let too_long =
-                                chain_mode && wait > FAILOVER_RETRY_AFTER_INLINE_CAP;
+                            let too_long = chain_mode && wait > FAILOVER_RETRY_AFTER_INLINE_CAP;
                             if budget_exhausted || too_long {
                                 if chain_mode {
                                     return Err(ProviderAttemptError::Failover {
@@ -587,6 +650,9 @@ impl LlmClient {
                                 max_attempts,
                                 wait,
                                 "status=429",
+                                &self.pool_id,
+                                operation_id,
+                                Some(FailureClass::RateLimited),
                             );
                             tokio::time::sleep(wait).await;
                         }
@@ -618,6 +684,9 @@ impl LlmClient {
                                 max_attempts,
                                 wait,
                                 &e.to_string(),
+                                &self.pool_id,
+                                operation_id,
+                                Some(failure_class_of(&e)),
                             );
                             tokio::time::sleep(wait).await;
                         }
@@ -731,9 +800,7 @@ fn prefix_continue_request(
     out
 }
 
-fn synthesize_partial_items(
-    partial: &CollectedTurn,
-) -> Vec<crate::conversation::ConversationItem> {
+fn synthesize_partial_items(partial: &CollectedTurn) -> Vec<crate::conversation::ConversationItem> {
     use crate::conversation::{AssistantItem, ConversationItem};
     let mut items = Vec::new();
     for r in &partial.reasoning_items {
@@ -830,12 +897,16 @@ fn merge_continued_items(
         match item {
             ConversationItem::Reasoning(r) => {
                 if r.id.is_empty() {
-                    if !out.iter().any(|o| matches!(o, ConversationItem::Reasoning(x) if x == r)) {
+                    if !out
+                        .iter()
+                        .any(|o| matches!(o, ConversationItem::Reasoning(x) if x == r))
+                    {
                         out.push(item.clone());
                     }
-                } else if let Some(ConversationItem::Reasoning(existing)) = out.iter_mut().find(|o| {
-                    matches!(o, ConversationItem::Reasoning(x) if x.id == r.id)
-                }) {
+                } else if let Some(ConversationItem::Reasoning(existing)) = out
+                    .iter_mut()
+                    .find(|o| matches!(o, ConversationItem::Reasoning(x) if x.id == r.id))
+                {
                     if r.encrypted_content.is_some() {
                         existing.encrypted_content = r.encrypted_content.clone();
                     }
@@ -863,12 +934,16 @@ fn merge_continued_items(
             _ => {}
         }
     }
-    if !out.iter().any(|i| matches!(i, ConversationItem::Assistant(_))) {
+    if !out
+        .iter()
+        .any(|i| matches!(i, ConversationItem::Assistant(_)))
+    {
         out.push(crate::conversation::ConversationItem::assistant(text));
     }
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_retrying(
     observer: &dyn AgentObserver,
     slot: &ProviderSlot,
@@ -876,6 +951,9 @@ fn emit_retrying(
     max_attempts: u32,
     wait: Duration,
     reason: &str,
+    pool_id: &str,
+    operation_id: &str,
+    failure_class: Option<FailureClass>,
 ) {
     observer.on_event(AgentEvent::Retrying {
         provider: slot.fingerprint.clone(),
@@ -883,7 +961,32 @@ fn emit_retrying(
         max_attempts,
         wait_ms: wait.as_millis() as u64,
         reason: reason.to_string(),
+        provider_id: Some(slot.provider_id.clone()),
+        pool_id: Some(pool_id.to_string()),
+        operation_id: Some(operation_id.to_string()),
+        failure_class: failure_class.map(|c| c.as_str().to_string()),
+        label: Some(slot.fingerprint.clone()),
     });
+}
+
+fn failure_class_of(err: &EngineError) -> FailureClass {
+    if matches!(err, EngineError::StreamIdleTimeout(_)) {
+        return FailureClass::StreamIdle;
+    }
+    if matches!(err, EngineError::EmptyResponse) {
+        return FailureClass::EmptyResponse;
+    }
+    match retry_class_for_error(err) {
+        RetryClass::RateLimited => FailureClass::RateLimited,
+        RetryClass::Retry => {
+            if status_from_error(err).is_none() {
+                FailureClass::Connection
+            } else {
+                FailureClass::RetryableHttp
+            }
+        }
+        RetryClass::Fatal => FailureClass::Fatal,
+    }
 }
 
 fn is_veto(err: &EngineError) -> bool {
@@ -893,76 +996,115 @@ fn is_veto(err: &EngineError) -> bool {
     }
 }
 
-fn annotate_tried(err: EngineError, fingerprints: &[String]) -> EngineError {
-    if fingerprints.is_empty() {
-        return err;
-    }
-    let summary = fingerprints.join(", ");
-    match err {
-        EngineError::Llm(msg) => EngineError::Llm(format!("{msg} [tried: {summary}]")),
-        other => EngineError::Llm(format!("{other} [tried: {summary}]")),
-    }
-}
-
-fn slot_from_primary(cfg: &EngineConfig) -> EngineResult<ProviderSlot> {
+fn slot_from_target(cfg: &EngineConfig, target: &ProviderTarget) -> EngineResult<ProviderSlot> {
+    let doom = cfg.enable_doom_loop_check.unwrap_or(matches!(
+        target.api_backend,
+        crate::llm::types::ApiBackend::Responses
+    ));
     let transport = Arc::new(http_transport(
         cfg,
-        &cfg.base_url,
-        &cfg.api_key,
-        cfg.api_backend,
-        cfg.client_profile,
-        cfg.client_version.clone(),
-        cfg.client_session_id.clone(),
-        cfg.extra_headers.clone(),
-        cfg.extra_body.clone(),
-        cfg.doom_loop_check_enabled(),
+        &target.base_url,
+        &target.api_key,
+        target.api_backend,
+        target.client_profile,
+        target.client_version.clone(),
+        target.client_session_id.clone(),
+        target.extra_headers.clone(),
+        target.extra_body.clone(),
+        doom,
     )?);
-    let group = resolve_provider_group(cfg.provider_group.as_deref(), cfg.client_profile);
     Ok(ProviderSlot {
-        fingerprint: provider_fingerprint(&cfg.base_url, &cfg.model),
-        compat_key: compatibility_key(&group, &cfg.model),
-        model: cfg.model.clone(),
-        api_backend: cfg.api_backend,
-        reasoning_effort: cfg.reasoning_effort,
-        enable_web_search: cfg.enable_web_search,
-        web_search_options: cfg.web_search_options.clone(),
-        enable_x_search: cfg.enable_x_search,
-        x_search_options: cfg.x_search_options.clone(),
-        health: Mutex::new(ProviderHealth::default()),
+        provider_id: target.provider_id.clone(),
+        fingerprint: provider_fingerprint(&target.base_url, &target.model),
+        compat_key: target.resolved_compat_key(),
+        model: target.model.clone(),
+        api_backend: target.api_backend,
+        reasoning_effort: target.reasoning_effort,
+        enable_web_search: target.enable_web_search,
+        web_search_options: target.web_search_options.clone(),
+        enable_x_search: target.enable_x_search,
+        x_search_options: target.x_search_options.clone(),
         transport,
     })
 }
 
-fn slot_from_endpoint(
-    cfg: &EngineConfig,
-    ep: &crate::config::ProviderEndpoint,
-) -> EngineResult<ProviderSlot> {
-    let transport = Arc::new(http_transport(
-        cfg,
-        &ep.base_url,
-        &ep.api_key,
-        ep.api_backend,
-        ep.client_profile,
-        ep.client_version.clone(),
-        ep.client_session_id.clone(),
-        ep.extra_headers.clone(),
-        ep.extra_body.clone(),
-        cfg.doom_loop_check_enabled(),
-    )?);
-    let group = resolve_provider_group(ep.provider_group.as_deref(), ep.client_profile);
-    Ok(ProviderSlot {
-        fingerprint: provider_fingerprint(&ep.base_url, &ep.model),
-        compat_key: compatibility_key(&group, &ep.model),
-        model: ep.model.clone(),
-        api_backend: ep.api_backend,
-        reasoning_effort: ep.reasoning_effort.or(cfg.reasoning_effort),
-        enable_web_search: ep.enable_web_search,
-        web_search_options: cfg.web_search_options.clone(),
-        enable_x_search: ep.enable_x_search,
-        x_search_options: ep.x_search_options.clone().or_else(|| cfg.x_search_options.clone()),
-        health: Mutex::new(ProviderHealth::default()),
-        transport,
-    })
+impl ProviderSlot {
+    fn clone_slot(&self) -> Self {
+        Self {
+            provider_id: self.provider_id.clone(),
+            transport: self.transport.clone(),
+            fingerprint: self.fingerprint.clone(),
+            compat_key: self.compat_key.clone(),
+            model: self.model.clone(),
+            api_backend: self.api_backend,
+            reasoning_effort: self.reasoning_effort,
+            enable_web_search: self.enable_web_search,
+            web_search_options: self.web_search_options.clone(),
+            enable_x_search: self.enable_x_search,
+            x_search_options: self.x_search_options.clone(),
+        }
+    }
+}
+
+fn synthetic_router(
+    slots: &[ProviderSlot],
+    max_retries: u32,
+    failover_max_attempts: u32,
+    cooldown_secs: u64,
+) -> EngineResult<Arc<LlmRouter>> {
+    let mut providers = Vec::new();
+    let mut members = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        providers.push(ProviderTarget {
+            provider_id: slot.provider_id.clone(),
+            base_url: format!("https://router.invalid/{i}/v1"),
+            api_key: "test".into(),
+            model: if slot.model.is_empty() {
+                "m".into()
+            } else {
+                slot.model.clone()
+            },
+            api_backend: slot.api_backend,
+            client_profile: Default::default(),
+            client_version: None,
+            client_session_id: None,
+            reasoning_compatibility_key: Some(slot.compat_key.clone()),
+            capabilities: Default::default(),
+            extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
+            enable_web_search: slot.enable_web_search,
+            web_search_options: slot.web_search_options.clone(),
+            enable_x_search: slot.enable_x_search,
+            x_search_options: slot.x_search_options.clone(),
+            reasoning_effort: slot.reasoning_effort,
+        });
+        members.push(PoolMember {
+            provider_id: slot.provider_id.clone(),
+            routing_group: crate::llm::router::DEFAULT_ROUTING_GROUP.into(),
+            base_score: crate::llm::router::DEFAULT_BASE_SCORE,
+            order: i as u32,
+            enabled: true,
+        });
+    }
+    let pool = ProviderPool {
+        members,
+        retry: RetryPolicy {
+            failover_max_attempts: failover_max_attempts.max(1),
+            max_retries: max_retries.max(1),
+        },
+        when_exhausted: ExhaustionPolicy::ProbeEarliest,
+    };
+    let mut pools = BTreeMap::new();
+    pools.insert(MAIN_POOL_ID.to_string(), pool);
+    let routing = LlmRoutingConfig {
+        providers,
+        pools,
+        health: RouterHealthConfig {
+            cooldown_base_secs: cooldown_secs,
+            ..RouterHealthConfig::default()
+        },
+    };
+    LlmRouter::in_memory(routing)
 }
 
 fn http_transport(
@@ -1227,7 +1369,8 @@ mod tests {
         tokio::time::pause();
         let a_hits = Arc::new(AtomicU32::new(0));
         let b_hits = Arc::new(AtomicU32::new(0));
-        let a = ScriptedTransport::failing("a", u32::MAX, "status=401 unauthorized", a_hits.clone());
+        let a =
+            ScriptedTransport::failing("a", u32::MAX, "status=401 unauthorized", a_hits.clone());
         let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
         let client = LlmClient::with_chain(
             vec![
@@ -1242,10 +1385,10 @@ mod tests {
         client.complete(&req(), &observer).await.unwrap();
         assert_eq!(a_hits.load(Ordering::SeqCst), 1);
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
-        assert!(observer.snapshot().iter().any(|e| matches!(
-            e,
-            AgentEvent::ProviderSwitched { .. }
-        )));
+        assert!(observer
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })));
     }
 
     #[tokio::test]
@@ -1315,28 +1458,20 @@ mod tests {
         );
         msg.origin = Some("grok_build/grok-4.6".into());
 
-        let same_group = msg.sanitized_for_provider(
-            "grok_build/grok-4.6",
-            "grok_build/grok-4.6",
-        );
+        let same_group = msg.sanitized_for_provider("grok_build/grok-4.6", "grok_build/grok-4.6");
         assert_eq!(same_group.reasoning_content.as_deref(), Some("thoughts"));
         assert_eq!(same_group.encrypted_reasoning.as_deref(), Some("sig"));
         assert_eq!(same_group.reasoning_items.len(), 1);
         assert_eq!(same_group.reasoning_items[0].id, "rs_abc");
 
-        let group_change = msg.sanitized_for_provider(
-            "claude_code/grok-4.6",
-            "grok_build/grok-4.6",
-        );
+        let group_change =
+            msg.sanitized_for_provider("claude_code/grok-4.6", "grok_build/grok-4.6");
         assert!(group_change.reasoning_content.is_none());
         assert!(group_change.encrypted_reasoning.is_none());
         assert!(group_change.reasoning_items.is_empty());
         assert_eq!(group_change.content_text(), "hello");
 
-        let model_change = msg.sanitized_for_provider(
-            "grok_build/grok-3",
-            "grok_build/grok-4.6",
-        );
+        let model_change = msg.sanitized_for_provider("grok_build/grok-3", "grok_build/grok-4.6");
         assert!(model_change.reasoning_items.is_empty());
     }
 
@@ -1410,8 +1545,8 @@ mod tests {
                 ("host-b/m".into(), "m".into(), b as Arc<dyn LlmTransportObj>),
                 ("host-c/m".into(), "m".into(), c as Arc<dyn LlmTransportObj>),
             ],
-            15,  // max_retries (single-provider budget, irrelevant in chain mode)
-            3,   // failover_max_attempts
+            15, // max_retries (single-provider budget, irrelevant in chain mode)
+            3,  // failover_max_attempts
             120,
         );
 
@@ -1551,7 +1686,11 @@ mod tests {
         assert_eq!(turn.text, "Hello world");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
-        let cont = captured.lock().unwrap().clone().expect("continuation request");
+        let cont = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("continuation request");
         assert_eq!(cont.previous_response_id.as_deref(), Some("resp_abc"));
         let last = cont.items.last().expect("prefix assistant");
         match last {
@@ -1639,7 +1778,11 @@ mod tests {
         let observer = RecordingObserver::new();
         let turn = client.complete(&req(), &observer).await.unwrap();
         assert_eq!(turn.text, "Hello ok");
-        assert_eq!(a_hits.load(Ordering::SeqCst), 2, "same provider continued once");
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            2,
+            "same provider continued once"
+        );
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
         assert!(observer.snapshot().iter().any(|e| matches!(
             e,

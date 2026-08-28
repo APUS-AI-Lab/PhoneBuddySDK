@@ -4,11 +4,12 @@ pub mod client;
 pub mod doom_loop_collector;
 pub mod doom_loop_wire;
 pub mod dumper;
-pub mod image;
 pub mod failover;
 pub mod host;
+pub mod image;
 pub mod profiles;
 pub mod retry;
+pub mod router;
 pub mod stream;
 pub mod transport;
 pub mod types;
@@ -23,4 +24,3 @@ pub use profiles::{
 };
 pub use transport::{HttpTransport, LlmTurnContext, MockTransport, MockTurn};
 pub use types::*;
-
