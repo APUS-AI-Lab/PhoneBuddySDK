@@ -277,7 +277,6 @@ fn run_generate(input: &str, pool_id: &str) -> anyhow::Result<()> {
             max_output_tokens: Some(256),
             temperature: Some(0.2),
             reasoning_effort: None,
-            response_format: None,
             timeout_ms: Some(30_000),
         },
         tokio_util::sync::CancellationToken::new(),

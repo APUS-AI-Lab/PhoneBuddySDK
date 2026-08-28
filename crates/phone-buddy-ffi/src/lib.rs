@@ -567,7 +567,9 @@ pub unsafe extern "C" fn pb_runtime_cancel_operation(
 pub unsafe extern "C" fn pb_runtime_free(runtime: *mut PbRuntime) {
     catch_void(|| {
         if !runtime.is_null() {
-            drop(Box::from_raw(runtime));
+            let boxed = Box::from_raw(runtime);
+            boxed.inner.cancel_all();
+            drop(boxed);
         }
     });
 }
@@ -1942,6 +1944,52 @@ mod tests {
             );
             pb_string_free(op);
             pb_runtime_free(runtime);
+        }
+    }
+
+    #[test]
+    fn test_pb_runtime_free_cancels_in_flight_generate() {
+        let dir = tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let routing = title_routing_json(&format!("http://{addr}/v1"));
+        unsafe {
+            let routing_c = CString::new(routing).unwrap();
+            let root_c = CString::new(dir.path().to_string_lossy().as_ref()).unwrap();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let runtime = pb_runtime_new(routing_c.as_ptr(), root_c.as_ptr(), &mut err);
+            assert!(!runtime.is_null());
+
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let req = CString::new(r#"{"pool_id":"session_title","input":"title me"}"#).unwrap();
+            let op = pb_runtime_generate_text_async(
+                runtime,
+                req.as_ptr(),
+                Some(generate_done_cb),
+                &tx as *const _ as *mut c_void,
+                &mut err,
+            );
+            assert!(!op.is_null());
+            pb_string_free(op);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            pb_runtime_free(runtime);
+            let envelope = rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("free must complete the callback");
+            let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+            assert_eq!(v["ok"], false);
+            assert_eq!(
+                v["error"]["kind"].as_str().unwrap_or(""),
+                "OperationCancelled",
+                "envelope={envelope}"
+            );
         }
     }
 }

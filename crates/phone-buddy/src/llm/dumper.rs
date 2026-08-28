@@ -24,7 +24,7 @@ pub enum HttpDumpMode {
 }
 
 /// Configuration for HTTP traffic dumping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpDumpConfig {
     /// Dump mode. Default: `Off`.
     #[serde(default)]
@@ -157,7 +157,10 @@ impl HttpDumper {
     }
 
     /// Format and mask headers from a reqwest HeaderMap.
-    pub fn extract_headers(&self, headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
+    pub fn extract_headers(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         for (name, val) in headers {
             let key = name.as_str().to_string();
@@ -178,7 +181,10 @@ impl HttpDumper {
         }
 
         if let Err(e) = std::fs::create_dir_all(&self.resolved_dir) {
-            tracing::warn!("failed to create HTTP dump directory {:?}: {e}", self.resolved_dir);
+            tracing::warn!(
+                "failed to create HTTP dump directory {:?}: {e}",
+                self.resolved_dir
+            );
             return None;
         }
 

@@ -257,7 +257,6 @@ let title = runtime.generate_text_blocking(
         max_output_tokens: Some(32),
         temperature: Some(0.2),
         reasoning_effort: None,
-        response_format: None,
         timeout_ms: Some(8_000),
     },
     CancellationToken::new(),

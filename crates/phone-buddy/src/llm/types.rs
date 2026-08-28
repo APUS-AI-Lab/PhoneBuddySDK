@@ -1325,7 +1325,8 @@ pub struct CollectedTurn {
     pub provider_id: String,
     /// Logical LLM operation id (retry/failover grouping).
     pub operation_id: String,
-    /// Transport requests spent producing this turn (including failovers).
+    /// Provider visits spent producing this turn (failover count + 1), not
+    /// in-provider HTTP retries.
     pub attempts: u32,
 }
 

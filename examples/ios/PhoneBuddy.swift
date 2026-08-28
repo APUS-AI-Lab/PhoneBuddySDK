@@ -512,7 +512,6 @@ public struct GenerateTextRequest: Codable {
     public var maxOutputTokens: UInt32?
     public var temperature: Float?
     public var reasoningEffort: String?
-    public var responseFormat: String?
     public var timeoutMs: UInt64?
 
     public init(
@@ -540,13 +539,25 @@ public struct GenerateTextRequest: Codable {
         case maxOutputTokens = "max_output_tokens"
         case temperature
         case reasoningEffort = "reasoning_effort"
-        case responseFormat = "response_format"
         case timeoutMs = "timeout_ms"
+    }
+}
+
+public struct GenerateTextUsage: Codable {
+    public let promptTokens: UInt32
+    public let completionTokens: UInt32
+    public let totalTokens: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case promptTokens = "prompt_tokens"
+        case completionTokens = "completion_tokens"
+        case totalTokens = "total_tokens"
     }
 }
 
 public struct GenerateTextResult: Codable {
     public let text: String
+    public let usage: GenerateTextUsage?
     public let providerId: String
     public let model: String
     public let attempts: UInt32
@@ -555,6 +566,7 @@ public struct GenerateTextResult: Codable {
 
     enum CodingKeys: String, CodingKey {
         case text
+        case usage
         case providerId = "provider_id"
         case model
         case attempts
@@ -570,10 +582,26 @@ private final class GenerateTextContext {
     }
 }
 
+private final class GenerateTextOpBox {
+    private let lock = NSLock()
+    private var operationId: String?
+
+    func set(_ id: String) {
+        lock.lock()
+        operationId = id
+        lock.unlock()
+    }
+
+    func get() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return operationId
+    }
+}
+
 /// Long-lived routing runtime. Outlives individual engines so provider health is shared.
 public final class PhoneBuddyRuntime {
     fileprivate var runtimePtr: OpaquePointer?
-    public private(set) var lastOperationId: String?
 
     public init(routingJson: String, rootDir: String) throws {
         var errOut: UnsafeMutablePointer<CChar>? = nil
@@ -630,41 +658,52 @@ public final class PhoneBuddyRuntime {
         guard let jsonString = String(data: data, encoding: .utf8) else {
             throw PhoneBuddyError.invalidConfig
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            var errOut: UnsafeMutablePointer<CChar>? = nil
-            let context = GenerateTextContext(continuation: continuation)
-            let unmanaged = Unmanaged.passRetained(context)
-            let callback: PbOperationCallback = { envelopeJson, userData in
-                guard let userData = userData else { return }
-                let ctx = Unmanaged<GenerateTextContext>.fromOpaque(userData).takeRetainedValue()
-                guard let envelopeJson = envelopeJson else {
-                    ctx.continuation.resume(throwing: PhoneBuddyError.chatFailed("Null generate_text envelope"))
+        let opBox = GenerateTextOpBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var errOut: UnsafeMutablePointer<CChar>? = nil
+                let context = GenerateTextContext(continuation: continuation)
+                let unmanaged = Unmanaged.passRetained(context)
+                let callback: PbOperationCallback = { envelopeJson, userData in
+                    guard let userData = userData else { return }
+                    let ctx = Unmanaged<GenerateTextContext>.fromOpaque(userData).takeRetainedValue()
+                    guard let envelopeJson = envelopeJson else {
+                        ctx.continuation.resume(throwing: PhoneBuddyError.chatFailed("Null generate_text envelope"))
+                        return
+                    }
+                    ctx.continuation.resume(returning: String(cString: envelopeJson))
+                }
+                let opPtr = pb_runtime_generate_text_async(
+                    ptr,
+                    jsonString,
+                    callback,
+                    unmanaged.toOpaque(),
+                    &errOut
+                )
+                if let err = errOut {
+                    unmanaged.release()
+                    let msg = String(cString: err)
+                    pb_string_free(err)
+                    continuation.resume(throwing: PhoneBuddyError.chatFailed(msg))
                     return
                 }
-                ctx.continuation.resume(returning: String(cString: envelopeJson))
+                if let opPtr = opPtr {
+                    let opId = String(cString: opPtr)
+                    pb_string_free(opPtr)
+                    opBox.set(opId)
+                    if Task.isCancelled {
+                        self.cancel(operationId: opId)
+                    }
+                } else {
+                    unmanaged.release()
+                    continuation.resume(throwing: PhoneBuddyError.chatFailed("Null operation id"))
+                }
+            }.parseGenerateTextEnvelope()
+        } onCancel: { [weak self] in
+            if let opId = opBox.get() {
+                self?.cancel(operationId: opId)
             }
-            let opPtr = pb_runtime_generate_text_async(
-                ptr,
-                jsonString,
-                callback,
-                unmanaged.toOpaque(),
-                &errOut
-            )
-            if let err = errOut {
-                unmanaged.release()
-                let msg = String(cString: err)
-                pb_string_free(err)
-                continuation.resume(throwing: PhoneBuddyError.chatFailed(msg))
-                return
-            }
-            if let opPtr = opPtr {
-                self.lastOperationId = String(cString: opPtr)
-                pb_string_free(opPtr)
-            } else {
-                unmanaged.release()
-                continuation.resume(throwing: PhoneBuddyError.chatFailed("Null operation id"))
-            }
-        }.parseGenerateTextEnvelope()
+        }
     }
 
     public func cancel(operationId: String) {

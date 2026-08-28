@@ -437,25 +437,33 @@ typedef struct {
     jmethodID on_complete_mid;
 } GenerateTextJniContext;
 
+static JNIEnv *generate_text_jni_env(GenerateTextJniContext *ctx, int *did_attach) {
+    JNIEnv *env = NULL;
+    *did_attach = 0;
+    if (!ctx || !ctx->vm) {
+        return NULL;
+    }
+    jint status = (*ctx->vm)->GetEnv(ctx->vm, (void **)&env, JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if ((*ctx->vm)->AttachCurrentThread(ctx->vm, &env, NULL) != 0) {
+            return NULL;
+        }
+        *did_attach = 1;
+        return env;
+    }
+    if (status != JNI_OK) {
+        return NULL;
+    }
+    return env;
+}
+
 static void generate_text_jni_cb(const char *envelope_json, void *user_data) {
     GenerateTextJniContext *ctx = (GenerateTextJniContext *)user_data;
     if (!ctx) {
         return;
     }
-    JNIEnv *env = NULL;
     int did_attach = 0;
-    if (ctx->vm) {
-        jint status = (*ctx->vm)->GetEnv(ctx->vm, (void **)&env, JNI_VERSION_1_6);
-        if (status == JNI_EDETACHED) {
-            if ((*ctx->vm)->AttachCurrentThread(ctx->vm, &env, NULL) == 0) {
-                did_attach = 1;
-            } else {
-                env = NULL;
-            }
-        } else if (status != JNI_OK) {
-            env = NULL;
-        }
-    }
+    JNIEnv *env = generate_text_jni_env(ctx, &did_attach);
     if (env && ctx->listener && ctx->on_complete_mid && envelope_json) {
         jstring j_env = (*env)->NewStringUTF(env, envelope_json);
         if (j_env) {
@@ -466,6 +474,9 @@ static void generate_text_jni_cb(const char *envelope_json, void *user_data) {
             }
             (*env)->DeleteLocalRef(env, j_env);
         }
+    }
+    if (!env && ctx->listener) {
+        env = generate_text_jni_env(ctx, &did_attach);
     }
     if (env && ctx->listener) {
         (*env)->DeleteGlobalRef(env, ctx->listener);
@@ -567,6 +578,18 @@ jstring pb_jni_nativeGenerateTextAsync(
         ctx->listener = (*env)->NewGlobalRef(env, listener);
         jclass l_cls = (*env)->GetObjectClass(env, listener);
         ctx->on_complete_mid = (*env)->GetMethodID(env, l_cls, "onComplete", "(Ljava/lang/String;)V");
+        if (ctx->on_complete_mid == NULL) {
+            if (ctx->listener) {
+                (*env)->DeleteGlobalRef(env, ctx->listener);
+            }
+            free(ctx);
+            (*env)->ReleaseStringUTFChars(env, request_json, c_req);
+            if (!(*env)->ExceptionCheck(env)) {
+                jclass ex_cls = (*env)->FindClass(env, "java/lang/NoSuchMethodError");
+                (*env)->ThrowNew(env, ex_cls, "GenerateTextListener.onComplete(String) is missing");
+            }
+            return NULL;
+        }
         cb = generate_text_jni_cb;
     }
     char *op = pb_runtime_generate_text_async(

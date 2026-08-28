@@ -1,10 +1,12 @@
 //! Long-lived process handle owning the LLM router.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -14,6 +16,7 @@ use crate::engine::PhoneBuddyEngine;
 use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
+use crate::llm::dumper::HttpDumpConfig;
 use crate::llm::router::{synthesize_legacy_routing, LlmRouter, LlmRoutingConfig};
 use crate::llm::types::{ConversationRequest, ReasoningEffort, Usage};
 
@@ -31,8 +34,6 @@ pub struct GenerateTextRequest {
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
-    pub response_format: Option<serde_json::Value>,
-    #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
 
@@ -44,6 +45,8 @@ pub struct GenerateTextResult {
     pub usage: Option<Usage>,
     pub provider_id: String,
     pub model: String,
+    /// Provider visits spent producing this result (failover count + 1), not
+    /// in-provider HTTP retries.
     pub attempts: u32,
     pub operation_id: String,
     pub pool_id: String,
@@ -52,10 +55,29 @@ pub struct GenerateTextResult {
 /// Process-scoped routing owner. Longer-lived than a single
 /// [`PhoneBuddyEngine`]. Shared interior mutability is not exposed via
 /// [`Clone`]; callers hold [`Arc`].
+#[derive(Clone, PartialEq, Eq)]
+struct OneShotHttpSettings {
+    stream_idle_timeout_secs: u64,
+    http_dump: HttpDumpConfig,
+    enable_doom_loop_check: Option<bool>,
+}
+
+impl OneShotHttpSettings {
+    fn from_engine(cfg: &EngineConfig) -> Self {
+        Self {
+            stream_idle_timeout_secs: cfg.stream_idle_timeout_secs,
+            http_dump: cfg.http_dump.clone(),
+            enable_doom_loop_check: cfg.enable_doom_loop_check,
+        }
+    }
+}
+
 pub struct PhoneBuddyRuntime {
     router: Arc<LlmRouter>,
     root_dir: PathBuf,
     operations: Mutex<HashMap<String, CancellationToken>>,
+    http_settings: Mutex<OneShotHttpSettings>,
+    one_shot_clients: Mutex<HashMap<String, Arc<LlmClient>>>,
 }
 
 impl PhoneBuddyRuntime {
@@ -70,6 +92,8 @@ impl PhoneBuddyRuntime {
             router,
             root_dir,
             operations: Mutex::new(HashMap::new()),
+            http_settings: Mutex::new(OneShotHttpSettings::from_engine(&EngineConfig::default())),
+            one_shot_clients: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -78,7 +102,9 @@ impl PhoneBuddyRuntime {
     pub fn from_engine_config(config: &EngineConfig) -> EngineResult<Arc<Self>> {
         let routing =
             synthesize_legacy_routing(config).map_err(EngineError::InvalidRoutingConfig)?;
-        Self::new(routing, config.root_dir.clone())
+        let runtime = Self::new(routing, config.root_dir.clone())?;
+        runtime.adopt_http_settings(config);
+        Ok(runtime)
     }
 
     /// Replace routing. In-flight operations may finish on a previously
@@ -100,7 +126,45 @@ impl PhoneBuddyRuntime {
         agent_config: EngineConfig,
         main_pool_id: &str,
     ) -> EngineResult<Arc<PhoneBuddyEngine>> {
+        self.adopt_http_settings(&agent_config);
         PhoneBuddyEngine::from_runtime(self.clone(), agent_config, main_pool_id)
+    }
+
+    fn adopt_http_settings(&self, cfg: &EngineConfig) {
+        let next = OneShotHttpSettings::from_engine(cfg);
+        let mut settings = self.http_settings.lock().unwrap();
+        if *settings != next {
+            *settings = next;
+            drop(settings);
+            self.one_shot_clients.lock().unwrap().clear();
+        }
+    }
+
+    fn http_engine_config(&self) -> EngineConfig {
+        let settings = self.http_settings.lock().unwrap();
+        EngineConfig {
+            root_dir: self.root_dir.clone(),
+            http_dump: settings.http_dump.clone(),
+            stream_idle_timeout_secs: settings.stream_idle_timeout_secs,
+            enable_doom_loop_check: settings.enable_doom_loop_check,
+            ..Default::default()
+        }
+    }
+
+    fn client_for_pool(&self, pool_id: &str) -> EngineResult<Arc<LlmClient>> {
+        if let Some(client) = self.one_shot_clients.lock().unwrap().get(pool_id) {
+            return Ok(client.clone());
+        }
+        let client = Arc::new(LlmClient::from_router(
+            self.router(),
+            pool_id,
+            &self.http_engine_config(),
+        )?);
+        self.one_shot_clients
+            .lock()
+            .unwrap()
+            .insert(pool_id.to_string(), client.clone());
+        Ok(client)
     }
 
     /// One-shot text generation: router + adapters + retry, no session or tools.
@@ -109,12 +173,17 @@ impl PhoneBuddyRuntime {
         request: GenerateTextRequest,
         cancellation: CancellationToken,
     ) -> EngineResult<GenerateTextResult> {
-        let http_cfg = EngineConfig {
-            root_dir: self.root_dir.clone(),
-            ..Default::default()
-        };
-        let client = LlmClient::from_router(self.router(), &request.pool_id, &http_cfg)?;
-        self.generate_text_on(client, request, cancellation).await
+        if !self.router.has_pool(&request.pool_id) {
+            self.one_shot_clients
+                .lock()
+                .unwrap()
+                .remove(&request.pool_id);
+            return Err(EngineError::RouteNotConfigured {
+                pool_id: request.pool_id,
+            });
+        }
+        let client = self.client_for_pool(&request.pool_id)?;
+        self.generate_text_on(&client, request, cancellation).await
     }
 
     /// Blocking wrapper around [`Self::generate_text`] using the process-wide executor.
@@ -142,11 +211,19 @@ impl PhoneBuddyRuntime {
         let this = self.clone();
         let op = operation_id.clone();
         crate::engine::shared_runtime()?.spawn(async move {
-            let mut result = this.generate_text(request, token).await;
+            let result = AssertUnwindSafe(this.generate_text(request, token))
+                .catch_unwind()
+                .await;
+            let mut result = match result {
+                Ok(inner) => inner,
+                Err(_) => Err(EngineError::Llm("one-shot worker panicked".into())),
+            };
             if let Ok(ref mut ok) = result {
                 ok.operation_id = op.clone();
             }
-            this.operations.lock().unwrap().remove(&op);
+            if let Ok(mut ops) = this.operations.lock() {
+                ops.remove(&op);
+            }
             on_done(op, result);
         });
         Ok(operation_id)
@@ -159,9 +236,19 @@ impl PhoneBuddyRuntime {
         }
     }
 
+    /// Cancel every in-flight one-shot. Does not wait for last-Arc drop, so
+    /// FFI `pb_runtime_free` can stop HTTP work while workers still hold `Arc`.
+    pub fn cancel_all(&self) {
+        if let Ok(ops) = self.operations.lock() {
+            for token in ops.values() {
+                token.cancel();
+            }
+        }
+    }
+
     async fn generate_text_on(
         &self,
-        client: LlmClient,
+        client: &LlmClient,
         request: GenerateTextRequest,
         cancellation: CancellationToken,
     ) -> EngineResult<GenerateTextResult> {
@@ -174,30 +261,7 @@ impl PhoneBuddyRuntime {
             });
         }
 
-        let mut items = Vec::new();
-        if let Some(instructions) = request.instructions.as_ref() {
-            if !instructions.is_empty() {
-                items.push(ConversationItem::system(instructions.clone()));
-            }
-        }
-        items.push(ConversationItem::user(request.input));
-
-        let conv = ConversationRequest {
-            model: String::new(),
-            items,
-            stream: Some(true),
-            tools: None,
-            tool_choice: Some(serde_json::json!("none")),
-            temperature: request.temperature,
-            max_tokens: request.max_output_tokens,
-            reasoning_effort: request.reasoning_effort,
-            search_parameters: None,
-            hosted_tools: Vec::new(),
-            previous_response_id: None,
-            image_bytes: Default::default(),
-            audio_bytes: Default::default(),
-        };
-        let _response_format = request.response_format;
+        let conv = one_shot_conversation_request(&request);
 
         let work = async {
             let session = client.begin_turn();
@@ -246,11 +310,32 @@ impl PhoneBuddyRuntime {
 
 impl Drop for PhoneBuddyRuntime {
     fn drop(&mut self) {
-        if let Ok(ops) = self.operations.lock() {
-            for token in ops.values() {
-                token.cancel();
-            }
+        self.cancel_all();
+    }
+}
+
+fn one_shot_conversation_request(request: &GenerateTextRequest) -> ConversationRequest {
+    let mut items = Vec::new();
+    if let Some(instructions) = request.instructions.as_ref() {
+        if !instructions.is_empty() {
+            items.push(ConversationItem::system(instructions.clone()));
         }
+    }
+    items.push(ConversationItem::user(request.input.clone()));
+    ConversationRequest {
+        model: String::new(),
+        items,
+        stream: Some(true),
+        tools: None,
+        tool_choice: Some(serde_json::json!("none")),
+        temperature: request.temperature,
+        max_tokens: request.max_output_tokens,
+        reasoning_effort: request.reasoning_effort,
+        search_parameters: None,
+        hosted_tools: Vec::new(),
+        previous_response_id: None,
+        image_bytes: Default::default(),
+        audio_bytes: Default::default(),
     }
 }
 
@@ -267,7 +352,7 @@ impl PhoneBuddyRuntime {
             request.pool_id.clone(),
             transports,
         )?;
-        self.generate_text_on(client, request, cancellation).await
+        self.generate_text_on(&client, request, cancellation).await
     }
 }
 
@@ -578,7 +663,6 @@ mod generate_text_tests {
             max_output_tokens: Some(32),
             temperature: Some(0.0),
             reasoning_effort: None,
-            response_format: None,
             timeout_ms: None,
         }
     }
@@ -689,6 +773,45 @@ mod generate_text_tests {
             Some("none")
         );
         assert!(conv.previous_response_id.is_none());
+    }
+
+    fn assert_payload_has_no_tools(payload: &serde_json::Value, backend: &str) {
+        if let Some(tools) = payload.get("tools") {
+            if let Some(arr) = tools.as_array() {
+                assert!(
+                    arr.is_empty(),
+                    "{backend} one-shot payload must not list tools: {payload}"
+                );
+            } else {
+                panic!("{backend} tools must be an array or absent: {payload}");
+            }
+        }
+        let encoded = payload.to_string();
+        assert!(
+            !encoded.contains("web_search") && !encoded.contains("x_search"),
+            "{backend} one-shot payload must not attach hosted search: {payload}"
+        );
+        assert!(
+            !encoded.contains("functionDeclarations"),
+            "{backend} one-shot payload must not declare functions: {payload}"
+        );
+    }
+
+    #[test]
+    fn one_shot_adapters_emit_no_tools_or_hosted_search() {
+        let conv = one_shot_conversation_request(&req());
+        let cc = crate::llm::wire::chat_completions::build_chat_completions_payload(&conv).unwrap();
+        assert_payload_has_no_tools(&cc, "chat_completions");
+        assert_eq!(cc.get("tool_choice").and_then(|v| v.as_str()), Some("none"));
+
+        let responses = crate::llm::wire::responses::build_responses_payload(&conv).unwrap();
+        assert_payload_has_no_tools(&responses, "responses");
+
+        let messages = crate::llm::wire::messages::build_messages_payload(&conv).unwrap();
+        assert_payload_has_no_tools(&messages, "messages");
+
+        let gemini = crate::llm::wire::gemini::build_gemini_payload(&conv).unwrap();
+        assert_payload_has_no_tools(&gemini, "gemini");
     }
 
     #[tokio::test]
