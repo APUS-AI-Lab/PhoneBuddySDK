@@ -253,9 +253,19 @@ impl LlmRoutingConfig {
             if pool_id.trim().is_empty() {
                 return Err("pool id is empty".into());
             }
+            if pool.members.is_empty() {
+                return Err(format!("pools.{pool_id} has no members"));
+            }
+            let mut in_pool = HashSet::new();
             for (i, member) in pool.members.iter().enumerate() {
                 if member.provider_id.trim().is_empty() {
                     return Err(format!("pools.{pool_id}.members[{i}].provider_id is empty"));
+                }
+                if !in_pool.insert(member.provider_id.clone()) {
+                    return Err(format!(
+                        "pools.{pool_id} duplicate provider_id '{}'",
+                        member.provider_id
+                    ));
                 }
                 if !seen.contains(&member.provider_id) {
                     return Err(format!(
@@ -482,6 +492,46 @@ mod tests {
             health: RouterHealthConfig::default(),
         };
         assert!(cfg.validate().unwrap_err().contains("unknown provider_id"));
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_pool_members() {
+        let mut pools = BTreeMap::new();
+        pools.insert(
+            "main".into(),
+            ProviderPool {
+                members: vec![],
+                retry: RetryPolicy::default(),
+                when_exhausted: ExhaustionPolicy::ProbeEarliest,
+            },
+        );
+        let mut cfg = LlmRoutingConfig {
+            providers: vec![sample_target("a")],
+            pools,
+            health: RouterHealthConfig::default(),
+        };
+        assert!(cfg.validate().unwrap_err().contains("no members"));
+
+        cfg.pools.get_mut("main").unwrap().members = vec![
+            PoolMember {
+                provider_id: "a".into(),
+                routing_group: "g".into(),
+                base_score: 10,
+                order: 0,
+                enabled: true,
+            },
+            PoolMember {
+                provider_id: "a".into(),
+                routing_group: "g".into(),
+                base_score: 5,
+                order: 1,
+                enabled: true,
+            },
+        ];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("duplicate provider_id"));
     }
 
     #[test]

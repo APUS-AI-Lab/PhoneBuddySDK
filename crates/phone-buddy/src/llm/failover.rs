@@ -1,9 +1,9 @@
-//! Provider health table and chain-mode selection.
+//! Compatibility helpers for provider fingerprints, encrypted-reasoning
+//! stripping, and cooldown duration math.
 //!
-//! When `EngineConfig.fallback_providers` is non-empty, a degraded provider
-//! sits out for a cooldown (circuit-breaker half-open). Subsequent requests
-//! stick to the first healthy provider in chain order until the cooldown
-//! expires, at which point the primary is passively re-probed.
+//! Runtime health scoring and visit planning live in [`crate::llm::router`].
+//! The Instant-based [`ProviderHealth`] / [`select_index`] types below are
+//! leftovers from the pre-router client and are not used by [`crate::llm::client::LlmClient`].
 
 use std::time::{Duration, Instant};
 
@@ -22,9 +22,12 @@ pub const MAX_PROVIDER_COOLDOWN_SECS: u64 = 600;
 /// long. Longer `Retry-After` values trip the provider and switch.
 pub const FAILOVER_RETRY_AFTER_INLINE_CAP: Duration = Duration::from_secs(10);
 
-/// Per-provider circuit-breaker state. Lives for the lifetime of an
-/// [`crate::llm::client::LlmClient`] (i.e. one engine instance).
+/// Legacy Instant-based circuit breaker. New code must use
+/// [`crate::llm::router::LlmRouter`] / [`crate::llm::router::ProviderHealthRecord`].
 #[derive(Debug, Clone, Default)]
+#[deprecated(
+    note = "use llm::router::LlmRouter health; this Instant table is not wired to LlmClient"
+)]
 pub struct ProviderHealth {
     /// Degraded until this instant; `None` = healthy.
     pub cooldown_until: Option<Instant>,
@@ -32,6 +35,7 @@ pub struct ProviderHealth {
     pub consecutive_trips: u32,
 }
 
+#[allow(deprecated)]
 impl ProviderHealth {
     pub fn is_cooling(&self, now: Instant) -> bool {
         self.cooldown_until.map(|t| t > now).unwrap_or(false)
@@ -74,9 +78,9 @@ pub fn cooldown_duration(base_secs: u64, consecutive_trips: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Pick the first provider that is not cooling. If every provider is in
-/// cooldown, pick the one whose cooldown expires soonest so a request always
-/// has somewhere to go.
+/// Legacy Instant selection. Visit order is owned by [`crate::llm::router`].
+#[deprecated(note = "use llm::router visit planning")]
+#[allow(deprecated)]
 pub fn select_index(health: &[ProviderHealth], now: Instant) -> usize {
     if health.is_empty() {
         return 0;
@@ -200,6 +204,7 @@ pub fn sanitize_items_for_provider(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -305,7 +310,10 @@ mod tests {
     #[test]
     fn explicit_group_overrides_profile() {
         assert_eq!(
-            resolve_provider_group(Some("packy"), crate::llm::profiles::ClientProfile::GrokBuild),
+            resolve_provider_group(
+                Some("packy"),
+                crate::llm::profiles::ClientProfile::GrokBuild
+            ),
             "packy"
         );
         assert_eq!(

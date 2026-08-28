@@ -36,17 +36,36 @@ use crate::llm::types::{
 };
 
 pub struct LlmClient {
-    providers: HashMap<String, ProviderSlot>,
     router: Arc<LlmRouter>,
     pool_id: String,
-    /// Single-provider retry budget (`EngineConfig.max_retries`).
-    max_retries: u32,
-    /// Chain-mode per-provider attempt budget (total tries, including the
-    /// first). Ignored when the bound pool has a single member.
-    failover_max_attempts: u32,
-    /// Independent budget for server doom-loop resamples (default 2).
+    slots: Mutex<BoundSlots>,
+    /// When set, HTTP transports and retry policy are rebuilt whenever the
+    /// router config generation changes. Injected test transports leave this
+    /// unset and keep their original slots.
+    http_factory: Option<HttpSlotFactory>,
     doom_loop_max_retries: u32,
     last_success: Mutex<Option<String>>,
+}
+
+struct BoundSlots {
+    generation: u64,
+    providers: HashMap<String, ProviderSlot>,
+    max_retries: u32,
+    failover_max_attempts: u32,
+    primary_compat_key: String,
+}
+
+struct HttpSlotFactory {
+    stream_idle_timeout_secs: u64,
+    http_dump: crate::llm::dumper::HttpDumpConfig,
+    dumps_dir: std::path::PathBuf,
+    enable_doom_loop_check: Option<bool>,
+}
+
+struct CapturedOperation {
+    plan: crate::llm::router::VisitPlan,
+    providers: HashMap<String, ProviderSlot>,
+    primary_compat_key: String,
 }
 
 /// A logical main-agent or subagent turn.
@@ -172,14 +191,20 @@ impl LlmClient {
             crate::llm::failover::DEFAULT_PROVIDER_COOLDOWN_SECS,
         )
         .expect("synthetic single-provider router");
+        let primary_compat_key = slot.compat_key.clone();
         let mut providers = HashMap::new();
         providers.insert(provider_id, slot);
         Self {
-            providers,
             router,
             pool_id: MAIN_POOL_ID.to_string(),
-            max_retries,
-            failover_max_attempts: crate::llm::failover::DEFAULT_FAILOVER_MAX_ATTEMPTS,
+            slots: Mutex::new(BoundSlots {
+                generation: 0,
+                providers,
+                max_retries,
+                failover_max_attempts: crate::llm::failover::DEFAULT_FAILOVER_MAX_ATTEMPTS,
+                primary_compat_key,
+            }),
+            http_factory: None,
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         }
@@ -194,9 +219,10 @@ impl LlmClient {
     ) -> Self {
         let mut slots = HashMap::new();
         let mut ordered = Vec::new();
+        let mut primary_compat_key = String::new();
         for (fingerprint, model, transport) in providers {
             let provider_id = fingerprint.clone();
-            ordered.push(ProviderSlot {
+            let slot = ProviderSlot {
                 provider_id: provider_id.clone(),
                 transport,
                 fingerprint: fingerprint.clone(),
@@ -208,10 +234,12 @@ impl LlmClient {
                 web_search_options: None,
                 enable_x_search: false,
                 x_search_options: None,
-            });
-            // Keep insertion order via the vec; HashMap is the lookup.
-            let slot = ordered.last().unwrap().clone_slot();
-            slots.insert(provider_id, slot);
+            };
+            if primary_compat_key.is_empty() {
+                primary_compat_key = slot.compat_key.clone();
+            }
+            slots.insert(provider_id, slot.clone_slot());
+            ordered.push(slot);
         }
         let router = synthetic_router(
             &ordered,
@@ -221,11 +249,16 @@ impl LlmClient {
         )
         .expect("synthetic chain router");
         Self {
-            providers: slots,
             router,
             pool_id: MAIN_POOL_ID.to_string(),
-            max_retries,
-            failover_max_attempts,
+            slots: Mutex::new(BoundSlots {
+                generation: 0,
+                providers: slots,
+                max_retries,
+                failover_max_attempts,
+                primary_compat_key,
+            }),
+            http_factory: None,
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         }
@@ -248,21 +281,14 @@ impl LlmClient {
         if !router.has_pool(&pool_id) {
             return Err(EngineError::RouteNotConfigured { pool_id });
         }
-        let snapshot = router.snapshot_config();
-        let pool = snapshot
-            .pools
-            .get(&pool_id)
-            .expect("pool existence checked");
-        let mut providers = HashMap::new();
-        for target in &snapshot.providers {
-            providers.insert(target.provider_id.clone(), slot_from_target(cfg, target)?);
-        }
+        let (generation, snapshot) = router.snapshot();
+        let factory = HttpSlotFactory::from_engine(cfg);
+        let bound = bind_http_slots(&pool_id, generation, &snapshot, &factory)?;
         Ok(Self {
-            providers,
             router,
             pool_id,
-            max_retries: pool.retry.max_retries.max(1),
-            failover_max_attempts: pool.retry.failover_max_attempts.max(1),
+            slots: Mutex::new(bound),
+            http_factory: Some(factory),
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         })
@@ -289,29 +315,14 @@ impl LlmClient {
     }
 
     fn primary_compat_key(&self) -> String {
-        let snapshot = self.router.snapshot_config();
-        if let Some(pool) = snapshot.pools.get(&self.pool_id) {
-            if let Some(first) = pool.members.first() {
-                if let Some(slot) = self.providers.get(&first.provider_id) {
-                    return slot.compat_key.clone();
-                }
-                return snapshot
-                    .provider(&first.provider_id)
-                    .map(|p| p.resolved_compat_key())
-                    .unwrap_or_else(|| first.provider_id.clone());
-            }
-        }
-        self.providers
-            .values()
-            .next()
-            .map(|p| p.compat_key.clone())
-            .unwrap_or_default()
+        self.slots.lock().unwrap().primary_compat_key.clone()
     }
 
     fn rewrite_request_for(
         &self,
         req: &ConversationRequest,
         slot: &ProviderSlot,
+        primary_compat_key: &str,
     ) -> ConversationRequest {
         let mut out = req.clone();
         if !slot.model.is_empty() {
@@ -329,10 +340,68 @@ impl LlmClient {
         );
         let tools = out.tools.take().unwrap_or_default();
         out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
-        let primary = self.primary_compat_key();
         let target = slot.compat_key.as_str();
-        out.items = crate::llm::failover::sanitize_items_for_provider(&out.items, target, &primary);
+        out.items = crate::llm::failover::sanitize_items_for_provider(
+            &out.items,
+            target,
+            primary_compat_key,
+        );
         out
+    }
+
+    /// Align local slots with `generation`. HTTP clients rebuild transports
+    /// from the matching config snapshot; injected clients keep their slots
+    /// and only refresh retry budgets.
+    fn sync_slots(&self, generation: u64, retry: &RetryPolicy) -> EngineResult<()> {
+        {
+            let slots = self.slots.lock().unwrap();
+            if slots.generation == generation {
+                return Ok(());
+            }
+        }
+        match &self.http_factory {
+            Some(factory) => {
+                let (snap_gen, snapshot) = self.router.snapshot();
+                let bound = bind_http_slots(&self.pool_id, snap_gen, &snapshot, factory)?;
+                *self.slots.lock().unwrap() = bound;
+            }
+            None => {
+                let mut slots = self.slots.lock().unwrap();
+                slots.max_retries = retry.max_retries.max(1);
+                slots.failover_max_attempts = retry.failover_max_attempts.max(1);
+                slots.generation = generation;
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_operation(&self) -> EngineResult<CapturedOperation> {
+        for _ in 0..4 {
+            let plan = self.router.plan_visit(&self.pool_id)?;
+            self.sync_slots(plan.generation, &plan.retry)?;
+            let slots = self.slots.lock().unwrap();
+            if slots.generation != plan.generation {
+                continue;
+            }
+            let mut providers = HashMap::new();
+            for id in &plan.provider_ids {
+                let Some(slot) = slots.providers.get(id) else {
+                    return Err(EngineError::InvalidRoutingConfig(format!(
+                        "pool '{}' visit plan references unbound provider_id '{id}'",
+                        self.pool_id
+                    )));
+                };
+                providers.insert(id.clone(), slot.clone_slot());
+            }
+            return Ok(CapturedOperation {
+                plan,
+                providers,
+                primary_compat_key: slots.primary_compat_key.clone(),
+            });
+        }
+        Err(EngineError::InvalidRoutingConfig(
+            "routing config changed while capturing a visit plan".into(),
+        ))
     }
 
     /// Run one chat-completion request with retry / failover, streaming
@@ -352,7 +421,8 @@ impl LlmClient {
         context: &LlmTurnContext,
     ) -> EngineResult<CollectedTurn> {
         let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
-        let plan = self.router.plan_visit(&self.pool_id)?;
+        let captured = self.capture_operation()?;
+        let plan = &captured.plan;
         let chain_mode = plan.chain_mode;
         let mut last_error: Option<EngineError> = None;
         let mut tried_ids: Vec<String> = Vec::new();
@@ -360,11 +430,14 @@ impl LlmClient {
         let mut continue_from: Option<CollectedTurn> = None;
 
         for (visit_idx, provider_id) in plan.provider_ids.iter().enumerate() {
-            let Some(slot) = self.providers.get(provider_id) else {
-                continue;
+            let Some(slot) = captured.providers.get(provider_id) else {
+                return Err(EngineError::InvalidRoutingConfig(format!(
+                    "pool '{}' visit plan references unbound provider_id '{provider_id}'",
+                    self.pool_id
+                )));
             };
             tried_ids.push(provider_id.clone());
-            let rewritten = self.rewrite_request_for(req, slot);
+            let rewritten = self.rewrite_request_for(req, slot, &captured.primary_compat_key);
             let rewritten = if let Some(ref partial) = continue_from {
                 skipper.set_skip(&partial.text, &partial.reasoning);
                 // Response ids are host-bound; keep encrypted reasoning
@@ -382,6 +455,8 @@ impl LlmClient {
                     chain_mode,
                     context,
                     &operation_id,
+                    plan.retry.max_retries,
+                    plan.retry.failover_max_attempts,
                 )
                 .await
             {
@@ -429,14 +504,14 @@ impl LlmClient {
                     );
                     let next = plan.provider_ids[visit_idx + 1..]
                         .iter()
-                        .find(|id| self.providers.contains_key(*id));
+                        .find(|id| captured.providers.contains_key(*id));
                     let Some(next_id) = next else {
                         return Err(EngineError::ProviderAttemptsExhausted {
                             pool_id: self.pool_id.clone(),
                             tried_provider_ids: tried_ids,
                         });
                     };
-                    let next_slot = self.providers.get(next_id).unwrap();
+                    let next_slot = captured.providers.get(next_id).unwrap();
                     let reason = last_error
                         .as_ref()
                         .map(|e| e.to_string())
@@ -467,6 +542,7 @@ impl LlmClient {
         Err(EngineError::Llm("no LLM providers configured".into()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_provider(
         &self,
         slot: &ProviderSlot,
@@ -475,11 +551,13 @@ impl LlmClient {
         chain_mode: bool,
         context: &LlmTurnContext,
         operation_id: &str,
+        max_retries: u32,
+        failover_max_attempts: u32,
     ) -> Result<CollectedTurn, ProviderAttemptError> {
         let max_attempts = if chain_mode {
-            self.failover_max_attempts.max(1)
+            failover_max_attempts.max(1)
         } else {
-            self.max_retries.max(1)
+            max_retries.max(1)
         };
         let mut attempt: u32 = 0;
         let mut rate_limit_retries: u32 = 0;
@@ -506,7 +584,7 @@ impl LlmClient {
                             let budget = if chain_mode {
                                 max_attempts
                             } else {
-                                self.max_retries
+                                max_retries
                             };
                             if attempt < budget {
                                 let wait = retry_backoff_with_jitter(attempt);
@@ -626,7 +704,7 @@ impl LlmClient {
                             let wait = retry_after_from_error(&e)
                                 .unwrap_or_else(|| retry_backoff_with_jitter(attempt));
                             let budget_exhausted = rate_limit_retries > RATE_LIMIT_RETRY_THRESHOLD
-                                || (!chain_mode && attempt > self.max_retries)
+                                || (!chain_mode && attempt > max_retries)
                                 || (chain_mode && attempt >= max_attempts);
                             let too_long = chain_mode && wait > FAILOVER_RETRY_AFTER_INLINE_CAP;
                             if budget_exhausted || too_long {
@@ -660,7 +738,7 @@ impl LlmClient {
                             let exhausted = if chain_mode {
                                 attempt >= max_attempts
                             } else {
-                                attempt > self.max_retries
+                                attempt > max_retries
                             };
                             if exhausted {
                                 if chain_mode {
@@ -996,13 +1074,65 @@ fn is_veto(err: &EngineError) -> bool {
     }
 }
 
-fn slot_from_target(cfg: &EngineConfig, target: &ProviderTarget) -> EngineResult<ProviderSlot> {
-    let doom = cfg.enable_doom_loop_check.unwrap_or(matches!(
+impl HttpSlotFactory {
+    fn from_engine(cfg: &EngineConfig) -> Self {
+        Self {
+            stream_idle_timeout_secs: cfg.stream_idle_timeout_secs,
+            http_dump: cfg.http_dump.clone(),
+            dumps_dir: cfg.http_dumps_dir(),
+            enable_doom_loop_check: cfg.enable_doom_loop_check,
+        }
+    }
+}
+
+fn bind_http_slots(
+    pool_id: &str,
+    generation: u64,
+    snapshot: &LlmRoutingConfig,
+    factory: &HttpSlotFactory,
+) -> EngineResult<BoundSlots> {
+    let pool = snapshot
+        .pools
+        .get(pool_id)
+        .ok_or_else(|| EngineError::RouteNotConfigured {
+            pool_id: pool_id.to_string(),
+        })?;
+    let mut providers = HashMap::new();
+    for target in &snapshot.providers {
+        providers.insert(
+            target.provider_id.clone(),
+            slot_from_target(factory, target)?,
+        );
+    }
+    let primary_compat_key = pool
+        .members
+        .first()
+        .and_then(|m| providers.get(&m.provider_id).map(|s| s.compat_key.clone()))
+        .or_else(|| {
+            snapshot
+                .provider(pool.members.first()?.provider_id.as_str())
+                .map(|p| p.resolved_compat_key())
+        })
+        .unwrap_or_default();
+    Ok(BoundSlots {
+        generation,
+        providers,
+        max_retries: pool.retry.max_retries.max(1),
+        failover_max_attempts: pool.retry.failover_max_attempts.max(1),
+        primary_compat_key,
+    })
+}
+
+fn slot_from_target(
+    factory: &HttpSlotFactory,
+    target: &ProviderTarget,
+) -> EngineResult<ProviderSlot> {
+    let doom = factory.enable_doom_loop_check.unwrap_or(matches!(
         target.api_backend,
         crate::llm::types::ApiBackend::Responses
     ));
     let transport = Arc::new(http_transport(
-        cfg,
+        factory,
         &target.base_url,
         &target.api_key,
         target.api_backend,
@@ -1108,7 +1238,7 @@ fn synthetic_router(
 }
 
 fn http_transport(
-    cfg: &EngineConfig,
+    factory: &HttpSlotFactory,
     base_url: &str,
     api_key: &str,
     api_backend: crate::llm::types::ApiBackend,
@@ -1119,11 +1249,12 @@ fn http_transport(
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     doom_loop: bool,
 ) -> EngineResult<crate::llm::transport::HttpTransport> {
-    let dumper = crate::llm::dumper::HttpDumper::new(cfg.http_dump.clone(), cfg.http_dumps_dir());
+    let dumper =
+        crate::llm::dumper::HttpDumper::new(factory.http_dump.clone(), factory.dumps_dir.clone());
     crate::llm::transport::HttpTransport::new_with_all_options(
         base_url,
         api_key,
-        Duration::from_secs(cfg.stream_idle_timeout_secs),
+        Duration::from_secs(factory.stream_idle_timeout_secs),
         api_backend,
         client_profile,
         client_version,
@@ -1856,5 +1987,53 @@ mod tests {
         let mut remaining = "Hello".to_string();
         assert_eq!(skip_prefix_chunk(&mut remaining, "Hi"), "Hi");
         assert_eq!(remaining, "");
+    }
+
+    #[tokio::test]
+    async fn update_routing_unbound_visit_id_is_hard_error() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let t = ScriptedTransport::failing("p", 0, "", hits.clone());
+        let client = LlmClient::new(t as Arc<dyn LlmTransportObj>, 1);
+        let mut next = client.router().snapshot_config();
+        next.providers[0].provider_id = "rotated".into();
+        next.pools.get_mut(MAIN_POOL_ID).unwrap().members[0].provider_id = "rotated".into();
+        client.router().update_config(next).unwrap();
+        let err = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap_err();
+        match err {
+            EngineError::InvalidRoutingConfig(msg) => {
+                assert!(msg.contains("unbound provider_id"), "{msg}");
+            }
+            other => panic!("expected InvalidRoutingConfig, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_earliest_still_visits_cooling_backup_in_same_operation() {
+        tokio::time::pause();
+        let a_hits = Arc::new(AtomicU32::new(0));
+        let b_hits = Arc::new(AtomicU32::new(0));
+        let a = ScriptedTransport::failing("a", u32::MAX, "status=503 busy", a_hits.clone());
+        let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
+        let client = LlmClient::with_chain(
+            vec![
+                ("host-a/m".into(), "m".into(), a),
+                ("host-b/m".into(), "m".into(), b),
+            ],
+            5,
+            3,
+            120,
+        );
+        client
+            .router()
+            .record_trip("pre", "host-b/m", FailureClass::RetryableHttp, None);
+        let observer = RecordingObserver::new();
+        let turn = client.complete(&req(), &observer).await.unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
     }
 }

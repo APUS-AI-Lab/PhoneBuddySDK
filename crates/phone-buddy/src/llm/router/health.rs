@@ -50,7 +50,6 @@ pub struct ProviderHealthRecord {
     pub last_success_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_class: Option<FailureClass>,
-    /// Makes a second trip for the same operation/visit a no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_trip_operation_id: Option<String>,
     /// Last time this id was present in the live routing config.

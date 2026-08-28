@@ -33,6 +33,7 @@ pub struct LlmRouter {
 }
 
 struct RouterInner {
+    generation: u64,
     config: LlmRoutingConfig,
     health: HashMap<String, ProviderHealthRecord>,
 }
@@ -63,15 +64,29 @@ impl LlmRouter {
         let now = Utc::now();
         reconcile_health(&mut health, &config, now);
         let router = Arc::new(Self {
-            inner: Mutex::new(RouterInner { config, health }),
+            inner: Mutex::new(RouterInner {
+                generation: 0,
+                config,
+                health,
+            }),
             persist_path,
         });
-        router.persist_locked();
+        router.flush_health();
         Ok(router)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation
     }
 
     pub fn snapshot_config(&self) -> LlmRoutingConfig {
         self.inner.lock().unwrap().config.clone()
+    }
+
+    /// Config snapshot paired with the generation it was taken from.
+    pub fn snapshot(&self) -> (u64, LlmRoutingConfig) {
+        let inner = self.inner.lock().unwrap();
+        (inner.generation, inner.config.clone())
     }
 
     pub fn has_pool(&self, pool_id: &str) -> bool {
@@ -105,6 +120,7 @@ impl LlmRouter {
         let mut inner = self.inner.lock().unwrap();
         let now = Utc::now();
         reconcile_health(&mut inner.health, &config, now);
+        inner.generation = inner.generation.wrapping_add(1);
         inner.config = config;
         self.write_health(&inner);
         Ok(())
@@ -118,16 +134,26 @@ impl LlmRouter {
 
     pub fn plan_visit_at(&self, pool_id: &str, now: DateTime<Utc>) -> EngineResult<VisitPlan> {
         let mut inner = self.inner.lock().unwrap();
-        let pool = inner.config.pools.get(pool_id).cloned().ok_or_else(|| {
-            EngineError::RouteNotConfigured {
-                pool_id: pool_id.to_string(),
+        let RouterInner {
+            generation,
+            config,
+            health,
+        } = &mut *inner;
+        let pool =
+            config
+                .pools
+                .get(pool_id)
+                .cloned()
+                .ok_or_else(|| EngineError::RouteNotConfigured {
+                    pool_id: pool_id.to_string(),
+                })?;
+        reconcile_health(health, config, now);
+        match select_visit_order(pool_id, &pool, health, &config.health, now) {
+            Ok(mut plan) => {
+                plan.generation = *generation;
+                plan.retry = pool.retry.clone();
+                Ok(plan)
             }
-        })?;
-        let health_cfg = inner.config.health.clone();
-        let live_config = inner.config.clone();
-        reconcile_health(&mut inner.health, &live_config, now);
-        match select_visit_order(pool_id, &pool, &inner.health, &health_cfg, now) {
-            Ok(plan) => Ok(plan),
             Err(SelectError::FailFast { retry_after_ms }) => Err(EngineError::PoolExhausted {
                 pool_id: pool_id.to_string(),
                 retry_after_ms,
@@ -154,10 +180,12 @@ impl LlmRouter {
         now: DateTime<Utc>,
     ) -> Duration {
         let mut inner = self.inner.lock().unwrap();
-        let health_cfg = inner.config.health.clone();
-        let rec = inner.health.entry(provider_id.to_string()).or_default();
-        rec.last_seen_in_config = Some(now);
-        let wait = rec.trip(now, operation_id, class, &health_cfg, retry_after);
+        let wait = {
+            let RouterInner { config, health, .. } = &mut *inner;
+            let rec = health.entry(provider_id.to_string()).or_default();
+            rec.last_seen_in_config = Some(now);
+            rec.trip(now, operation_id, class, &config.health, retry_after)
+        };
         self.write_health(&inner);
         wait
     }
@@ -174,7 +202,7 @@ impl LlmRouter {
         self.write_health(&inner);
     }
 
-    fn persist_locked(&self) {
+    fn flush_health(&self) {
         let inner = self.inner.lock().unwrap();
         self.write_health(&inner);
     }
@@ -284,6 +312,16 @@ mod tests {
             .unwrap_or(false));
         let plan = router.plan_visit_at("main", t).unwrap();
         assert_eq!(plan.provider_ids[0], "p-b");
+    }
+
+    #[test]
+    fn config_update_bumps_generation() {
+        let router = LlmRouter::in_memory(two_provider_config(false)).unwrap();
+        assert_eq!(router.generation(), 0);
+        router.update_config(two_provider_config(true)).unwrap();
+        assert_eq!(router.generation(), 1);
+        let plan = router.plan_visit("main").unwrap();
+        assert_eq!(plan.generation, 1);
     }
 
     #[test]

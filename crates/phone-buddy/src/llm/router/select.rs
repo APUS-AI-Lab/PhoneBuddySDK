@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::config::{ExhaustionPolicy, PoolMember, ProviderPool, RouterHealthConfig};
+use super::config::{ExhaustionPolicy, PoolMember, ProviderPool, RetryPolicy, RouterHealthConfig};
 use super::health::ProviderHealthRecord;
 
 /// Ordered visit plan for one operation against one pool.
@@ -14,6 +14,9 @@ pub struct VisitPlan {
     pub pool_id: String,
     pub provider_ids: Vec<String>,
     pub chain_mode: bool,
+    /// Router config generation this plan was computed against.
+    pub generation: u64,
+    pub retry: RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +72,6 @@ pub fn select_visit_order(
         .cloned()
         .collect();
 
-    let chain_mode = pool.members.len() > 1;
     let mut provider_ids = rank_eligible(&mut eligible);
 
     if provider_ids.is_empty() {
@@ -104,13 +106,14 @@ pub fn select_visit_order(
 
     Ok(VisitPlan {
         pool_id: pool_id.to_string(),
+        chain_mode: provider_ids.len() > 1,
         provider_ids,
-        chain_mode,
+        generation: 0,
+        retry: pool.retry.clone(),
     })
 }
 
 fn rank_eligible(members: &mut [ScoredMember<'_>]) -> Vec<String> {
-    // Group rank: max score desc, then lowest declared order, then group name.
     let mut groups: HashMap<&str, (i32, u32)> = HashMap::new();
     for s in members.iter() {
         let entry = groups
@@ -302,5 +305,51 @@ mod tests {
         };
         let plan = select_visit_order("main", &pool, &HashMap::new(), &cfg(), t0()).unwrap();
         assert_eq!(plan.provider_ids, vec!["live"]);
+        assert!(
+            !plan.chain_mode,
+            "one enabled member must use the single-provider retry budget"
+        );
+    }
+
+    #[test]
+    fn probe_earliest_appends_cooling_after_healthy() {
+        let pool = ProviderPool {
+            members: vec![member("a", "g", 10, 0), member("b", "g", 8, 1)],
+            retry: RetryPolicy::default(),
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
+        };
+        let mut health = HashMap::new();
+        health.insert(
+            "b".into(),
+            ProviderHealthRecord {
+                cooldown_until: Some(t0() + chrono::Duration::seconds(120)),
+                consecutive_trips: 1,
+                ..Default::default()
+            },
+        );
+        let plan = select_visit_order("main", &pool, &health, &cfg(), t0()).unwrap();
+        assert_eq!(plan.provider_ids, vec!["a", "b"]);
+        assert!(plan.chain_mode);
+    }
+
+    #[test]
+    fn fail_fast_does_not_append_cooling_when_healthy_exists() {
+        let pool = ProviderPool {
+            members: vec![member("a", "g", 10, 0), member("b", "g", 8, 1)],
+            retry: RetryPolicy::default(),
+            when_exhausted: ExhaustionPolicy::FailFast,
+        };
+        let mut health = HashMap::new();
+        health.insert(
+            "b".into(),
+            ProviderHealthRecord {
+                cooldown_until: Some(t0() + chrono::Duration::seconds(120)),
+                consecutive_trips: 1,
+                ..Default::default()
+            },
+        );
+        let plan = select_visit_order("title", &pool, &health, &cfg(), t0()).unwrap();
+        assert_eq!(plan.provider_ids, vec!["a"]);
+        assert!(!plan.chain_mode);
     }
 }
