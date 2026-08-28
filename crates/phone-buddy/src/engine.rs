@@ -280,8 +280,7 @@ impl PhoneBuddyEngine {
         ));
         subagent_registry.register(crate::tools::notification::arc(host_tools.clone()));
 
-        // HTTP engines bind TaskManager to `subagent`. Host / injected
-        // transports share the engine client because they have no pools.
+        // Host / injected transports share the engine client; they have no named pools.
         let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
             (Some(runtime), LlmMode::Http) => Arc::new(LlmClient::from_router(
                 runtime.router(),
