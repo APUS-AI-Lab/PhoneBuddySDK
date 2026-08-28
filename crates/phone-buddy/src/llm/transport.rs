@@ -29,7 +29,7 @@ pub type ChunkStream =
 /// result), but must never be shared with another turn. State is keyed by the
 /// concrete transport so provider failover cannot carry host-bound tokens to
 /// a different endpoint.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct LlmTurnContext {
     turn_states: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
@@ -315,7 +315,6 @@ impl HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
         }
 
-        // The token is scoped to this exact transport and logical agent turn.
         if let Some(ts) = context.turn_state(&self.turn_state_key) {
             builder = builder.header("x-codex-turn-state", &ts);
             req_headers_map.insert(
@@ -425,7 +424,6 @@ impl HttpTransport {
             }
         };
 
-        // Capture sticky routing token for later requests in this logical turn.
         if let Some(ts_val) = resp.headers().get("x-codex-turn-state") {
             if let Ok(ts_str) = ts_val.to_str() {
                 context.set_turn_state(&self.turn_state_key, ts_str.to_string());

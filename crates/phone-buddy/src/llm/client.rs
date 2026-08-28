@@ -93,10 +93,8 @@ pub trait LlmTransportObj: Send + Sync {
     fn request_stream_in_context_boxed<'a>(
         &'a self,
         req: &'a ConversationRequest,
-        _context: &'a LlmTurnContext,
-    ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>> {
-        self.request_stream_boxed(req)
-    }
+        context: &'a LlmTurnContext,
+    ) -> futures_util::future::BoxFuture<'a, EngineResult<crate::llm::transport::ChunkStream>>;
     fn name(&self) -> &str;
 }
 
