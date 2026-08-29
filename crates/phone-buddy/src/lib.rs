@@ -54,9 +54,9 @@ pub mod prelude {
     };
     pub use crate::llm::router::{
         ExhaustionPolicy, LlmRoutingConfig, PoolMember, ProviderPool, ProviderTarget, RetryPolicy,
-        RouterHealthConfig, MAIN_POOL_ID, SUBAGENT_POOL_ID,
+        RouterHealthConfig, Workload, MAIN_POOL_ID, SUBAGENT_POOL_ID,
     };
-    pub use crate::llm::types::{ApiBackend, ReasoningEffort};
+    pub use crate::llm::types::{ApiBackend, ReasoningEffort, ResponseFormat};
     pub use crate::runtime::{GenerateTextRequest, GenerateTextResult, PhoneBuddyRuntime};
     pub use crate::session::SessionMeta;
 }

@@ -38,6 +38,9 @@ pub fn build_chat_completions_payload(req: &ConversationRequest) -> EngineResult
             }
         }
     }
+    if let Some(format) = &req.response_format {
+        val["response_format"] = format.to_chat_completions();
+    }
     Ok(val)
 }
 

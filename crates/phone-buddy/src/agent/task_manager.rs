@@ -395,6 +395,7 @@ impl TaskManager {
                 search_parameters: None,
                 hosted_tools: hosted,
                 previous_response_id: None,
+                response_format: None,
                 image_bytes: crate::llm::image::ImageBytesStore::default(),
                 audio_bytes: crate::llm::image::AudioBytesStore::default(),
             };

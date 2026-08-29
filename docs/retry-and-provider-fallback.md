@@ -32,12 +32,14 @@ duplicated tokens.
 The engine emits a `Retrying` event before each wait:
 
 ```json
-{"Retrying":{"provider":"api.example.com/grok-4.6","attempt":2,"max_attempts":5,"wait_ms":2100,"reason":"status=503","provider_id":"legacy-primary","pool_id":"main"}}
+{"Retrying":{"provider":"api.example.com/grok-4.6","attempt":2,"max_attempts":5,"wait_ms":2100,"reason":"status=503","provider_id":"legacy-primary","pool_id":"main","workload":"main"}}
 ```
 
 `provider` is a desensitized `host/model` label kept for existing UI.
-`provider_id` is the stable, secret-free join key. Neither field includes
-an API key.
+`provider_id` is the stable, secret-free join key. `workload` is `main`,
+`subagent`, or `one_shot`, so a `provider_id` listed in several pools can
+still be attributed to the work that tripped it. No field includes an API
+key.
 
 ## 2. Named pools (and the legacy chain)
 
@@ -110,7 +112,7 @@ A `ProviderSwitched` event is emitted on every switch. Stable ids are the
 join key; `from` / `to` remain as sanitized labels during deprecation:
 
 ```json
-{"ProviderSwitched":{"from":"primary.example/grok-4.6","to":"api.openai.com/gpt-5.6","reason":"LLM request failed: status=503 …","cooldown_ms":120000,"from_provider_id":"legacy-primary","to_provider_id":"legacy-fallback-0","pool_id":"main","failure_class":"retryable_http"}}
+{"ProviderSwitched":{"from":"primary.example/grok-4.6","to":"api.openai.com/gpt-5.6","reason":"LLM request failed: status=503 …","cooldown_ms":120000,"from_provider_id":"legacy-primary","to_provider_id":"legacy-fallback-0","pool_id":"main","workload":"main","failure_class":"retryable_http"}}
 ```
 
 If every provider in the visit plan is exhausted, the SDK returns
@@ -254,3 +256,6 @@ The printer logs `Retrying` and `ProviderSwitched` events on stderr.
 8. Subagents never inherit the main pool by falling back; missing
    `subagent` is `RouteNotConfigured`. Free-form task `model` overrides
    are not accepted — the selected pool member supplies the model.
+9. Every routed operation reports its `workload` (`main`, `subagent`,
+   `one_shot`) alongside `pool_id` and `operation_id`. One-shot calls have
+   no host event stream, so their routing diagnostics go to `tracing`.

@@ -9,6 +9,9 @@ use crate::llm::types::{
 
 use super::{args_as_object, sanitize_json_schema_for_gemini, WireAdapter};
 
+/// `generationConfig.responseMimeType` value that constrains output to JSON.
+const JSON_MIME: &str = "application/json";
+
 pub struct GeminiAdapter;
 
 impl WireAdapter for GeminiAdapter {
@@ -138,6 +141,19 @@ pub fn build_gemini_payload(req: &ConversationRequest) -> EngineResult<serde_jso
         "thinkingConfig".into(),
         serde_json::json!({ "includeThoughts": true }),
     );
+    match req.response_format.as_ref() {
+        None | Some(crate::llm::types::ResponseFormat::Text) => {}
+        Some(crate::llm::types::ResponseFormat::JsonObject) => {
+            generation_config.insert("responseMimeType".into(), JSON_MIME.into());
+        }
+        Some(crate::llm::types::ResponseFormat::JsonSchema { schema, .. }) => {
+            generation_config.insert("responseMimeType".into(), JSON_MIME.into());
+            generation_config.insert(
+                "responseSchema".into(),
+                sanitize_json_schema_for_gemini(schema.clone()),
+            );
+        }
+    }
 
     let mut payload = serde_json::json!({
         "contents": contents,
@@ -347,6 +363,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            response_format: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }

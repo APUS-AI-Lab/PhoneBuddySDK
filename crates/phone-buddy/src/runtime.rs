@@ -14,11 +14,11 @@ use crate::config::EngineConfig;
 use crate::conversation::ConversationItem;
 use crate::engine::PhoneBuddyEngine;
 use crate::error::{EngineError, EngineResult};
-use crate::events::NullObserver;
+use crate::events::{AgentEvent, AgentObserver};
 use crate::llm::client::LlmClient;
 use crate::llm::dumper::HttpDumpConfig;
-use crate::llm::router::{synthesize_legacy_routing, LlmRouter, LlmRoutingConfig};
-use crate::llm::types::{ConversationRequest, ReasoningEffort, Usage};
+use crate::llm::router::{synthesize_legacy_routing, LlmRouter, LlmRoutingConfig, Workload};
+use crate::llm::types::{ConversationRequest, ReasoningEffort, ResponseFormat, Usage};
 
 /// Tool-free one-shot generation. Pool id is caller-supplied (e.g. `session_title`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +33,10 @@ pub struct GenerateTextRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Structured-output constraint. Backends that cannot express it reject
+    /// the request instead of silently returning prose.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -50,6 +54,63 @@ pub struct GenerateTextResult {
     pub attempts: u32,
     pub operation_id: String,
     pub pool_id: String,
+    /// Always `one_shot`; lets hosts join results with routing diagnostics.
+    pub workload: String,
+}
+
+/// Forwards one-shot router diagnostics to `tracing`. A one-shot call has no
+/// session and no host event stream, so `Retrying` / `ProviderSwitched` would
+/// otherwise be invisible; content deltas are dropped.
+struct OneShotDiagnostics;
+
+impl AgentObserver for OneShotDiagnostics {
+    fn on_event(&self, event: AgentEvent) {
+        match event {
+            AgentEvent::Retrying {
+                provider_id,
+                pool_id,
+                workload,
+                operation_id,
+                failure_class,
+                attempt,
+                max_attempts,
+                wait_ms,
+                reason,
+                ..
+            } => {
+                tracing::warn!(
+                    provider_id = provider_id.as_deref().unwrap_or(""),
+                    pool_id = pool_id.as_deref().unwrap_or(""),
+                    workload = workload.as_deref().unwrap_or(""),
+                    operation_id = operation_id.as_deref().unwrap_or(""),
+                    failure_class = failure_class.as_deref().unwrap_or(""),
+                    "one-shot retry {attempt}/{max_attempts} in {wait_ms}ms: {reason}"
+                );
+            }
+            AgentEvent::ProviderSwitched {
+                from_provider_id,
+                to_provider_id,
+                pool_id,
+                workload,
+                operation_id,
+                failure_class,
+                cooldown_ms,
+                reason,
+                ..
+            } => {
+                tracing::warn!(
+                    from_provider_id = from_provider_id.as_deref().unwrap_or(""),
+                    to_provider_id = to_provider_id.as_deref().unwrap_or(""),
+                    pool_id = pool_id.as_deref().unwrap_or(""),
+                    workload = workload.as_deref().unwrap_or(""),
+                    operation_id = operation_id.as_deref().unwrap_or(""),
+                    failure_class = failure_class.as_deref().unwrap_or(""),
+                    "one-shot provider switch, cooldown {cooldown_ms}ms: {reason}"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Process-scoped routing owner. Longer-lived than a single
@@ -155,11 +216,10 @@ impl PhoneBuddyRuntime {
         if let Some(client) = self.one_shot_clients.lock().unwrap().get(pool_id) {
             return Ok(client.clone());
         }
-        let client = Arc::new(LlmClient::from_router(
-            self.router(),
-            pool_id,
-            &self.http_engine_config(),
-        )?);
+        let client = Arc::new(
+            LlmClient::from_router(self.router(), pool_id, &self.http_engine_config())?
+                .with_workload(Workload::OneShot),
+        );
         self.one_shot_clients
             .lock()
             .unwrap()
@@ -265,7 +325,7 @@ impl PhoneBuddyRuntime {
 
         let work = async {
             let session = client.begin_turn();
-            session.complete(&conv, &NullObserver).await
+            session.complete(&conv, &OneShotDiagnostics).await
         };
 
         let turn = if let Some(ms) = request.timeout_ms {
@@ -304,6 +364,7 @@ impl PhoneBuddyRuntime {
             attempts: turn.attempts.max(1),
             operation_id,
             pool_id: request.pool_id,
+            workload: Workload::OneShot.as_str().to_string(),
         })
     }
 }
@@ -331,6 +392,7 @@ fn one_shot_conversation_request(request: &GenerateTextRequest) -> ConversationR
         temperature: request.temperature,
         max_tokens: request.max_output_tokens,
         reasoning_effort: request.reasoning_effort,
+        response_format: request.response_format.clone(),
         search_parameters: None,
         hosted_tools: Vec::new(),
         previous_response_id: None,
@@ -351,7 +413,8 @@ impl PhoneBuddyRuntime {
             self.router(),
             request.pool_id.clone(),
             transports,
-        )?;
+        )?
+        .with_workload(Workload::OneShot);
         self.generate_text_on(&client, request, cancellation).await
     }
 }
@@ -663,6 +726,7 @@ mod generate_text_tests {
             max_output_tokens: Some(32),
             temperature: Some(0.0),
             reasoning_effort: None,
+            response_format: None,
             timeout_ms: None,
         }
     }
@@ -687,6 +751,7 @@ mod generate_text_tests {
         assert_eq!(result.provider_id, "p-cc");
         assert_eq!(result.model, "stream-model");
         assert_eq!(result.pool_id, TITLE_POOL);
+        assert_eq!(result.workload, "one_shot");
         assert!(result.operation_id.starts_with("op_"));
         assert!(result.attempts >= 1);
         let usage = result.usage.expect("usage");
@@ -814,6 +879,77 @@ mod generate_text_tests {
         assert_payload_has_no_tools(&gemini, "gemini");
     }
 
+    #[test]
+    fn one_shot_response_format_reaches_every_supported_backend() {
+        let mut request = req();
+        request.response_format = Some(ResponseFormat::JsonSchema {
+            name: "title".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"],
+            }),
+            strict: Some(true),
+        });
+        let conv = one_shot_conversation_request(&request);
+
+        let cc = crate::llm::wire::chat_completions::build_chat_completions_payload(&conv).unwrap();
+        assert_eq!(
+            cc["response_format"]["type"].as_str(),
+            Some("json_schema"),
+            "{cc}"
+        );
+        assert_eq!(cc["response_format"]["json_schema"]["name"], "title");
+        assert_eq!(cc["response_format"]["json_schema"]["strict"], true);
+
+        let responses = crate::llm::wire::responses::build_responses_payload(&conv).unwrap();
+        assert_eq!(responses["text"]["format"]["type"], "json_schema");
+        assert_eq!(responses["text"]["format"]["name"], "title");
+        assert!(
+            responses["text"]["format"]["schema"].is_object(),
+            "{responses}"
+        );
+
+        let gemini = crate::llm::wire::gemini::build_gemini_payload(&conv).unwrap();
+        assert_eq!(
+            gemini["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(gemini["generationConfig"]["responseSchema"].is_object());
+
+        // Anthropic Messages cannot express this without a tool schema, and
+        // one-shot generation forbids tools — fail loudly instead of
+        // returning prose the caller would try to parse.
+        let err = crate::llm::wire::messages::build_messages_payload(&conv).unwrap_err();
+        assert_eq!(err.kind(), "ResponseFormatUnsupported");
+        assert_eq!(err.envelope_fields()["api_backend"], "messages");
+    }
+
+    #[test]
+    fn one_shot_json_object_and_text_formats_round_trip() {
+        let mut request = req();
+        request.response_format = Some(ResponseFormat::JsonObject);
+        let conv = one_shot_conversation_request(&request);
+        let cc = crate::llm::wire::chat_completions::build_chat_completions_payload(&conv).unwrap();
+        assert_eq!(cc["response_format"]["type"], "json_object");
+        assert_eq!(
+            crate::llm::wire::gemini::build_gemini_payload(&conv).unwrap()["generationConfig"]
+                ["responseMimeType"],
+            "application/json"
+        );
+
+        // `Text` is the documented no-op and stays legal on every backend.
+        request.response_format = Some(ResponseFormat::Text);
+        let conv = one_shot_conversation_request(&request);
+        assert!(crate::llm::wire::messages::build_messages_payload(&conv).is_ok());
+        let gemini = crate::llm::wire::gemini::build_gemini_payload(&conv).unwrap();
+        assert!(gemini["generationConfig"].get("responseMimeType").is_none());
+
+        let parsed: ResponseFormat =
+            serde_json::from_str(r#"{"type":"json_object"}"#).expect("wire form");
+        assert_eq!(parsed, ResponseFormat::JsonObject);
+    }
+
     #[tokio::test]
     async fn missing_pool_is_route_not_configured() {
         let dir = tempfile::tempdir().unwrap();
@@ -904,5 +1040,177 @@ mod generate_text_tests {
         cancel.cancel();
         let err = task.await.unwrap().unwrap_err();
         assert!(matches!(err, EngineError::OperationCancelled));
+    }
+
+    /// Always fails with a retryable status so the pool fails over.
+    struct FailingTransport {
+        name: String,
+        hits: AtomicU32,
+    }
+
+    impl FailingTransport {
+        fn new(name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                hits: AtomicU32::new(0),
+            })
+        }
+    }
+
+    impl LlmTransport for FailingTransport {
+        async fn request_stream(
+            &self,
+            _req: &ConversationRequest,
+        ) -> EngineResult<crate::llm::transport::ChunkStream> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Err(EngineError::Llm("status=503 busy".into()))
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_main_subagent_and_one_shot_share_health_but_not_state() {
+        use crate::events::RecordingObserver;
+        use crate::llm::client::LlmClient;
+        use crate::llm::router::{Workload, MAIN_POOL_ID, SUBAGENT_POOL_ID};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_pool = ProviderPool {
+            members: vec![member("p-shared-a", 0), member("p-shared-b", 1)],
+            // Fail over on the first failure instead of burning the budget.
+            retry: crate::llm::router::RetryPolicy {
+                failover_max_attempts: 1,
+                max_retries: 1,
+            },
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
+        };
+        let mut pools = BTreeMap::new();
+        pools.insert(MAIN_POOL_ID.into(), agent_pool.clone());
+        pools.insert(SUBAGENT_POOL_ID.into(), agent_pool);
+        pools.insert(
+            TITLE_POOL.into(),
+            ProviderPool {
+                members: vec![member("p-title", 0)],
+                when_exhausted: ExhaustionPolicy::FailFast,
+                ..Default::default()
+            },
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                target_with("p-shared-a", ApiBackend::ChatCompletions, false),
+                target_with("p-shared-b", ApiBackend::ChatCompletions, false),
+                target_with("p-title", ApiBackend::ChatCompletions, false),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let runtime = PhoneBuddyRuntime::new(routing, dir.path()).unwrap();
+
+        let dead = FailingTransport::new("p-shared-a");
+        let healthy = CapturingTransport::new("p-shared-b", "agent answer");
+        let title = CapturingTransport::new("p-title", "A Title");
+        let agent_transports: HashMap<String, Arc<dyn LlmTransportObj>> = HashMap::from([
+            (
+                "p-shared-a".into(),
+                dead.clone() as Arc<dyn LlmTransportObj>,
+            ),
+            (
+                "p-shared-b".into(),
+                healthy.clone() as Arc<dyn LlmTransportObj>,
+            ),
+        ]);
+        let title_transports: HashMap<String, Arc<dyn LlmTransportObj>> =
+            HashMap::from([("p-title".into(), title.clone() as Arc<dyn LlmTransportObj>)]);
+
+        let main_client = LlmClient::from_router_with_transports(
+            runtime.router(),
+            MAIN_POOL_ID,
+            agent_transports.clone(),
+        )
+        .unwrap()
+        .with_workload(Workload::Main);
+        let sub_client = LlmClient::from_router_with_transports(
+            runtime.router(),
+            SUBAGENT_POOL_ID,
+            agent_transports,
+        )
+        .unwrap()
+        .with_workload(Workload::Subagent);
+
+        let conv = one_shot_conversation_request(&req());
+        let observer = RecordingObserver::new();
+        let main_turn = main_client.begin_turn();
+        let sub_turn = sub_client.begin_turn();
+        let (main_res, sub_res, one_shot_res) = tokio::join!(
+            main_turn.complete(&conv, &observer),
+            sub_turn.complete(&conv, &observer),
+            runtime.generate_text_with_transports(
+                req(),
+                title_transports,
+                CancellationToken::new()
+            ),
+        );
+
+        assert_eq!(main_res.unwrap().provider_id, "p-shared-b");
+        assert_eq!(sub_res.unwrap().provider_id, "p-shared-b");
+        let one_shot = one_shot_res.unwrap();
+        assert_eq!(one_shot.provider_id, "p-title");
+        assert_eq!(one_shot.workload, "one_shot");
+
+        // One trip per logical visit, never per low-level retry. Whether the
+        // second agent workload reaches the dead provider depends on whether
+        // it captured its plan before the first trip landed, so compare the
+        // trip count against the visits that actually happened.
+        let visits = dead.hits.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&visits),
+            "unexpected dead visits: {visits}"
+        );
+        let shared = runtime.router().health_record("p-shared-a").unwrap();
+        assert_eq!(shared.consecutive_trips, visits);
+        assert!(shared.is_cooling(chrono::Utc::now()));
+
+        // Health is shared by provider id: the trip suppresses the dead
+        // provider in every pool that lists it, not just the one that failed.
+        for pool in [MAIN_POOL_ID, SUBAGENT_POOL_ID] {
+            let plan = runtime.router().plan_visit(pool).unwrap();
+            assert_eq!(plan.provider_ids[0], "p-shared-b", "pool {pool}");
+        }
+        // The title pool uses a different provider id, so it stays healthy.
+        assert_eq!(
+            runtime
+                .router()
+                .plan_visit(TITLE_POOL)
+                .unwrap()
+                .provider_ids,
+            vec!["p-title"]
+        );
+        assert!(runtime
+            .router()
+            .health_record("p-title")
+            .is_none_or(|h| !h.is_cooling(chrono::Utc::now())));
+
+        // Isolated route-affine state: three concurrent operations each
+        // started with a clean turn context on their own transport.
+        assert_eq!(healthy.isolated_starts.load(Ordering::SeqCst), 2);
+        assert_eq!(title.isolated_starts.load(Ordering::SeqCst), 1);
+
+        // Diagnostics attribute the shared trip to the workload that caused it.
+        let workloads: Vec<String> = observer
+            .snapshot()
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::events::AgentEvent::ProviderSwitched { workload, .. } => workload,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(workloads.len(), visits as usize, "{workloads:?}");
+        assert!(
+            workloads.iter().all(|w| w == "main" || w == "subagent"),
+            "{workloads:?}"
+        );
     }
 }

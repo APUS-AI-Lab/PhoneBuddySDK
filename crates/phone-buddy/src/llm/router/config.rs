@@ -26,6 +26,39 @@ pub const DEFAULT_PENALTY_WINDOW_SECS: u64 = 3600;
 /// Keep health for provider ids absent from config this long.
 pub const DEFAULT_ABSENT_PROVIDER_RETENTION_SECS: u64 = 24 * 3600;
 
+/// Which kind of work a routed LLM operation belongs to.
+///
+/// Pool ids are app-chosen and arbitrary, so diagnostics report the workload
+/// separately: two pools may share a `provider_id`, and a `provider_id` may be
+/// visited by an agent turn and a one-shot call in the same second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Workload {
+    /// Main agent turn (tool loop, session, compaction).
+    #[default]
+    Main,
+    /// Subagent task turn (tool loop, task-owned history).
+    Subagent,
+    /// Tool-free, session-free [`crate::runtime::PhoneBuddyRuntime::generate_text`].
+    OneShot,
+}
+
+impl Workload {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Subagent => "subagent",
+            Self::OneShot => "one_shot",
+        }
+    }
+}
+
+impl std::fmt::Display for Workload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Declarative routing snapshot owned by the host app.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmRoutingConfig {

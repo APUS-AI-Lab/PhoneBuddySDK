@@ -186,6 +186,7 @@ async fn test_codex_profile_protocol_conformance() {
         search_parameters: None,
         hosted_tools: vec![],
         previous_response_id: None,
+        response_format: None,
         image_bytes: phone_buddy::llm::image::ImageBytesStore::default(),
         audio_bytes: phone_buddy::llm::image::AudioBytesStore::default(),
     };
@@ -245,6 +246,7 @@ async fn test_x_thread_fetch_and_x_search_alignment() {
         search_parameters: None,
         hosted_tools: hosted,
         previous_response_id: None,
+        response_format: None,
         image_bytes: phone_buddy::llm::image::ImageBytesStore::default(),
         audio_bytes: phone_buddy::llm::image::AudioBytesStore::default(),
     };

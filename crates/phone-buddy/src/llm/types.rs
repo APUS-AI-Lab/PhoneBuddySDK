@@ -132,6 +132,75 @@ impl std::fmt::Display for ReasoningEffort {
     }
 }
 
+// ── Structured output ─────────────────────────────────────────────────────
+
+/// Structured-output constraint for a generation request.
+///
+/// Only [`crate::runtime::PhoneBuddyRuntime::generate_text`] sets this today;
+/// agent turns need free-form text plus tool calls. Backends that cannot
+/// express the constraint fail the request rather than returning prose that
+/// the caller would then try to parse as JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Free-form text. Same as omitting the field.
+    Text,
+    /// Any syntactically valid JSON value.
+    JsonObject,
+    /// JSON constrained by `schema`.
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+}
+
+impl ResponseFormat {
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text)
+    }
+
+    /// Chat Completions `response_format` object.
+    pub fn to_chat_completions(&self) -> serde_json::Value {
+        match self {
+            Self::Text => serde_json::json!({ "type": "text" }),
+            Self::JsonObject => serde_json::json!({ "type": "json_object" }),
+            Self::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                let mut json_schema = serde_json::json!({ "name": name, "schema": schema });
+                if let Some(strict) = strict {
+                    json_schema["strict"] = serde_json::Value::Bool(*strict);
+                }
+                serde_json::json!({ "type": "json_schema", "json_schema": json_schema })
+            }
+        }
+    }
+
+    /// Responses `text.format` object (name and schema are not nested there).
+    pub fn to_responses_text_format(&self) -> serde_json::Value {
+        match self {
+            Self::Text => serde_json::json!({ "type": "text" }),
+            Self::JsonObject => serde_json::json!({ "type": "json_object" }),
+            Self::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                let mut format =
+                    serde_json::json!({ "type": "json_schema", "name": name, "schema": schema });
+                if let Some(strict) = strict {
+                    format["strict"] = serde_json::Value::Bool(*strict);
+                }
+                format
+            }
+        }
+    }
+}
+
 // ── Reasoning items ───────────────────────────────────────────────────────
 // Ported from upstream grok `rs::ReasoningItem` and `conversation.rs`.
 
@@ -978,6 +1047,9 @@ pub struct ConversationRequest {
     pub search_parameters: Option<SearchParameters>,
     pub hosted_tools: Vec<HostedTool>,
     pub previous_response_id: Option<String>,
+    /// Structured-output constraint. `None` (or [`ResponseFormat::Text`])
+    /// leaves the payload untouched.
+    pub response_format: Option<ResponseFormat>,
     /// Request-scoped image bytes. Never serialized to session storage.
     pub image_bytes: crate::llm::image::ImageBytesStore,
     /// Request-scoped audio bytes. Never serialized to session storage.
@@ -998,6 +1070,7 @@ impl ConversationRequest {
             search_parameters: req.search_parameters,
             hosted_tools: req.hosted_tools,
             previous_response_id: req.previous_response_id,
+            response_format: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }

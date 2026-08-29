@@ -237,7 +237,55 @@ int main(void) {
 
 ---
 
-### 4. 本地开发与命令行测试 (`phone-buddy-cli`)
+### 4. 长生命周期 Runtime 与一次性文本生成 `generate_text`
+
+`PhoneBuddyRuntime` 持有路由池、Provider 健康度以及重试/故障转移策略，其生命周期长于单个 `PhoneBuddyEngine`。基于同一个 Runtime 重建 Engine 时，冷却状态会被完整保留。
+
+`generate_text` 是一个无工具、无会话的一次性调用。它复用 SDK 的路由器、协议适配器、HTTP Dump 与用量解析，但**不会**运行 Agent 循环、上下文压缩或任何工具。调用方需自行指定池 ID（例如 `session_title`）；池不存在时返回 `RouteNotConfigured`，不会隐式回落到 `main`。
+
+```rust
+use phone_buddy::prelude::*;
+use tokio_util::sync::CancellationToken;
+
+let runtime = PhoneBuddyRuntime::new(routing_config, root_dir)?;
+let engine = runtime.create_engine(agent_config, "main")?;
+let title = runtime.generate_text_blocking(
+    GenerateTextRequest {
+        pool_id: "session_title".into(),
+        instructions: Some("Return a short conversation title.".into()),
+        input: transcript.into(),
+        max_output_tokens: Some(32),
+        temperature: Some(0.2),
+        reasoning_effort: None,
+        // 可选的结构化输出。Anthropic `Messages` 协议无法表达该约束，
+        // 会直接返回 `ResponseFormatUnsupported`，而不是回一段还需自行
+        // 当作 JSON 解析的散文。
+        response_format: Some(ResponseFormat::JsonObject),
+        timeout_ms: Some(8_000),
+    },
+    CancellationToken::new(),
+)?;
+println!("{} via {} / {}", title.text, title.provider_id, title.model);
+```
+
+每次经过路由的请求都会上报所属工作负载（`main`、`subagent` 或 `one_shot`）：既出现在 `GenerateTextResult` 上，也出现在 `Retrying` / `ProviderSwitched` 事件中。因此即使多个池共用同一个 `provider_id`，仍然可以定位到究竟是哪类工作把它打挂的。
+
+C FFI（异步完成回调 + 取消；与聊天会话回调相互独立）：
+
+```c
+PbRuntime *rt = pb_runtime_new(routing_json, root_dir, &err);
+PbEngine *engine = pb_engine_new_with_runtime(rt, agent_config_json, "main", &err);
+char *op = pb_runtime_generate_text_async(rt, request_json, on_done, user, &err);
+/* on_done 收到 {"version":1,"ok":true,"operation_id":"op_...","result":{...}} */
+pb_runtime_cancel_operation(rt, op);
+pb_runtime_free(rt);
+```
+
+`pb_engine_new` 仍作为兼容路径保留：它会依据 primary + `fallback_providers` 合成一个私有 Runtime。
+
+---
+
+### 5. 本地开发与命令行测试 (`phone-buddy-cli`)
 
 ```bash
 # 1. 运行离线 Script 演示（无需 API Key 即可体验销售数据分析）
@@ -248,6 +296,12 @@ cargo run -p phone-buddy-cli -- self-test
 
 # 3. 运行在线真实 LLM 对话
 PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "分析销售数据"
+
+# 4. 无工具的一次性文本生成（未指定 --pool 时使用合成出来的 `main` 池）
+PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- generate "给这段对话起个标题"
+
+# 5. 同上，但约束模型只返回 JSON 对象
+PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- generate --json "给这段对话起个标题"
 ```
 
 ---

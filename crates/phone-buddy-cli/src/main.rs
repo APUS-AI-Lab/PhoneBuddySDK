@@ -255,7 +255,7 @@ fn run_chat(
     Ok(())
 }
 
-fn run_generate(input: &str, pool_id: &str) -> anyhow::Result<()> {
+fn run_generate(input: &str, pool_id: &str, json: bool) -> anyhow::Result<()> {
     let api_key = std::env::var("PHONEBUDDY_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -277,14 +277,20 @@ fn run_generate(input: &str, pool_id: &str) -> anyhow::Result<()> {
             max_output_tokens: Some(256),
             temperature: Some(0.2),
             reasoning_effort: None,
+            response_format: json.then_some(ResponseFormat::JsonObject),
             timeout_ms: Some(30_000),
         },
         tokio_util::sync::CancellationToken::new(),
     )?;
     println!("{}", result.text);
     eprintln!(
-        "provider={} model={} attempts={} op={} pool={}",
-        result.provider_id, result.model, result.attempts, result.operation_id, result.pool_id
+        "provider={} model={} attempts={} op={} pool={} workload={}",
+        result.provider_id,
+        result.model,
+        result.attempts,
+        result.operation_id,
+        result.pool_id,
+        result.workload
     );
     Ok(())
 }
@@ -296,6 +302,7 @@ fn main() -> anyhow::Result<()> {
         Some("self-test") => run_self_test(),
         Some("generate") => {
             let mut pool_id = MAIN_POOL_ID.to_string();
+            let mut json = false;
             let mut input_parts = Vec::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -304,14 +311,15 @@ fn main() -> anyhow::Result<()> {
                             .next()
                             .ok_or_else(|| anyhow::anyhow!("--pool requires a pool id"))?;
                     }
+                    "--json" => json = true,
                     _ => input_parts.push(arg),
                 }
             }
             let input = input_parts.join(" ");
             if input.is_empty() {
-                anyhow::bail!("usage: phone-buddy-demo generate [--pool ID] \"<prompt>\"");
+                anyhow::bail!("usage: phone-buddy-demo generate [--pool ID] [--json] \"<prompt>\"");
             }
-            run_generate(&input, &pool_id)
+            run_generate(&input, &pool_id, json)
         }
         Some("chat") => {
             let mut fallbacks = Vec::new();

@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 
 pub use config::{
     synthesize_legacy_routing, ExhaustionPolicy, LlmRoutingConfig, PoolMember,
-    ProviderCapabilities, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig,
+    ProviderCapabilities, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, Workload,
     DEFAULT_BASE_SCORE, DEFAULT_ROUTING_GROUP, LEGACY_PRIMARY_PROVIDER_ID, MAIN_POOL_ID,
     SUBAGENT_POOL_ID,
 };

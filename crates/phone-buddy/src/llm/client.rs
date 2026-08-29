@@ -25,7 +25,8 @@ use crate::llm::retry::{
 };
 use crate::llm::router::{
     synthesize_legacy_routing, ExhaustionPolicy, FailureClass, LlmRouter, LlmRoutingConfig,
-    PoolMember, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, MAIN_POOL_ID,
+    PoolMember, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, Workload,
+    MAIN_POOL_ID,
 };
 use crate::llm::stream::{collect_stream, CollectStreamError};
 use crate::llm::transport::{
@@ -38,6 +39,9 @@ use crate::llm::types::{
 pub struct LlmClient {
     router: Arc<LlmRouter>,
     pool_id: String,
+    /// Reported in routing diagnostics so a shared `provider_id` can be
+    /// attributed to the workload that tripped it.
+    workload: Workload,
     slots: Mutex<BoundSlots>,
     /// When set, HTTP transports and retry policy are rebuilt whenever the
     /// router config generation changes. Injected test transports leave this
@@ -197,6 +201,7 @@ impl LlmClient {
         Self {
             router,
             pool_id: MAIN_POOL_ID.to_string(),
+            workload: Workload::Main,
             slots: Mutex::new(BoundSlots {
                 generation: 0,
                 providers,
@@ -251,6 +256,7 @@ impl LlmClient {
         Self {
             router,
             pool_id: MAIN_POOL_ID.to_string(),
+            workload: Workload::Main,
             slots: Mutex::new(BoundSlots {
                 generation: 0,
                 providers: slots,
@@ -287,6 +293,7 @@ impl LlmClient {
         Ok(Self {
             router,
             pool_id,
+            workload: Workload::Main,
             slots: Mutex::new(bound),
             http_factory: Some(factory),
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
@@ -311,11 +318,23 @@ impl LlmClient {
         Ok(Self {
             router,
             pool_id,
+            workload: Workload::Main,
             slots: Mutex::new(bound),
             http_factory: None,
             doom_loop_max_retries: DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES,
             last_success: Mutex::new(None),
         })
+    }
+
+    /// Tag this client's routing diagnostics with a workload kind. Defaults
+    /// to [`Workload::Main`]; subagent and one-shot bindings set their own.
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.workload = workload;
+        self
+    }
+
+    pub fn workload(&self) -> Workload {
+        self.workload
     }
 
     pub fn pool_id(&self) -> &str {
@@ -565,6 +584,7 @@ impl LlmClient {
                         from_provider_id: Some(provider_id.clone()),
                         to_provider_id: Some(next_id.clone()),
                         pool_id: Some(self.pool_id.clone()),
+                        workload: Some(self.workload.as_str().to_string()),
                         operation_id: Some(operation_id.clone()),
                         failure_class: Some(class.as_str().to_string()),
                         from_label: Some(slot.fingerprint.clone()),
@@ -641,6 +661,7 @@ impl LlmClient {
                                     wait,
                                     "empty",
                                     &self.pool_id,
+                                    self.workload,
                                     operation_id,
                                     Some(FailureClass::EmptyResponse),
                                 );
@@ -704,6 +725,7 @@ impl LlmClient {
                                 Duration::from_millis(0),
                                 "idle-timeout-continue",
                                 &self.pool_id,
+                                self.workload,
                                 operation_id,
                                 Some(FailureClass::StreamIdle),
                             );
@@ -770,6 +792,7 @@ impl LlmClient {
                                 wait,
                                 "status=429",
                                 &self.pool_id,
+                                self.workload,
                                 operation_id,
                                 Some(FailureClass::RateLimited),
                             );
@@ -804,6 +827,7 @@ impl LlmClient {
                                 wait,
                                 &e.to_string(),
                                 &self.pool_id,
+                                self.workload,
                                 operation_id,
                                 Some(failure_class_of(&e)),
                             );
@@ -1082,6 +1106,7 @@ fn emit_retrying(
     wait: Duration,
     reason: &str,
     pool_id: &str,
+    workload: Workload,
     operation_id: &str,
     failure_class: Option<FailureClass>,
 ) {
@@ -1093,6 +1118,7 @@ fn emit_retrying(
         reason: reason.to_string(),
         provider_id: Some(slot.provider_id.clone()),
         pool_id: Some(pool_id.to_string()),
+        workload: Some(workload.as_str().to_string()),
         operation_id: Some(operation_id.to_string()),
         failure_class: failure_class.map(|c| c.as_str().to_string()),
         label: Some(slot.fingerprint.clone()),
@@ -1518,6 +1544,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: Vec::new(),
             previous_response_id: None,
+            response_format: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }
@@ -1729,6 +1756,61 @@ mod tests {
             .snapshot()
             .iter()
             .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })));
+    }
+
+    #[tokio::test]
+    async fn routing_events_report_the_workload_that_tripped_the_provider() {
+        tokio::time::pause();
+        let a_hits = Arc::new(AtomicU32::new(0));
+        let b_hits = Arc::new(AtomicU32::new(0));
+        let a = ScriptedTransport::failing("a", u32::MAX, "status=503 busy", a_hits.clone());
+        let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
+        let client = LlmClient::with_chain(
+            vec![
+                ("host-a/m".into(), "m".into(), a),
+                ("host-b/m".into(), "m".into(), b),
+            ],
+            5,
+            3,
+            120,
+        )
+        .with_workload(Workload::Subagent);
+        assert_eq!(client.workload(), Workload::Subagent);
+
+        let observer = RecordingObserver::new();
+        client.complete(&req(), &observer).await.unwrap();
+
+        let events = observer.snapshot();
+        let switched = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ProviderSwitched {
+                    workload,
+                    pool_id,
+                    operation_id,
+                    from_provider_id,
+                    to_provider_id,
+                    ..
+                } => Some((
+                    workload.clone(),
+                    pool_id.clone(),
+                    operation_id.clone(),
+                    from_provider_id.clone(),
+                    to_provider_id.clone(),
+                )),
+                _ => None,
+            })
+            .expect("expected a ProviderSwitched event");
+        assert_eq!(switched.0.as_deref(), Some("subagent"));
+        assert_eq!(switched.1.as_deref(), Some(MAIN_POOL_ID));
+        assert!(switched.2.is_some_and(|op| op.starts_with("op_")));
+        assert_eq!(switched.3.as_deref(), Some("host-a/m"));
+        assert_eq!(switched.4.as_deref(), Some("host-b/m"));
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Retrying { workload, .. } if workload.as_deref() == Some("subagent")
+        )));
     }
 
     #[test]

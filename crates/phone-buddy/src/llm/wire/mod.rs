@@ -308,6 +308,7 @@ mod schema_tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            response_format: None,
             image_bytes: store,
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         };

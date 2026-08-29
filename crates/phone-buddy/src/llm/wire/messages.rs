@@ -1,7 +1,7 @@
 //! Anthropic Messages API adapter.
 
 use crate::conversation::{backend_call_summary, ConversationItem};
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{
     ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ConversationRequest, ToolCallDelta,
     ToolCallFunctionDelta, Usage,
@@ -26,6 +26,13 @@ impl WireAdapter for MessagesAdapter {
 }
 
 pub fn build_messages_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
+    // Anthropic Messages has no request-level structured-output field; the
+    // documented pattern is a tool schema, which one-shot generation forbids.
+    if req.response_format.as_ref().is_some_and(|f| !f.is_text()) {
+        return Err(EngineError::ResponseFormatUnsupported {
+            backend: "messages".into(),
+        });
+    }
     let mut system_text = String::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut pending_assistant: Vec<serde_json::Value> = Vec::new();

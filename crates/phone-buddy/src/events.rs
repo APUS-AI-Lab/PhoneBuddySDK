@@ -49,6 +49,9 @@ pub enum AgentEvent {
         provider_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pool_id: Option<String>,
+        /// `main`, `subagent`, or `one_shot` ([`crate::llm::router::Workload`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workload: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +74,9 @@ pub enum AgentEvent {
         to_provider_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pool_id: Option<String>,
+        /// `main`, `subagent`, or `one_shot` ([`crate::llm::router::Workload`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workload: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +153,7 @@ mod tests {
             reason: "status=503".into(),
             provider_id: Some("legacy-primary".into()),
             pool_id: Some("main".into()),
+            workload: Some("main".into()),
             operation_id: None,
             failure_class: Some("retryable_http".into()),
             label: Some("cf.api.fan/grok-4.6".into()),
@@ -165,6 +172,7 @@ mod tests {
             from_provider_id: Some("legacy-primary".into()),
             to_provider_id: Some("legacy-fallback-0".into()),
             pool_id: Some("main".into()),
+            workload: Some("one_shot".into()),
             operation_id: None,
             failure_class: Some("retryable_http".into()),
             from_label: Some("cf.api.fan/grok-4.6".into()),
@@ -174,6 +182,7 @@ mod tests {
         assert!(json.contains("\"ProviderSwitched\""));
         assert!(json.contains("from_provider_id"));
         assert!(json.contains("legacy-fallback-0"));
+        assert!(json.contains("\"workload\":\"one_shot\""));
         let legacy =
             r#"{"ProviderSwitched":{"from":"a/m","to":"b/m","reason":"x","cooldown_ms":1}}"#;
         let _legacy_back: AgentEvent = serde_json::from_str(legacy).unwrap();

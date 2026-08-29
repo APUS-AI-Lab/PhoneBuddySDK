@@ -16,7 +16,7 @@ use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
-use crate::llm::router::{MAIN_POOL_ID, SUBAGENT_POOL_ID};
+use crate::llm::router::{Workload, MAIN_POOL_ID, SUBAGENT_POOL_ID};
 use crate::llm::types::{
     drop_colliding_function_tools, ConversationRequest, HostedTool, ToolCall, ToolDefinitionWire,
     Usage,
@@ -282,11 +282,10 @@ impl PhoneBuddyEngine {
 
         // Host / injected transports share the engine client; they have no named pools.
         let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
-            (Some(runtime), LlmMode::Http) => Arc::new(LlmClient::from_router(
-                runtime.router(),
-                SUBAGENT_POOL_ID,
-                &config,
-            )?),
+            (Some(runtime), LlmMode::Http) => Arc::new(
+                LlmClient::from_router(runtime.router(), SUBAGENT_POOL_ID, &config)?
+                    .with_workload(Workload::Subagent),
+            ),
             _ => client.clone(),
         };
 
@@ -489,6 +488,9 @@ impl PhoneBuddyEngine {
             search_parameters: None,
             hosted_tools: hosted,
             previous_response_id: None,
+            // Agent turns stream text and tool calls; structured output is a
+            // one-shot-only concern.
+            response_format: None,
             image_bytes,
             audio_bytes,
         })

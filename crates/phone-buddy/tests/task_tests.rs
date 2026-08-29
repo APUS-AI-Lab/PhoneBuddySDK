@@ -424,6 +424,7 @@ async fn subagent_trip_of_shared_id_affects_main_selection() {
         search_parameters: None,
         hosted_tools: Vec::new(),
         previous_response_id: None,
+        response_format: None,
         image_bytes: Default::default(),
         audio_bytes: Default::default(),
     };

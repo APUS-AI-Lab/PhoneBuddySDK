@@ -110,6 +110,9 @@ pub enum EngineError {
 
     #[error("operation cancelled")]
     OperationCancelled,
+
+    #[error("{backend} backend does not support the requested response_format")]
+    ResponseFormatUnsupported { backend: String },
 }
 
 impl EngineError {
@@ -147,6 +150,7 @@ impl EngineError {
             Self::ProviderAttemptsExhausted { .. } => "ProviderAttemptsExhausted",
             Self::OperationTimedOut => "OperationTimedOut",
             Self::OperationCancelled => "OperationCancelled",
+            Self::ResponseFormatUnsupported { .. } => "ResponseFormatUnsupported",
         }
     }
 
@@ -168,6 +172,9 @@ impl EngineError {
                 "pool_id": pool_id,
                 "tried_provider_ids": tried_provider_ids,
             }),
+            Self::ResponseFormatUnsupported { backend } => {
+                serde_json::json!({ "api_backend": backend })
+            }
             _ => serde_json::json!({}),
         }
     }

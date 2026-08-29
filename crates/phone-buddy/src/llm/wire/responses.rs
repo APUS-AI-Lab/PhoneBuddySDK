@@ -202,6 +202,10 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
         }
     }
 
+    if let Some(format) = &req.response_format {
+        payload["text"]["format"] = format.to_responses_text_format();
+    }
+
     Ok(payload)
 }
 
@@ -261,6 +265,7 @@ mod tests {
             search_parameters: None,
             hosted_tools: vec![],
             previous_response_id: None,
+            response_format: None,
             image_bytes: crate::llm::image::ImageBytesStore::default(),
             audio_bytes: crate::llm::image::AudioBytesStore::default(),
         }

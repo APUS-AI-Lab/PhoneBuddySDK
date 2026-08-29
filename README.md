@@ -257,12 +257,18 @@ let title = runtime.generate_text_blocking(
         max_output_tokens: Some(32),
         temperature: Some(0.2),
         reasoning_effort: None,
+        // Optional structured output. `Messages` (Anthropic) rejects a
+        // non-text format with `ResponseFormatUnsupported` instead of
+        // returning prose you would have to parse as JSON.
+        response_format: Some(ResponseFormat::JsonObject),
         timeout_ms: Some(8_000),
     },
     CancellationToken::new(),
 )?;
 println!("{} via {} / {}", title.text, title.provider_id, title.model);
 ```
+
+Every routed request reports its workload (`main`, `subagent`, or `one_shot`) on `GenerateTextResult` and on the `Retrying` / `ProviderSwitched` events, so a `provider_id` shared by several pools can still be attributed to the work that tripped it.
 
 C FFI (async completion + cancel; not the chat session callback):
 
@@ -295,6 +301,9 @@ PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- chat "Analyze 
 
 # 4. Tool-free one-shot generation (uses the synthesized `main` pool unless --pool is set)
 PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- generate "Name this conversation"
+
+# 5. Same, constrained to a JSON object response
+PHONEBUDDY_API_KEY="your-api-key" cargo run -p phone-buddy-cli -- generate --json "Name this conversation"
 ```
 
 ---

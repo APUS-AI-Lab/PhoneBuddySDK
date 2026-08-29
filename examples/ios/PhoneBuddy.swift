@@ -505,6 +505,128 @@ public struct ChatOutcome: Codable {
     }
 }
 
+/// Minimal `Codable` JSON value, so a JSON Schema can ride inside a
+/// `Codable` request without pulling in a third-party dependency.
+public enum JSONValue: Codable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int)
+    case double(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    /// Convert a `JSONSerialization`-compatible Foundation value
+    /// (dictionary / array / NSNumber / String / NSNull).
+    public init(any value: Any) throws {
+        switch value {
+        case is NSNull:
+            self = .null
+        case let n as NSNumber:
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                self = .bool(n.boolValue)
+            } else if let i = Int(exactly: n) {
+                self = .int(i)
+            } else {
+                self = .double(n.doubleValue)
+            }
+        case let s as String:
+            self = .string(s)
+        case let a as [Any]:
+            self = .array(try a.map { try JSONValue(any: $0) })
+        case let o as [String: Any]:
+            self = .object(try o.mapValues { try JSONValue(any: $0) })
+        default:
+            throw PhoneBuddyError.invalidConfig
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() {
+            self = .null
+        } else if let v = try? c.decode(Bool.self) {
+            self = .bool(v)
+        } else if let v = try? c.decode(Int.self) {
+            self = .int(v)
+        } else if let v = try? c.decode(Double.self) {
+            self = .double(v)
+        } else if let v = try? c.decode(String.self) {
+            self = .string(v)
+        } else if let v = try? c.decode([JSONValue].self) {
+            self = .array(v)
+        } else {
+            self = .object(try c.decode([String: JSONValue].self))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .null: try c.encodeNil()
+        case let .bool(v): try c.encode(v)
+        case let .int(v): try c.encode(v)
+        case let .double(v): try c.encode(v)
+        case let .string(v): try c.encode(v)
+        case let .array(v): try c.encode(v)
+        case let .object(v): try c.encode(v)
+        }
+    }
+}
+
+/// Structured-output constraint for one-shot generation. The Anthropic
+/// `messages` backend rejects anything but `.text` with
+/// `ResponseFormatUnsupported`.
+public enum GenerateTextResponseFormat: Codable {
+    case text
+    case jsonObject
+    case jsonSchema(name: String, schema: JSONValue, strict: Bool?)
+
+    /// Convenience for callers holding a plain Foundation schema dictionary.
+    public static func jsonSchema(
+        name: String,
+        dictionary: [String: Any],
+        strict: Bool? = nil
+    ) throws -> Self {
+        .jsonSchema(name: name, schema: try JSONValue(any: dictionary), strict: strict)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, name, schema, strict
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text:
+            try c.encode("text", forKey: .type)
+        case .jsonObject:
+            try c.encode("json_object", forKey: .type)
+        case let .jsonSchema(name, schema, strict):
+            try c.encode("json_schema", forKey: .type)
+            try c.encode(name, forKey: .name)
+            try c.encode(schema, forKey: .schema)
+            try c.encodeIfPresent(strict, forKey: .strict)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .type) {
+        case "json_object":
+            self = .jsonObject
+        case "json_schema":
+            self = .jsonSchema(
+                name: try c.decode(String.self, forKey: .name),
+                schema: try c.decode(JSONValue.self, forKey: .schema),
+                strict: try c.decodeIfPresent(Bool.self, forKey: .strict)
+            )
+        default:
+            self = .text
+        }
+    }
+}
+
 public struct GenerateTextRequest: Codable {
     public var poolId: String
     public var instructions: String?
@@ -512,6 +634,7 @@ public struct GenerateTextRequest: Codable {
     public var maxOutputTokens: UInt32?
     public var temperature: Float?
     public var reasoningEffort: String?
+    public var responseFormat: GenerateTextResponseFormat?
     public var timeoutMs: UInt64?
 
     public init(
@@ -521,6 +644,7 @@ public struct GenerateTextRequest: Codable {
         maxOutputTokens: UInt32? = nil,
         temperature: Float? = nil,
         reasoningEffort: String? = nil,
+        responseFormat: GenerateTextResponseFormat? = nil,
         timeoutMs: UInt64? = nil
     ) {
         self.poolId = poolId
@@ -529,6 +653,7 @@ public struct GenerateTextRequest: Codable {
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
         self.reasoningEffort = reasoningEffort
+        self.responseFormat = responseFormat
         self.timeoutMs = timeoutMs
     }
 
@@ -539,6 +664,7 @@ public struct GenerateTextRequest: Codable {
         case maxOutputTokens = "max_output_tokens"
         case temperature
         case reasoningEffort = "reasoning_effort"
+        case responseFormat = "response_format"
         case timeoutMs = "timeout_ms"
     }
 }
@@ -563,6 +689,8 @@ public struct GenerateTextResult: Codable {
     public let attempts: UInt32
     public let operationId: String
     public let poolId: String
+    /// Always `one_shot`. Joins this result with routing diagnostics.
+    public let workload: String
 
     enum CodingKeys: String, CodingKey {
         case text
@@ -572,6 +700,7 @@ public struct GenerateTextResult: Codable {
         case attempts
         case operationId = "operation_id"
         case poolId = "pool_id"
+        case workload
     }
 }
 
