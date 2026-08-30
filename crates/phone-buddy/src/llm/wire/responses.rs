@@ -246,6 +246,41 @@ fn output_index_of(v: &serde_json::Value) -> u32 {
         .unwrap_or(0) as u32
 }
 
+fn opt_nonzero_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn json_to_arg_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn function_call_arg_string(item: &serde_json::Value) -> Option<String> {
+    item.get("arguments")
+        .or_else(|| item.get("input"))
+        .map(json_to_arg_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn function_call_arguments_event(v: &serde_json::Value, args: Option<String>) -> ToolCallDelta {
+    ToolCallDelta {
+        index: output_index_of(v),
+        id: opt_nonzero_str(v, "call_id"),
+        item_id: opt_nonzero_str(v, "item_id").or_else(|| opt_nonzero_str(v, "id")),
+        kind: Some("function".to_string()),
+        function: Some(ToolCallFunctionDelta {
+            name: opt_nonzero_str(v, "name"),
+            arguments: args,
+        }),
+        thought_signature: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,22 +580,14 @@ fn tool_delta_from_output_item(
     let item_type = item.get("type").and_then(|s| s.as_str()).unwrap_or("");
     match item_type {
         "function_call" => {
-            let id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let name = item
-                .get("name")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let args = item
-                .get("arguments")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
+            let call_id = opt_nonzero_str(item, "call_id").or_else(|| opt_nonzero_str(item, "id"));
+            let item_id = opt_nonzero_str(item, "id");
+            let name = opt_nonzero_str(item, "name");
+            let args = function_call_arg_string(item);
             Some(ToolCallDelta {
                 index: fallback_index,
-                id,
+                id: call_id,
+                item_id,
                 kind: Some("function".to_string()),
                 function: Some(ToolCallFunctionDelta {
                     name,
@@ -585,6 +612,7 @@ fn tool_delta_from_output_item(
             Some(ToolCallDelta {
                 index: fallback_index,
                 id,
+                item_id: None,
                 kind: Some("local_shell".to_string()),
                 function: Some(ToolCallFunctionDelta {
                     name: Some("local_shell".to_string()),
@@ -619,6 +647,7 @@ fn tool_delta_from_output_item(
             Some(ToolCallDelta {
                 index: fallback_index,
                 id,
+                item_id: None,
                 kind: Some(kind.to_string()),
                 function: Some(ToolCallFunctionDelta {
                     name: Some(name),
@@ -655,6 +684,7 @@ fn tool_delta_from_output_item(
             Some(ToolCallDelta {
                 index: fallback_index,
                 id,
+                item_id: None,
                 kind: Some("server".to_string()),
                 function: Some(ToolCallFunctionDelta {
                     name: Some(name),
@@ -739,25 +769,21 @@ pub fn parse_responses_chunk(
     } else if type_str.contains("function_call_arguments.delta")
         || json_type.contains("function_call_arguments.delta")
     {
-        let id = v
-            .get("call_id")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        let name = v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string());
-        let args = v
-            .get("delta")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        delta.tool_calls.push(ToolCallDelta {
-            index: output_index_of(&v),
-            id,
-            kind: Some("function".to_string()),
-            function: Some(ToolCallFunctionDelta {
-                name,
-                arguments: args,
-            }),
-            thought_signature: None,
-        });
+        let args = v.get("delta").and_then(|s| s.as_str()).map(str::to_string);
+        delta
+            .tool_calls
+            .push(function_call_arguments_event(&v, args));
+    } else if type_str.contains("function_call_arguments.done")
+        || json_type.contains("function_call_arguments.done")
+    {
+        // Codex takes the complete snapshot; grok-build ignores this event
+        // because it already assembled deltas. Feed it through the merge
+        // helper: fill an empty/`{}` buffer, do not concatenate onto a
+        // finished JSON object.
+        let args = v.get("arguments").map(json_to_arg_string);
+        delta
+            .tool_calls
+            .push(function_call_arguments_event(&v, args));
     } else if type_str.contains("custom_tool_call_input.delta")
         || json_type.contains("custom_tool_call_input.delta")
     {
@@ -778,6 +804,7 @@ pub fn parse_responses_chunk(
         delta.tool_calls.push(ToolCallDelta {
             index: output_index_of(&v),
             id,
+            item_id: None,
             kind: Some(kind.to_string()),
             function: Some(ToolCallFunctionDelta {
                 name,

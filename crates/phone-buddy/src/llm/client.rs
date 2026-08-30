@@ -501,6 +501,18 @@ impl LlmClient {
                 rewritten
             };
 
+            tracing::info!(
+                target: "phone_buddy::client",
+                "LLM attempt #{}/{} in pool '{}' -> provider '{}' (model='{}', fingerprint='{}', op={})",
+                visit_idx + 1,
+                plan.provider_ids.len(),
+                self.pool_id,
+                provider_id,
+                slot.model,
+                slot.fingerprint,
+                operation_id
+            );
+
             match self
                 .try_provider(
                     slot,
@@ -527,12 +539,26 @@ impl LlmClient {
                     if turn.model.is_empty() {
                         turn.model = slot.model.clone();
                     }
+                    tracing::info!(
+                        target: "phone_buddy::client",
+                        "LLM turn SUCCEEDED on provider '{}' (attempts={}, op={})",
+                        provider_id,
+                        turn.attempts,
+                        operation_id
+                    );
                     return Ok(turn);
                 }
                 Err(ProviderAttemptError::Veto(e))
                 | Err(ProviderAttemptError::EmptyExhausted(e))
                 | Err(ProviderAttemptError::DoomLoop(e))
                 | Err(ProviderAttemptError::Terminal(e)) => {
+                    tracing::warn!(
+                        target: "phone_buddy::client",
+                        "Provider '{}' fatal error (non-failover, op={}): {}",
+                        provider_id,
+                        operation_id,
+                        e
+                    );
                     return Err(e);
                 }
                 Err(ProviderAttemptError::Failover {
@@ -566,6 +592,14 @@ impl LlmClient {
                         .iter()
                         .find(|id| captured.providers.contains_key(*id));
                     let Some(next_id) = next else {
+                        tracing::warn!(
+                            target: "phone_buddy::client",
+                            "Provider attempts EXHAUSTED in pool '{}' (tried {} providers: {:?}, op={})",
+                            self.pool_id,
+                            tried_ids.len(),
+                            tried_ids,
+                            operation_id
+                        );
                         return Err(EngineError::ProviderAttemptsExhausted {
                             pool_id: self.pool_id.clone(),
                             tried_provider_ids: tried_ids,
@@ -576,6 +610,15 @@ impl LlmClient {
                         .as_ref()
                         .map(|e| e.to_string())
                         .unwrap_or_default();
+                    tracing::warn!(
+                        target: "phone_buddy::client",
+                        "FAILOVER in pool '{}': '{}' -> '{}' (cooldown={}ms, reason: {})",
+                        self.pool_id,
+                        provider_id,
+                        next_id,
+                        cooldown.as_millis(),
+                        reason
+                    );
                     skipper.on_event(AgentEvent::ProviderSwitched {
                         from: slot.fingerprint.clone(),
                         to: next_slot.fingerprint.clone(),
@@ -2183,7 +2226,7 @@ mod tests {
                         name: Some("web_search".into()),
                         arguments: Some("{\"q\":".into()),
                     }),
-                    thought_signature: None,
+                    ..Default::default()
                 });
                 yield Ok(ChatCompletionChunk {
                     choices: vec![ChatChunkChoice {

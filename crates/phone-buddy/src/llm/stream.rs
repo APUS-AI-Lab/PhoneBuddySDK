@@ -50,11 +50,14 @@ pub async fn collect_stream(
 
     // Tool-call accumulators keyed by positional index:
     // (id, name, arguments_buffer, kind, thought_signature).
-    // `id_to_idx` merges Responses events that share `call_id` but
-    // disagree on `output_index` (arguments.delta often omits it).
+    //
+    // Identity merge is grok-build's output_index map plus Codex's
+    // item_id/call_id: argument deltas often carry `item_id` and omit
+    // `call_id`, and some proxies omit `output_index` (it defaults to 0).
     let mut tool_call_acc: BTreeMap<u32, (String, String, String, String, Option<String>)> =
         BTreeMap::new();
     let mut id_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut output_to_idx: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(next) = stream.next().await {
@@ -115,15 +118,14 @@ pub async fn collect_stream(
             }
 
             for tc in &delta.tool_calls {
-                let idx = if let Some(id) = &tc.id {
-                    if !id.is_empty() {
-                        *id_to_idx.entry(id.clone()).or_insert(tc.index)
-                    } else {
-                        tc.index
-                    }
-                } else {
-                    tc.index
+                let Some(idx) = resolve_tool_call_index(tc, &id_to_idx, &output_to_idx) else {
+                    // grok-build drops FunctionCallArgumentsDelta when no
+                    // OutputItemAdded mapped that output_index. Same here
+                    // for nameless fragments so they cannot land on slot 0
+                    // (reasoning / text) and leave the real call empty.
+                    continue;
                 };
+                remember_tool_call_ids(tc, idx, &mut id_to_idx, &mut output_to_idx);
                 let entry = tool_call_acc.entry(idx).or_default();
                 if let Some(id) = &tc.id {
                     if !id.is_empty() {
@@ -303,16 +305,11 @@ fn items_from_canonical_output(
                 name,
                 arguments,
             } => {
-                let args = if arguments.trim().is_empty() {
-                    streamed_calls
-                        .iter()
-                        .find(|c| c.id == *call_id)
-                        .map(|c| c.function.arguments.clone())
-                        .filter(|a| !a.trim().is_empty())
-                        .unwrap_or_else(|| "{}".into())
-                } else {
-                    arguments.clone()
-                };
+                let streamed = streamed_calls
+                    .iter()
+                    .find(|c| c.id == *call_id)
+                    .map(|c| c.function.arguments.as_str());
+                let args = prefer_tool_arguments(arguments, streamed);
                 let thought_signature = streamed_calls
                     .iter()
                     .find(|c| c.id == *call_id)
@@ -496,19 +493,96 @@ fn is_complete_json(s: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
 }
 
+/// Empty / `{}` is the Responses `output_item.added` and Anthropic
+/// `tool_use` start placeholder — not a finished argument object.
+fn is_placeholder_tool_args(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(t),
+        Ok(serde_json::Value::Object(m)) if m.is_empty()
+    )
+}
+
+fn prefer_tool_arguments(canonical: &str, streamed: Option<&str>) -> String {
+    if !is_placeholder_tool_args(canonical) {
+        return canonical.to_string();
+    }
+    if let Some(s) = streamed.filter(|s| !is_placeholder_tool_args(s)) {
+        return s.to_string();
+    }
+    if canonical.trim().is_empty() {
+        "{}".into()
+    } else {
+        canonical.to_string()
+    }
+}
+
+fn tool_delta_has_name(tc: &crate::llm::types::ToolCallDelta) -> bool {
+    tc.function
+        .as_ref()
+        .and_then(|f| f.name.as_deref())
+        .is_some_and(|n| !n.is_empty())
+}
+
+fn resolve_tool_call_index(
+    tc: &crate::llm::types::ToolCallDelta,
+    id_to_idx: &std::collections::HashMap<String, u32>,
+    output_to_idx: &std::collections::HashMap<u32, u32>,
+) -> Option<u32> {
+    if let Some(id) = tc.id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(&idx) = id_to_idx.get(id) {
+            return Some(idx);
+        }
+    }
+    if let Some(id) = tc.item_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(&idx) = id_to_idx.get(id) {
+            return Some(idx);
+        }
+    }
+    if let Some(&idx) = output_to_idx.get(&tc.index) {
+        return Some(idx);
+    }
+    // New call: Chat Completions first chunk, or Responses output_item.added.
+    if tool_delta_has_name(tc) {
+        return Some(tc.index);
+    }
+    None
+}
+
+fn remember_tool_call_ids(
+    tc: &crate::llm::types::ToolCallDelta,
+    idx: u32,
+    id_to_idx: &mut std::collections::HashMap<String, u32>,
+    output_to_idx: &mut std::collections::HashMap<u32, u32>,
+) {
+    if let Some(id) = tc.id.as_deref().filter(|s| !s.is_empty()) {
+        id_to_idx.insert(id.to_string(), idx);
+    }
+    if let Some(id) = tc.item_id.as_deref().filter(|s| !s.is_empty()) {
+        id_to_idx.insert(id.to_string(), idx);
+    }
+    output_to_idx.insert(tc.index, idx);
+}
+
 /// Accumulate a tool-call argument fragment.
 ///
 /// grok-build streams `function_call_arguments.delta` fragments and
-/// *ignores* the later full snapshot (`function_call_arguments.done` /
-/// `output_item.done`). PhoneBuddy's Responses parser used to feed both
-/// into this buffer; `push_str` of a complete JSON onto a complete JSON
-/// is exactly `{...}{...}`, which then fails with
-/// `invalid JSON arguments: trailing characters`.
+/// ignores later full snapshots. Codex never streams function-call
+/// arguments: it takes the complete `output_item.done` item. PhoneBuddy
+/// has to do both (xAI-style deltas *and* proxy snapshots).
+///
+/// `{}` is a start placeholder, not a finished object. A later complete
+/// snapshot must replace it; two complete non-placeholder objects must
+/// not concatenate into `{...}{...}`.
 fn append_tool_argument_fragment(buffer: &mut String, incoming: &str) {
     if incoming.is_empty() {
         return;
     }
-    if buffer.is_empty() {
+    if is_placeholder_tool_args(buffer) {
+        buffer.clear();
         buffer.push_str(incoming);
         return;
     }
@@ -584,8 +658,20 @@ mod tests {
                 name: name.map(str::to_string),
                 arguments: arguments.map(str::to_string),
             }),
-            thought_signature: None,
+            ..Default::default()
         }
+    }
+
+    fn tc_with_item_id(
+        index: u32,
+        id: Option<&str>,
+        item_id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> ToolCallDelta {
+        let mut d = tc(index, id, name, arguments);
+        d.item_id = item_id.map(str::to_string);
+        d
     }
 
     #[tokio::test]
@@ -639,6 +725,117 @@ mod tests {
             .unwrap();
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
+
+    #[tokio::test]
+    async fn placeholder_object_is_replaced_by_later_snapshot() {
+        // Anthropic-translated Responses: output_item.added carries "{}"
+        // then output_item.done / arguments.done carries the real JSON.
+        let json = r#"{"query":"today news"}"#;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                1,
+                Some("toolu_1"),
+                Some("web_search"),
+                Some("{}"),
+            ))),
+            Ok(chunk_with_tool(tc(
+                1,
+                Some("toolu_1"),
+                Some("web_search"),
+                Some(json),
+            ))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
+
+    #[tokio::test]
+    async fn item_id_binds_argument_delta_when_output_index_is_wrong() {
+        // Official deltas use item_id; proxies often omit output_index
+        // (defaults to 0) while the function_call sits at output_index 1
+        // after a reasoning item.
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc_with_item_id(
+                1,
+                Some("toolu_1"),
+                Some("fc_1"),
+                Some("web_search"),
+                None,
+            ))),
+            Ok(chunk_with_tool(tc_with_item_id(
+                0,
+                None,
+                Some("fc_1"),
+                None,
+                Some("{\"query\":\"today news\"}"),
+            ))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "toolu_1");
+        assert_eq!(
+            turn.tool_calls[0].function.arguments,
+            "{\"query\":\"today news\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_argument_delta_at_index_zero_is_dropped() {
+        let json = r#"{"query":"from done"}"#;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                1,
+                Some("toolu_1"),
+                Some("web_search"),
+                None,
+            ))),
+            Ok(chunk_with_tool(tc(0, None, None, Some("{\"query\":\"orphan\"}")))),
+            Ok(chunk_with_tool(tc(
+                1,
+                Some("toolu_1"),
+                Some("web_search"),
+                Some(json),
+            ))),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.arguments, json);
+    }
+
+    #[tokio::test]
+    async fn canonical_placeholder_yields_to_streamed_args() {
+        use crate::conversation::ConversationItem;
+        use crate::llm::types::OutputItemWire;
+        let stream = stream::iter(vec![
+            Ok(chunk_with_tool(tc(
+                0,
+                Some("c1"),
+                Some("web_search"),
+                Some(r#"{"query":"streamed"}"#),
+            ))),
+            Ok(chunk_final_output(vec![OutputItemWire::FunctionCall {
+                call_id: "c1".into(),
+                name: "web_search".into(),
+                arguments: "{}".into(),
+            }])),
+        ]);
+        let turn = collect_stream(Box::pin(stream), &NullObserver)
+            .await
+            .unwrap();
+        match &turn.items[0] {
+            ConversationItem::Assistant(a) => {
+                assert_eq!(a.tool_calls[0].function.arguments, r#"{"query":"streamed"}"#);
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
     }
 
     #[tokio::test]

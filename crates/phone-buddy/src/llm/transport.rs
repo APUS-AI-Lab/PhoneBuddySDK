@@ -739,7 +739,7 @@ impl LlmTransport for MockTransport {
                         name: Some(name.clone()),
                         arguments: Some(a.to_string()),
                     }),
-                    thought_signature: None,
+                    ..Default::default()
                 });
                 yield Ok(make_chunk(&d));
                 // second chunk: rest of arguments
@@ -752,7 +752,7 @@ impl LlmTransport for MockTransport {
                         name: None,
                         arguments: Some(b.to_string()),
                     }),
-                    thought_signature: None,
+                    ..Default::default()
                 });
                 yield Ok(make_chunk(&d2));
             }
@@ -1546,9 +1546,10 @@ mod tests {
             "output_index": 1,
             "item": {
                 "type": "function_call",
+                "id": "fc_0",
                 "call_id": "c0",
                 "name": "web_fetch",
-                "arguments": ""
+                "arguments": "{}"
             }
         }"#;
         let chunk = parse_responses_chunk("response.output_item.added", added)
@@ -1557,9 +1558,17 @@ mod tests {
         let tc = &chunk.choices[0].delta.tool_calls[0];
         assert_eq!(tc.index, 1);
         assert_eq!(tc.id.as_deref(), Some("c0"));
+        assert_eq!(tc.item_id.as_deref(), Some("fc_0"));
         assert_eq!(
             tc.function.as_ref().and_then(|f| f.name.as_deref()),
             Some("web_fetch")
+        );
+        assert!(
+            tc.function
+                .as_ref()
+                .and_then(|f| f.arguments.as_deref())
+                .is_none_or(|a| a.is_empty()),
+            "added must not carry the placeholder arguments object"
         );
 
         let done = r#"{
@@ -1653,25 +1662,74 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_function_call_arguments_done_is_ignored() {
-        // grok-build drops ResponseFunctionCallArgumentsDone: the full
-        // JSON is a snapshot of already-streamed deltas. Treating it as
-        // another fragment concatenates `{...}{...}`.
+    fn test_responses_function_call_arguments_done_is_snapshot() {
+        // Codex uses the complete snapshot; grok-build ignores this event.
+        // Parser emits it; collect_stream replaces an empty/`{}` buffer and
+        // will not concatenate onto already-complete JSON.
         let done = r#"{
             "type": "response.function_call_arguments.done",
             "output_index": 1,
+            "item_id": "fc_nav",
             "call_id": "nav",
             "arguments": "{\"url\": \"https://news.cctv.com/\"}"
         }"#;
-        let chunk = parse_responses_chunk("response.function_call_arguments.done", done).unwrap();
-        assert!(
-            chunk.is_none()
-                || chunk
-                    .as_ref()
-                    .map(|c| c.choices[0].delta.tool_calls.is_empty())
-                    .unwrap_or(true),
-            "function_call_arguments.done must not be appended as a delta"
+        let chunk = parse_responses_chunk("response.function_call_arguments.done", done)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.index, 1);
+        assert_eq!(tc.id.as_deref(), Some("nav"));
+        assert_eq!(tc.item_id.as_deref(), Some("fc_nav"));
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            Some("{\"url\": \"https://news.cctv.com/\"}")
         );
+    }
+
+    #[test]
+    fn test_responses_function_call_arguments_delta_reads_item_id() {
+        let delta = r#"{
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": "{\"query\":"
+        }"#;
+        let chunk = parse_responses_chunk("response.function_call_arguments.delta", delta)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.item_id.as_deref(), Some("fc_1"));
+        assert!(tc.id.is_none());
+        assert_eq!(
+            tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            Some("{\"query\":")
+        );
+    }
+
+    #[test]
+    fn test_responses_function_call_object_arguments_on_done() {
+        let done = r#"{
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "toolu_1",
+                "name": "web_search",
+                "arguments": {"query": "today news"}
+            }
+        }"#;
+        let chunk = parse_responses_chunk("response.output_item.done", done)
+            .unwrap()
+            .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.id.as_deref(), Some("toolu_1"));
+        assert_eq!(tc.item_id.as_deref(), Some("fc_1"));
+        let args = tc
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_deref())
+            .unwrap_or("");
+        assert!(args.contains("today news"), "done args: {args}");
     }
 
     #[test]

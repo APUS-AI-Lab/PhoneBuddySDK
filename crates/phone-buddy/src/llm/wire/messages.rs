@@ -252,7 +252,7 @@ pub fn parse_messages_chunk(
                             name,
                             arguments: Some(String::new()),
                         }),
-                        thought_signature: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -277,7 +277,7 @@ pub fn parse_messages_chunk(
                                     name: None,
                                     arguments: Some(partial.to_string()),
                                 }),
-                                thought_signature: None,
+                                ..Default::default()
                             });
                         }
                     }

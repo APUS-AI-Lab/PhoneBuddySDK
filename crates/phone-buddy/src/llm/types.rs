@@ -1145,8 +1145,13 @@ pub struct ToolCallDelta {
     #[serde(default)]
     pub index: u32,
     /// Only present in the first chunk for this tool call.
+    /// Responses `call_id` (also Chat Completions `id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Responses output-item id (`item_id` / `item.id`). Argument deltas
+    /// often carry this instead of `call_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     /// Only present in the first chunk (usually "function").
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -1271,6 +1276,7 @@ pub fn parse_output_item(v: &serde_json::Value) -> Option<OutputItemWire> {
                 .to_string();
             let arguments = v
                 .get("arguments")
+                .or_else(|| v.get("input"))
                 .map(|a| {
                     if let Some(s) = a.as_str() {
                         s.to_string()

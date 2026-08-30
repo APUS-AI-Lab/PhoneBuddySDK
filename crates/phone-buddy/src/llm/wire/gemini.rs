@@ -261,6 +261,7 @@ pub fn parse_gemini_chunk(
                             arguments: Some(args),
                         }),
                         thought_signature,
+                        ..Default::default()
                     });
                 }
             }
