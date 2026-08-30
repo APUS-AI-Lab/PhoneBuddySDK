@@ -85,9 +85,20 @@ pub fn select_visit_order(
                     .and_then(|t| (t - now).to_std().ok())
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                tracing::warn!(
+                    target: "phone_buddy::router",
+                    "Pool '{}' exhausted: all members cooling or score<=0, fail-fast (retry_after={}ms)",
+                    pool_id,
+                    retry_after_ms
+                );
                 return Err(SelectError::FailFast { retry_after_ms });
             }
             ExhaustionPolicy::ProbeEarliest => {
+                tracing::warn!(
+                    target: "phone_buddy::router",
+                    "Pool '{}' has no eligible members, falling back to probe_earliest",
+                    pool_id
+                );
                 provider_ids = rank_probe_earliest(&mut scored, now);
             }
         }
@@ -103,6 +114,45 @@ pub fn select_visit_order(
             .collect();
         provider_ids.extend(rank_probe_earliest(&mut rest, now));
     }
+
+    let summary: Vec<String> = provider_ids
+        .iter()
+        .enumerate()
+        .map(|(rank, pid)| {
+            if let Some(s) = scored.iter().find(|s| s.member.provider_id == *pid) {
+                let cooling_info = if s.cooling {
+                    let rem_sec = s
+                        .cooldown_until
+                        .map(|t| (t - now).num_seconds().max(0))
+                        .unwrap_or(0);
+                    format!(" [cooling: {}s left]", rem_sec)
+                } else {
+                    "".to_string()
+                };
+                let primary_tag = if rank == 0 { " ★ PRIMARY" } else { "" };
+                format!(
+                    "  #{} [{}] score={} (base={}) group={}{}{}",
+                    rank,
+                    pid,
+                    s.score,
+                    s.member.base_score,
+                    s.member.routing_group,
+                    cooling_info,
+                    primary_tag
+                )
+            } else {
+                format!("  #{} [{}]", rank, pid)
+            }
+        })
+        .collect();
+
+    tracing::info!(
+        target: "phone_buddy::router",
+        "Pool '{}' VisitPlan computed ({} servers ranked):\n{}",
+        pool_id,
+        provider_ids.len(),
+        summary.join("\n")
+    );
 
     Ok(VisitPlan {
         pool_id: pool_id.to_string(),

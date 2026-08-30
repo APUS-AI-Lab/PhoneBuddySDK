@@ -180,12 +180,29 @@ impl LlmRouter {
         now: DateTime<Utc>,
     ) -> Duration {
         let mut inner = self.inner.lock().unwrap();
-        let wait = {
+        let (wait, trips, failures_count) = {
             let RouterInner { config, health, .. } = &mut *inner;
             let rec = health.entry(provider_id.to_string()).or_default();
             rec.last_seen_in_config = Some(now);
-            rec.trip(now, operation_id, class, &config.health, retry_after)
+            let wait = rec.trip(now, operation_id, class, &config.health, retry_after);
+            let window = Duration::from_secs(config.health.penalty_window_secs.max(1));
+            let failures = rec
+                .recent_failures
+                .iter()
+                .filter(|t| **t > (now - window))
+                .count();
+            (wait, rec.consecutive_trips, failures)
         };
+        tracing::warn!(
+            target: "phone_buddy::router",
+            "Provider '{}' TRIPPED (class={}, op={}): cooldown={}s, consecutive_trips={}, penalty_failures={}",
+            provider_id,
+            class.as_str(),
+            operation_id,
+            wait.as_secs(),
+            trips,
+            failures_count
+        );
         self.write_health(&inner);
         wait
     }
@@ -197,8 +214,16 @@ impl LlmRouter {
     pub fn record_success_at(&self, provider_id: &str, now: DateTime<Utc>) {
         let mut inner = self.inner.lock().unwrap();
         let rec = inner.health.entry(provider_id.to_string()).or_default();
+        let had_trips = rec.consecutive_trips > 0 || rec.cooldown_until.is_some();
         rec.recover(now);
         rec.last_seen_in_config = Some(now);
+        if had_trips {
+            tracing::info!(
+                target: "phone_buddy::router",
+                "Provider '{}' probe SUCCEEDED, health recovered (cooldown cleared, consecutive_trips reset to 0)",
+                provider_id
+            );
+        }
         self.write_health(&inner);
     }
 
