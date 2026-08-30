@@ -15,6 +15,7 @@ use crate::conversation::{user_assistant_count, ConversationItem};
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
+use crate::llm::endpoint::LlmEndpointProvider;
 use crate::llm::host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
 use crate::llm::router::{Workload, MAIN_POOL_ID, SUBAGENT_POOL_ID};
 use crate::llm::types::{
@@ -261,6 +262,15 @@ impl PhoneBuddyEngine {
             sandbox.clone(),
         ));
 
+        // Host / injected transports share the engine client; they have no named pools.
+        let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
+            (Some(runtime), LlmMode::Http) => Arc::new(
+                LlmClient::from_router(runtime.router(), SUBAGENT_POOL_ID, &config)?
+                    .with_workload(Workload::Subagent),
+            ),
+            _ => client.clone(),
+        };
+
         let mut subagent_registry = ToolRegistry::new();
         subagent_registry.register(crate::tools::read_file::arc());
         subagent_registry.register(crate::tools::write_file::arc());
@@ -269,9 +279,13 @@ impl PhoneBuddyEngine {
         subagent_registry.register(crate::tools::grep::arc());
         subagent_registry.register(crate::tools::busybox::arc());
         subagent_registry.register(crate::tools::script::arc());
-        subagent_registry.register(
-            crate::tools::web_search::arc_from_engine_config_with_webview(&config, webview.clone()),
-        );
+        subagent_registry.register(Arc::new(
+            crate::tools::web_search::WebSearchTool::from_engine_config_with_webview(
+                &config,
+                webview.clone(),
+            )
+            .with_endpoint_provider(subagent_client.clone() as Arc<dyn LlmEndpointProvider>),
+        ));
         subagent_registry.register(crate::tools::web_fetch::arc_with_allow_local_and_webview(
             config.web_fetch_allow_local,
             webview.clone(),
@@ -282,15 +296,6 @@ impl PhoneBuddyEngine {
             host_tools.clone(),
         ));
         subagent_registry.register(crate::tools::notification::arc(host_tools.clone()));
-
-        // Host / injected transports share the engine client; they have no named pools.
-        let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
-            (Some(runtime), LlmMode::Http) => Arc::new(
-                LlmClient::from_router(runtime.router(), SUBAGENT_POOL_ID, &config)?
-                    .with_workload(Workload::Subagent),
-            ),
-            _ => client.clone(),
-        };
 
         let task_manager = Arc::new(crate::agent::task_manager::TaskManager::with_prompt(
             config.clone(),
@@ -308,9 +313,13 @@ impl PhoneBuddyEngine {
         registry.register(crate::tools::grep::arc());
         registry.register(crate::tools::busybox::arc());
         registry.register(crate::tools::script::arc());
-        registry.register(
-            crate::tools::web_search::arc_from_engine_config_with_webview(&config, webview.clone()),
-        );
+        registry.register(Arc::new(
+            crate::tools::web_search::WebSearchTool::from_engine_config_with_webview(
+                &config,
+                webview.clone(),
+            )
+            .with_endpoint_provider(client.clone() as Arc<dyn LlmEndpointProvider>),
+        ));
         registry.register(crate::tools::web_fetch::arc_with_allow_local_and_webview(
             config.web_fetch_allow_local,
             webview.clone(),

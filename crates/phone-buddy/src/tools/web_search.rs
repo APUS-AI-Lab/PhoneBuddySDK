@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::EngineResult;
+use crate::llm::endpoint::SharedLlmEndpointProvider;
 use crate::llm::types::ApiBackend;
 use crate::tools::webview::{WebViewFetchRequest, WebViewHost};
 use crate::tools::{
@@ -43,6 +44,9 @@ pub struct WebSearchConfig {
 pub struct WebSearchTool {
     client: reqwest::Client,
     config: WebSearchConfig,
+    /// Live credentials from the currently selected pool member.
+    /// Analog of grok-build `SharedApiKeyProvider`.
+    endpoint_provider: Option<SharedLlmEndpointProvider>,
     webview: Arc<WebViewHost>,
     cooldown_until: Arc<Mutex<Option<Instant>>>,
     probe_enabled: bool,
@@ -66,6 +70,7 @@ impl WebSearchTool {
         Self {
             client,
             config,
+            endpoint_provider: None,
             webview,
             cooldown_until: Arc::new(Mutex::new(None)),
             probe_enabled: true,
@@ -75,6 +80,37 @@ impl WebSearchTool {
     pub fn with_probe_enabled(mut self, enabled: bool) -> Self {
         self.probe_enabled = enabled;
         self
+    }
+
+    /// Attach a live credential source. Each fallback call re-reads the
+    /// currently selected pool member (key, URL, backend, model).
+    pub fn with_endpoint_provider(mut self, provider: SharedLlmEndpointProvider) -> Self {
+        self.endpoint_provider = Some(provider);
+        self
+    }
+
+    /// Static EngineConfig snapshot, overlaid by the selected pool member
+    /// when an endpoint provider is attached.
+    fn resolved_fallback_config(&self) -> WebSearchConfig {
+        if let Some(provider) = &self.endpoint_provider {
+            if let Some(ep) = provider.current_endpoint() {
+                if !ep.api_key.trim().is_empty() && !ep.base_url.trim().is_empty() {
+                    return WebSearchConfig {
+                        api_key: Some(ep.api_key),
+                        base_url: Some(ep.base_url),
+                        model: if ep.model.trim().is_empty() {
+                            self.config.model.clone()
+                        } else {
+                            Some(ep.model)
+                        },
+                        api_backend: Some(ep.api_backend),
+                        extra_headers: ep.extra_headers,
+                        extra_body: ep.extra_body,
+                    };
+                }
+            }
+        }
+        self.config.clone()
     }
 
     pub fn from_engine_config(cfg: &crate::config::EngineConfig) -> Self {
@@ -238,7 +274,8 @@ impl WebSearchTool {
         allowed_domains: &[String],
         blocked_domains: &[String],
     ) -> Result<String, String> {
-        let backend = self.config.api_backend.unwrap_or_else(|| {
+        let config = self.resolved_fallback_config();
+        let backend = config.api_backend.unwrap_or_else(|| {
             match std::env::var("PHONEBUDDY_API_BACKEND").as_deref() {
                 Ok("messages") => ApiBackend::Messages,
                 Ok("responses") => ApiBackend::Responses,
@@ -246,8 +283,7 @@ impl WebSearchTool {
             }
         });
 
-        let api_key = self
-            .config
+        let api_key = config
             .api_key
             .as_deref()
             .filter(|s| !s.trim().is_empty())
@@ -261,13 +297,12 @@ impl WebSearchTool {
             Some(k) if !k.trim().is_empty() => k,
             _ => {
                 return Err(
-                    "API key missing (set in EngineConfig or PHONEBUDDY_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY environment variable)".into(),
+                    "API key missing (set on the selected pool member, in EngineConfig, or PHONEBUDDY_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY environment variable)".into(),
                 );
             }
         };
 
-        let base_url = self
-            .config
+        let base_url = config
             .base_url
             .as_deref()
             .filter(|s| !s.trim().is_empty())
@@ -302,8 +337,7 @@ impl WebSearchTool {
             ApiBackend::Gemini => format!("{root}/models/placeholder:generateContent"),
         };
 
-        let mut model = self
-            .config
+        let mut model = config
             .model
             .as_deref()
             .filter(|s| !s.trim().is_empty())
@@ -354,7 +388,7 @@ impl WebSearchTool {
                     ]
                 });
                 if let Some(obj) = payload.as_object_mut() {
-                    for (k, v) in &self.config.extra_body {
+                    for (k, v) in &config.extra_body {
                         obj.insert(k.clone(), v.clone());
                     }
                 }
@@ -369,7 +403,7 @@ impl WebSearchTool {
                     .header("Content-Type", "application/json")
                     .json(&payload);
 
-                for (k, v) in &self.config.extra_headers {
+                for (k, v) in &config.extra_headers {
                     req = req.header(k, v);
                 }
 
@@ -406,7 +440,7 @@ impl WebSearchTool {
                     ]
                 });
                 if let Some(obj) = payload.as_object_mut() {
-                    for (k, v) in &self.config.extra_body {
+                    for (k, v) in &config.extra_body {
                         obj.insert(k.clone(), v.clone());
                     }
                 }
@@ -419,7 +453,7 @@ impl WebSearchTool {
                     .header("Content-Type", "application/json")
                     .json(&payload);
 
-                for (k, v) in &self.config.extra_headers {
+                for (k, v) in &config.extra_headers {
                     req = req.header(k, v);
                 }
 
@@ -465,7 +499,7 @@ impl WebSearchTool {
                     ]
                 });
                 if let Some(obj) = payload.as_object_mut() {
-                    for (k, v) in &self.config.extra_body {
+                    for (k, v) in &config.extra_body {
                         obj.insert(k.clone(), v.clone());
                     }
                 }
@@ -478,7 +512,7 @@ impl WebSearchTool {
                     .header("Content-Type", "application/json")
                     .json(&payload);
 
-                for (k, v) in &self.config.extra_headers {
+                for (k, v) in &config.extra_headers {
                     req = req.header(k, v);
                 }
 
@@ -511,7 +545,7 @@ impl WebSearchTool {
                     }]
                 });
                 if let Some(obj) = payload.as_object_mut() {
-                    for (k, v) in &self.config.extra_body {
+                    for (k, v) in &config.extra_body {
                         obj.insert(k.clone(), v.clone());
                     }
                 }
@@ -524,7 +558,7 @@ impl WebSearchTool {
                     .header("Content-Type", "application/json")
                     .json(&payload);
 
-                for (k, v) in &self.config.extra_headers {
+                for (k, v) in &config.extra_headers {
                     req = req.header(k, v);
                 }
 
@@ -1107,6 +1141,57 @@ mod tests {
 
         let res = parse_responses_api_json(&mock_json, "test query");
         assert!(res.is_err());
+    }
+
+    struct FixedEndpoint(crate::llm::endpoint::LlmEndpoint);
+
+    impl crate::llm::endpoint::LlmEndpointProvider for FixedEndpoint {
+        fn current_endpoint(&self) -> Option<crate::llm::endpoint::LlmEndpoint> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn fallback_config_prefers_selected_pool_member_over_empty_engine_config() {
+        let mut cfg = crate::config::EngineConfig::default();
+        cfg.api_key.clear();
+        cfg.base_url.clear();
+        cfg.api_backend = ApiBackend::ChatCompletions;
+        cfg.model = "engine-model".into();
+
+        let tool = WebSearchTool::from_engine_config(&cfg).with_endpoint_provider(Arc::new(
+            FixedEndpoint(crate::llm::endpoint::LlmEndpoint {
+                provider_id: "builtin-wududu-grok".into(),
+                api_key: "sk-pool".into(),
+                base_url: "https://sub.wududu.com/v1".into(),
+                api_backend: ApiBackend::Responses,
+                model: "grok-4.6".into(),
+                extra_headers: Default::default(),
+                extra_body: Default::default(),
+            }),
+        ));
+        let resolved = tool.resolved_fallback_config();
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-pool"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://sub.wududu.com/v1")
+        );
+        assert_eq!(resolved.api_backend, Some(ApiBackend::Responses));
+        assert_eq!(resolved.model.as_deref(), Some("grok-4.6"));
+    }
+
+    #[test]
+    fn fallback_config_keeps_engine_snapshot_without_endpoint_provider() {
+        let mut cfg = crate::config::EngineConfig::default();
+        cfg.api_key = "sk-engine".into();
+        cfg.base_url = "https://api.x.ai/v1".into();
+        cfg.api_backend = ApiBackend::Responses;
+        cfg.model = "grok-4.6".into();
+        let tool = WebSearchTool::from_engine_config(&cfg);
+        let resolved = tool.resolved_fallback_config();
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-engine"));
+        assert_eq!(resolved.base_url.as_deref(), Some("https://api.x.ai/v1"));
+        assert_eq!(resolved.api_backend, Some(ApiBackend::Responses));
     }
 
     #[tokio::test]

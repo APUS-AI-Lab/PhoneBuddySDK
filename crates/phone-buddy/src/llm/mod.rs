@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod doom_loop_collector;
+pub mod endpoint;
 pub mod doom_loop_wire;
 pub mod dumper;
 pub mod failover;
@@ -16,6 +17,7 @@ pub mod types;
 pub mod wire;
 
 pub use client::{LlmClient, LlmTransportObj, LlmTurnSession};
+pub use endpoint::{LlmEndpoint, LlmEndpointProvider, SharedLlmEndpointProvider};
 pub use dumper::{HttpDumpConfig, HttpDumpMode, HttpDumper};
 pub use host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
 pub use profiles::{

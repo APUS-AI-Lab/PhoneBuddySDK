@@ -18,6 +18,7 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver};
 use crate::llm::doom_loop_wire::DoomLoopRecoveryPolicy;
+use crate::llm::endpoint::{LlmEndpoint, LlmEndpointProvider};
 use crate::llm::failover::{provider_fingerprint, FAILOVER_RETRY_AFTER_INLINE_CAP};
 use crate::llm::retry::{
     doom_loop_backoff, is_retry_vetoed_message, parse_retry_after, retry_backoff_with_jitter,
@@ -48,7 +49,14 @@ pub struct LlmClient {
     /// unset and keep their original slots.
     http_factory: Option<HttpSlotFactory>,
     doom_loop_max_retries: u32,
-    last_success: Mutex<Option<String>>,
+    /// Compat key + provider id of the last successful visit.
+    last_success: Mutex<Option<LastSuccess>>,
+}
+
+#[derive(Debug, Clone)]
+struct LastSuccess {
+    compat_key: String,
+    provider_id: String,
 }
 
 struct BoundSlots {
@@ -353,8 +361,64 @@ impl LlmClient {
         self.last_success
             .lock()
             .unwrap()
-            .clone()
+            .as_ref()
+            .map(|s| s.compat_key.clone())
             .unwrap_or_else(|| self.primary_compat_key())
+    }
+
+    /// Provider id of the last successful visit, if that member is still
+    /// in this client's pool. Used by [`LlmEndpointProvider`].
+    fn last_success_provider_id(&self, snapshot: &LlmRoutingConfig) -> Option<String> {
+        let id = self
+            .last_success
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.provider_id.clone())?;
+        let in_pool = snapshot
+            .pools
+            .get(&self.pool_id)
+            .is_some_and(|p| p.members.iter().any(|m| m.provider_id == id));
+        in_pool.then_some(id)
+    }
+
+    /// First enabled member of this client's pool (the default selection
+    /// before any turn has succeeded).
+    fn primary_provider_id(&self, snapshot: &LlmRoutingConfig) -> Option<String> {
+        snapshot.pools.get(&self.pool_id).and_then(|p| {
+            p.members
+                .iter()
+                .find(|m| m.enabled)
+                .map(|m| m.provider_id.clone())
+        })
+    }
+
+    fn endpoint_for_provider(
+        &self,
+        snapshot: &LlmRoutingConfig,
+        provider_id: &str,
+    ) -> Option<LlmEndpoint> {
+        let target = snapshot.provider(provider_id)?;
+        if target.api_key.trim().is_empty() || target.base_url.trim().is_empty() {
+            return None;
+        }
+        Some(LlmEndpoint::from_target(target))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_success_provider_for_test(&self, provider_id: &str) {
+        let compat_key = self
+            .slots
+            .lock()
+            .unwrap()
+            .providers
+            .get(provider_id)
+            .map(|s| s.compat_key.clone())
+            .unwrap_or_else(|| provider_id.to_string());
+        *self.last_success.lock().unwrap() = Some(LastSuccess {
+            compat_key,
+            provider_id: provider_id.to_string(),
+        });
     }
 
     fn primary_compat_key(&self) -> String {
@@ -532,7 +596,10 @@ impl LlmClient {
                         None => turn,
                     };
                     self.router.record_success(provider_id);
-                    *self.last_success.lock().unwrap() = Some(slot.compat_key.clone());
+                    *self.last_success.lock().unwrap() = Some(LastSuccess {
+                        compat_key: slot.compat_key.clone(),
+                        provider_id: provider_id.clone(),
+                    });
                     turn.provider_id = provider_id.clone();
                     turn.operation_id = operation_id.clone();
                     turn.attempts = tried_ids.len() as u32;
@@ -1340,6 +1407,22 @@ fn slot_from_target(
         x_search_options: target.x_search_options.clone(),
         transport,
     })
+}
+
+impl LlmEndpointProvider for LlmClient {
+    fn current_endpoint(&self) -> Option<LlmEndpoint> {
+        // Injected / host transports have no HTTP routing credentials.
+        // grok-build's SharedApiKeyProvider is only wired onto the HTTP
+        // sampler; the same gate applies here.
+        if self.http_factory.is_none() {
+            return None;
+        }
+        let (_, snapshot) = self.router.snapshot();
+        let provider_id = self
+            .last_success_provider_id(&snapshot)
+            .or_else(|| self.primary_provider_id(&snapshot))?;
+        self.endpoint_for_provider(&snapshot, &provider_id)
+    }
 }
 
 impl ProviderSlot {
@@ -2572,5 +2655,65 @@ mod tests {
             Err(other) => panic!("expected InvalidRoutingConfig, got {other}"),
             Ok(_) => panic!("expected missing slot to be a hard error"),
         }
+    }
+
+    #[test]
+    fn current_endpoint_reads_selected_pool_member() {
+        use crate::config::EngineConfig;
+        use crate::llm::endpoint::LlmEndpointProvider;
+        use crate::llm::types::ApiBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut extra = HashMap::new();
+        extra.insert("X-Test".into(), "1".into());
+
+        let mut p1 = target("p1", "https://sub.wududu.com/v1", "grok-4.6");
+        p1.api_key = "sk-a".into();
+        p1.api_backend = ApiBackend::Responses;
+        p1.extra_headers = extra.clone();
+
+        let mut p2 = target("p2", "https://cf.api.fan/v1", "grok-4.6");
+        p2.api_key = "sk-b".into();
+        p2.api_backend = ApiBackend::ChatCompletions;
+
+        let mut pools = BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            pool(vec![member("p1", 0), member("p2", 1)]),
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![p1, p2],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.root_dir = dir.path().to_path_buf();
+        cfg.api_key.clear();
+        let client = LlmClient::from_router(router, MAIN_POOL_ID, &cfg).unwrap();
+
+        let ep = client.current_endpoint().expect("primary member");
+        assert_eq!(ep.provider_id, "p1");
+        assert_eq!(ep.api_key, "sk-a");
+        assert_eq!(ep.base_url, "https://sub.wududu.com/v1");
+        assert_eq!(ep.api_backend, ApiBackend::Responses);
+        assert_eq!(ep.model, "grok-4.6");
+        assert_eq!(ep.extra_headers.get("X-Test").map(String::as_str), Some("1"));
+
+        client.set_last_success_provider_for_test("p2");
+        let ep = client.current_endpoint().expect("failover member");
+        assert_eq!(ep.provider_id, "p2");
+        assert_eq!(ep.api_key, "sk-b");
+        assert_eq!(ep.base_url, "https://cf.api.fan/v1");
+        assert_eq!(ep.api_backend, ApiBackend::ChatCompletions);
+    }
+
+    #[test]
+    fn injected_client_has_no_http_endpoint() {
+        use crate::llm::endpoint::LlmEndpointProvider;
+        let hits = Arc::new(AtomicU32::new(0));
+        let t = ScriptedTransport::failing("inline", 0, "", hits);
+        let client = LlmClient::new(t as Arc<dyn LlmTransportObj>, 1);
+        assert!(client.current_endpoint().is_none());
     }
 }
