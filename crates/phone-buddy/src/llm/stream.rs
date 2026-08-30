@@ -162,15 +162,11 @@ pub async fn collect_stream(
                     } else {
                         entry.0.clone()
                     };
-                    if started.insert(call_id.clone()) {
+                    if entry.3 == "server" && started.insert(call_id.clone()) {
                         // grok-build `BackendToolCallStarted` carries
                         // name+id only. Hosted search query/sources land
                         // later on OutputItemDone (ToolCallResult).
-                        let arguments_json = if entry.3 == "server" || entry.2.is_empty() {
-                            "{}".to_string()
-                        } else {
-                            entry.2.clone()
-                        };
+                        let arguments_json = "{}".to_string();
                         if entry.1 == "x_thread_fetch" || entry.1.starts_with("x_") || entry.1 == "x_search" {
                             tracing::info!(
                                 tool = %entry.1,

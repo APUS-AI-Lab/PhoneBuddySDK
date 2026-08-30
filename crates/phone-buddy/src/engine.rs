@@ -804,6 +804,15 @@ impl PhoneBuddyEngine {
                     return Err(EngineError::Cancelled);
                 }
                 let name = call.function.name.clone();
+                observer.on_event(AgentEvent::ToolCallStart {
+                    call_id: call.id.clone(),
+                    name: name.clone(),
+                    arguments_json: if call.function.arguments.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        call.function.arguments.clone()
+                    },
+                });
 
                 let output = tokio::select! {
                     _ = token.cancelled() => {
