@@ -48,6 +48,12 @@ named pools (`main`, `subagent`, `session_title`, …), and a
 `RouterHealthConfig`. Create a long-lived `PhoneBuddyRuntime` and bind
 engines with `runtime.create_engine(agent_config, "main")`.
 
+A pool-bound engine is validated with `EngineConfig::validate_pool_bound()`:
+the pool's targets own `base_url` / `api_key` / per-provider model, so the
+agent config may leave them empty and carry only agent policy. Credentials
+then live in exactly one place. `PhoneBuddyEngine::new` still uses the full
+`validate()` because the legacy adapter needs them to synthesize a pool.
+
 The main-agent tool loop uses the engine's pool-bound client (typically
 `main`). `TaskManager` receives a **second** `LlmClient` bound to
 `subagent`: same router (shared health), independent provider slots, and

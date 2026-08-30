@@ -372,26 +372,16 @@ impl EngineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.model.trim().is_empty() {
-            return Err("model is empty".into());
-        }
-        if self.root_dir.as_os_str().is_empty() {
-            return Err("root_dir is empty".into());
-        }
-        match self.llm_mode {
-            LlmMode::Http => {
-                if self.api_key.trim().is_empty() {
-                    return Err("api_key is empty".into());
-                }
-                if !self.base_url.starts_with("http://") && !self.base_url.starts_with("https://") {
-                    return Err(format!(
-                        "base_url must be an http(s) URL: {}",
-                        self.base_url
-                    ));
-                }
+        self.validate_pool_bound()?;
+        if matches!(self.llm_mode, LlmMode::Http) {
+            if self.api_key.trim().is_empty() {
+                return Err("api_key is empty".into());
             }
-            LlmMode::Host => {
-                // Host mode uses FFI callbacks; no HTTP credentials required.
+            if !self.base_url.starts_with("http://") && !self.base_url.starts_with("https://") {
+                return Err(format!(
+                    "base_url must be an http(s) URL: {}",
+                    self.base_url
+                ));
             }
         }
         for (i, ep) in self.fallback_providers.iter().enumerate() {
@@ -407,6 +397,26 @@ impl EngineConfig {
                     ep.base_url
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Validation for an engine bound to a [`crate::llm::router`] pool.
+    ///
+    /// The pool's [`crate::llm::router::ProviderTarget`]s own `base_url`,
+    /// `api_key`, and the per-provider model, so those engine fields are inert
+    /// and may be left empty. Hosts that pass a declarative routing config
+    /// therefore keep every credential in one place instead of duplicating one
+    /// into the agent config just to satisfy a check.
+    ///
+    /// `model` stays required: it is the request model until the router picks
+    /// a provider, and it drives the web-search fallback and token budgets.
+    pub fn validate_pool_bound(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("model is empty".into());
+        }
+        if self.root_dir.as_os_str().is_empty() {
+            return Err("root_dir is empty".into());
         }
         Ok(())
     }

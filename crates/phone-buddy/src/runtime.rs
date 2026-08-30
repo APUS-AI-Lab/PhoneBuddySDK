@@ -528,6 +528,55 @@ mod tests {
             Ok(_) => panic!("expected RouteNotConfigured for missing subagent pool"),
         }
     }
+
+    #[test]
+    fn pool_bound_engine_needs_no_credentials_in_the_agent_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = PoolMember {
+            provider_id: "p1".into(),
+            routing_group: "g".into(),
+            base_score: 10,
+            order: 0,
+            enabled: true,
+        };
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: vec![member.clone()],
+                ..Default::default()
+            },
+        );
+        pools.insert(
+            SUBAGENT_POOL_ID.into(),
+            ProviderPool {
+                members: vec![member],
+                ..Default::default()
+            },
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![target("p1")],
+            pools,
+            health: Default::default(),
+        };
+        let runtime = PhoneBuddyRuntime::new(routing, dir.path()).unwrap();
+
+        // The pool owns base_url / api_key. A host that passes a routing
+        // config must not have to duplicate a credential into the agent
+        // config just to get past validation.
+        let cfg = EngineConfig {
+            model: "m".into(),
+            root_dir: dir.path().to_path_buf(),
+            api_key: String::new(),
+            base_url: String::new(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err(), "legacy validation still demands them");
+        cfg.validate_pool_bound().expect("pool-bound config is valid");
+        runtime
+            .create_engine(cfg, MAIN_POOL_ID)
+            .expect("engine binds to the pool without engine-level credentials");
+    }
 }
 
 #[cfg(test)]

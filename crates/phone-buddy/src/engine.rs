@@ -188,12 +188,15 @@ impl PhoneBuddyEngine {
 
     /// Bind an engine to an existing runtime's named pool. Recreating an
     /// engine against the same runtime keeps provider health.
+    ///
+    /// The pool supplies every provider credential, so `agent_config` only
+    /// needs agent-level policy (`root_dir`, `model`, prompt, tool switches).
     pub fn from_runtime(
         runtime: Arc<PhoneBuddyRuntime>,
         config: EngineConfig,
         main_pool_id: &str,
     ) -> EngineResult<Arc<Self>> {
-        config.validate().map_err(EngineError::Config)?;
+        config.validate_pool_bound().map_err(EngineError::Config)?;
         let _ = rustls::crypto::ring::default_provider().install_default();
         if !runtime.router().has_pool(main_pool_id) {
             return Err(EngineError::RouteNotConfigured {
