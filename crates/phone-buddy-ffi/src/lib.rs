@@ -80,6 +80,16 @@ static LOG_INIT: std::sync::Once = std::sync::Once::new();
 struct HostLogLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HostLogLayer {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let target = metadata.target();
+        // Suppress extremely verbose parsing logs from third-party crates (e.g. html5ever char_ref tokenizer, selectors)
+        !target.starts_with("html5ever") && !target.starts_with("selectors")
+    }
+
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
@@ -95,6 +105,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HostLogLayer {
         };
 
         let meta = event.metadata();
+        let target = meta.target();
+        if target.starts_with("html5ever") || target.starts_with("selectors") {
+            return;
+        }
+
         let level: i32 = match *meta.level() {
             tracing::Level::ERROR => 1,
             tracing::Level::WARN => 2,
@@ -1184,13 +1199,18 @@ pub unsafe extern "C" fn pb_init_logging(callback: PbLogCallback, min_level: i32
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let filter = match min_level {
+        let level_filter = match min_level {
             1 => tracing_subscriber::filter::LevelFilter::ERROR,
             2 => tracing_subscriber::filter::LevelFilter::WARN,
             3 => tracing_subscriber::filter::LevelFilter::INFO,
             4 => tracing_subscriber::filter::LevelFilter::DEBUG,
             _ => tracing_subscriber::filter::LevelFilter::TRACE,
         };
+
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_default(level_filter)
+            .with_target("html5ever", tracing_subscriber::filter::LevelFilter::OFF)
+            .with_target("selectors", tracing_subscriber::filter::LevelFilter::OFF);
 
         #[cfg(target_os = "android")]
         {

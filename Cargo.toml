@@ -94,7 +94,7 @@ boa_engine = "0.20"
 sha2 = "0.10"
 # tracing: release_max_level_off strips all tracing format strings at compile time in release builds
 tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_off"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry", "env-filter"] }
 tracing-android = "0.2"
 
 [profile.release]
