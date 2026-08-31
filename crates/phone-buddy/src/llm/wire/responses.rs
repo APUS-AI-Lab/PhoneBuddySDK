@@ -828,7 +828,13 @@ pub fn parse_responses_chunk(
                 || json_type.contains("output_item.added");
             if is_added {
                 if let Some(f) = tc.function.as_mut() {
-                    f.arguments = None;
+                    if tc.kind.as_deref() == Some("server")
+                        || f.arguments
+                            .as_deref()
+                            .is_some_and(crate::llm::stream::is_placeholder_tool_args)
+                    {
+                        f.arguments = None;
+                    }
                 }
             }
             delta.tool_calls.push(tc);

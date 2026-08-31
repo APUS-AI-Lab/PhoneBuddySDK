@@ -59,6 +59,13 @@ pub async fn collect_stream(
     let mut id_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut output_to_idx: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // gro-build drops unmatched fragments outright because its canonical
+    // `ResponseCompleted` output carries the authoritative arguments.
+    // Hermes / LiteLLM-style translation gateways renumber argument
+    // deltas relative to `output_item.added` and often send no usable
+    // canonical snapshot, so fragments that resolve nowhere are parked
+    // here and salvaged at finalize (see `salvage_parked_fragments`).
+    let mut parked: Vec<ParkedFragment> = Vec::new();
 
     while let Some(next) = stream.next().await {
         let chunk = match next {
@@ -120,9 +127,24 @@ pub async fn collect_stream(
             for tc in &delta.tool_calls {
                 let Some(idx) = resolve_tool_call_index(tc, &id_to_idx, &output_to_idx) else {
                     // grok-build drops FunctionCallArgumentsDelta when no
-                    // OutputItemAdded mapped that output_index. Same here
-                    // for nameless fragments so they cannot land on slot 0
-                    // (reasoning / text) and leave the real call empty.
+                    // OutputItemAdded mapped that output_index; it can
+                    // afford to because its canonical response snapshot
+                    // owns the final arguments. Hermes-style translation
+                    // gateways misnumber deltas relative to the added
+                    // item, so park the fragment and salvage it before
+                    // finalize instead of losing the arguments. Parked
+                    // fragments graft onto known tool entries only, so
+                    // they can never land on slot 0 (reasoning / text).
+                    if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_deref()) {
+                        if !args.is_empty() {
+                            parked.push(ParkedFragment {
+                                index: tc.index,
+                                call_id: tc.id.clone(),
+                                item_id: tc.item_id.clone(),
+                                fragment: args.to_string(),
+                            });
+                        }
+                    }
                     continue;
                 };
                 remember_tool_call_ids(tc, idx, &mut id_to_idx, &mut output_to_idx);
@@ -187,12 +209,118 @@ pub async fn collect_stream(
                         });
                     }
                 }
+                if !parked.is_empty() {
+                    graft_parked_fragments(idx, tc, &mut tool_call_acc, &mut parked);
+                }
             }
         }
     }
 
+    salvage_parked_fragments(&mut tool_call_acc, &mut parked);
     finalize_turn(&mut turn, tool_call_acc);
     Ok(turn)
+}
+
+/// A tool-argument fragment that resolved to no known call on arrival.
+#[derive(Debug)]
+struct ParkedFragment {
+    index: u32,
+    call_id: Option<String>,
+    item_id: Option<String>,
+    fragment: String,
+}
+
+/// Graft parked fragments whose identity (call_id / item_id) matches a
+/// just-registered call. This handles fragments that arrive *before*
+/// their `output_item.added` (delta-before-added reordering).
+fn graft_parked_fragments(
+    idx: u32,
+    tc: &crate::llm::types::ToolCallDelta,
+    acc: &mut BTreeMap<u32, (String, String, String, String, Option<String>)>,
+    parked: &mut Vec<ParkedFragment>,
+) {
+    let Some(entry) = acc.get_mut(&idx) else {
+        return;
+    };
+    let identities: Vec<String> = [tc.id.clone(), tc.item_id.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if identities.is_empty() {
+        return;
+    }
+    let mut still_parked = Vec::new();
+    for p in parked.drain(..) {
+        let matches = p
+            .call_id
+            .as_ref()
+            .or(p.item_id.as_ref())
+            .is_some_and(|id| identities.contains(id));
+        if matches && entry.3 != "server" {
+            tracing::debug!(
+                index = p.index,
+                target = %idx,
+                "grafted parked tool-argument fragment after call registration"
+            );
+            append_tool_argument_fragment(&mut entry.2, &p.fragment);
+        } else {
+            still_parked.push(p);
+        }
+    }
+    *parked = still_parked;
+}
+
+/// Last-resort salvage for parked fragments before `finalize_turn`.
+///
+/// gro-build never needs this: its `ResponseCompleted` output is the
+/// argument source of truth. Hermes-style gateways send no usable
+/// canonical snapshot, so when exactly one still-empty client call was
+/// observed, fragments parked by the resolver must belong to it. With
+/// more than one open call the attribution is ambiguous and the
+/// fragments stay dropped (gro-build parity).
+fn salvage_parked_fragments(
+    acc: &mut BTreeMap<u32, (String, String, String, String, Option<String>)>,
+    parked: &mut Vec<ParkedFragment>,
+) {
+    if parked.is_empty() {
+        return;
+    }
+    let candidates: Vec<u32> = acc
+        .iter()
+        .filter(|(_, entry)| entry.3 != "server" && is_placeholder_tool_args(&entry.2))
+        .map(|(idx, _)| *idx)
+        .collect();
+    if candidates.len() != 1 {
+        tracing::debug!(
+            fragments = parked.len(),
+            open_calls = candidates.len(),
+            "dropping unmatched tool-argument fragments (ambiguous or no open call)"
+        );
+        parked.clear();
+        return;
+    }
+    let entry = acc.get_mut(&candidates[0]).expect("candidate exists");
+    let mut buffer = String::new();
+    for p in parked.iter() {
+        append_tool_argument_fragment(&mut buffer, &p.fragment);
+    }
+    if is_complete_json(&buffer) {
+        tracing::info!(
+            call_id = %entry.0,
+            tool = %entry.1,
+            args = %buffer,
+            "salvaged parked tool-argument fragments onto the only open call"
+        );
+        entry.2 = buffer;
+    } else {
+        tracing::warn!(
+            fragments = parked.len(),
+            buffer = %buffer,
+            "parked tool-argument fragments never formed complete JSON; dropping"
+        );
+    }
+    parked.clear();
 }
 
 fn idle_timeout_of(err: &EngineError) -> Option<Duration> {
@@ -495,7 +623,7 @@ fn is_complete_json(s: &str) -> bool {
 
 /// Empty / `{}` is the Responses `output_item.added` and Anthropic
 /// `tool_use` start placeholder — not a finished argument object.
-fn is_placeholder_tool_args(s: &str) -> bool {
+pub(crate) fn is_placeholder_tool_args(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
         return true;
@@ -586,7 +714,12 @@ fn append_tool_argument_fragment(buffer: &mut String, incoming: &str) {
         buffer.push_str(incoming);
         return;
     }
-    if is_complete_json(buffer) && is_complete_json(incoming) {
+    if is_complete_json(buffer) {
+        // The buffer already holds a closed argument object (streamed to
+        // completion, or seeded by a Codex-style added snapshot). A later
+        // complete snapshot is a repeat (grok-build ignores it); a later
+        // partial fragment cannot continue a closed JSON object and must
+        // not concatenate onto it.
         return;
     }
     buffer.push_str(incoming);
