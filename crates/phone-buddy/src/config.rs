@@ -69,12 +69,12 @@ pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     /// This model/gateway exposes hosted `{ "type": "web_search" }` on
-    /// Responses. The agent conversation does **not** inline that tool
-    /// (inlining it is grok-build's server-side search loop and stalls
-    /// buffering proxies). The client `web_search` function always tries
-    /// DuckDuckGo first; this flag only authorizes a *separate* hosted
-    /// search request after DDG fails. Gateways without hosted search
-    /// (PackyAPI, chat-completions models) must leave this off.
+    /// Responses. Matches grok-build: the agent conversation inlines that
+    /// tool so server-side search runs inside the same SSE. Gateways
+    /// without hosted search (PackyAPI, chat-completions models) must
+    /// leave this off. Truncated `in_progress` hosted searches are
+    /// salvaged as client `web_search` (DuckDuckGo, then a separate
+    /// hosted request).
     #[serde(default)]
     pub enable_web_search: bool,
     /// Optional configuration options for WebSearch (allowed/excluded domains).
@@ -97,7 +97,7 @@ pub struct EngineConfig {
     /// Extra text appended to the system prompt (product persona etc).
     #[serde(default)]
     pub system_prompt_extra: Option<String>,
-    /// Idle timeout for the LLM stream, in seconds (default: 120s).
+    /// Idle timeout for the LLM stream, in seconds (default: 300s, matching grok-build).
     #[serde(default = "default_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
     /// Max API retries per LLM request (default: 5 attempts).
@@ -188,8 +188,9 @@ pub struct ProviderEndpoint {
     pub extra_headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub extra_body: std::collections::HashMap<String, serde_json::Value>,
-    /// Hosted `{type: web_search}` available as the function-tool fallback
-    /// after DuckDuckGo. Not inlined on the agent conversation SSE.
+    /// Hosted `{type: web_search}` on Responses, matching grok-build
+    /// backend search. Also used as the function-tool fallback after
+    /// DuckDuckGo when a truncated hosted search is salvaged.
     #[serde(default)]
     pub enable_web_search: bool,
     /// Optional configuration options for WebSearch.
@@ -233,7 +234,7 @@ fn default_max_tokens() -> u32 {
     8192
 }
 fn default_idle_timeout_secs() -> u64 {
-    120
+    300
 }
 fn default_max_retries() -> u32 {
     5
@@ -344,7 +345,7 @@ impl EngineConfig {
             .model(model)
     }
 
-    /// True when hosted `{type: web_search}` is available as a function-tool fallback.
+    /// True when hosted `{type: web_search}` should ride the Responses request.
     pub fn backend_search_active(&self) -> bool {
         self.enable_web_search && matches!(self.api_backend, ApiBackend::Responses)
     }

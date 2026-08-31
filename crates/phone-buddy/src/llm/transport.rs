@@ -7,7 +7,7 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::Stream;
 
@@ -234,10 +234,18 @@ impl HttpTransport {
         doom_loop_enabled: bool,
         dumper: crate::llm::dumper::HttpDumper,
     ) -> EngineResult<Self> {
-        // The ring crypto provider is installed by PhoneBuddyEngine::new.
+        // Match grok-build's sampler HTTP client: Nagle off (HTTP/1.1 SSE
+        // otherwise sits in TCP buffers) and HTTP/2 keepalive pings so a
+        // silent hosted-search interval does not look like a dead socket.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60 * 10))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .http2_keep_alive_interval(Duration::from_secs(15))
+            .http2_keep_alive_timeout(Duration::from_secs(5))
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| EngineError::Config(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
@@ -286,6 +294,99 @@ pub fn merge_extra_body(
         for (k, v) in extra_body {
             obj.insert(k.clone(), v.clone());
         }
+    }
+}
+
+fn http_version_label(v: reqwest::Version) -> &'static str {
+    match v {
+        reqwest::Version::HTTP_09 => "HTTP/0.9",
+        reqwest::Version::HTTP_10 => "HTTP/1.0",
+        reqwest::Version::HTTP_11 => "HTTP/1.1",
+        reqwest::Version::HTTP_2 => "HTTP/2",
+        reqwest::Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/?",
+    }
+}
+
+fn sse_event_label(event_name: &str, data: &str) -> String {
+    let named = event_name.trim();
+    if !named.is_empty() && named != "message" {
+        return named.to_string();
+    }
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            if named.is_empty() {
+                "(unnamed)".into()
+            } else {
+                named.into()
+            }
+        })
+}
+
+fn is_notable_sse(label: &str) -> bool {
+    let l = label.to_ascii_lowercase();
+    l.contains("web_search")
+        || l.contains("x_search")
+        || l.contains("output_item")
+        || l.contains("completed")
+        || l.contains("incomplete")
+        || l.contains("failed")
+        || l.contains("error")
+        || l.contains("created")
+}
+
+fn is_terminal_sse(backend: ApiBackend, event_name: &str, data: &str) -> bool {
+    let data_trimmed = data.trim();
+    if data_trimmed == "[DONE]" {
+        return true;
+    }
+
+    match backend {
+        ApiBackend::Responses => {
+            let type_str = event_name.to_ascii_lowercase();
+            if type_str.contains("response.completed")
+                || type_str.contains("response.incomplete")
+                || type_str.contains("response.failed")
+                || type_str.contains("response.done")
+            {
+                return true;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_trimmed) {
+                if let Some(t) = v.get("type").and_then(|s| s.as_str()) {
+                    let t_lower = t.to_ascii_lowercase();
+                    if t_lower.contains("response.completed")
+                        || t_lower.contains("response.incomplete")
+                        || t_lower.contains("response.failed")
+                        || t_lower.contains("response.done")
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        ApiBackend::Messages => {
+            let type_str = event_name.to_ascii_lowercase();
+            if type_str.contains("message_stop") {
+                return true;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_trimmed) {
+                if let Some(t) = v.get("type").and_then(|s| s.as_str()) {
+                    if t == "message_stop" {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        ApiBackend::ChatCompletions => false,
+        ApiBackend::Gemini => false,
     }
 }
 
@@ -338,6 +439,11 @@ impl HttpTransport {
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
 
+        // grok-build sets Accept last on the streaming request so a proxy
+        // cannot treat the body as a buffered JSON document.
+        builder = builder.header("accept", "text/event-stream");
+        req_headers_map.insert("accept".to_string(), "text/event-stream".to_string());
+
         let mut body = adapter.build_payload(req)?;
 
         // Attach Codex client_metadata if ClientProfile::Codex
@@ -385,6 +491,23 @@ impl HttpTransport {
 
         merge_extra_body(&mut body, &self.extra_body);
         req_headers_map.insert("content-type".to_string(), "application/json".to_string());
+
+        let hosted_names = req
+            .hosted_tools
+            .iter()
+            .map(|h| h.wire_name())
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::diag::info(
+            "phone_buddy::sse",
+            &format!(
+                "[HTTP] POST {} stream={} hosted=[{}] idle={}s accept=text/event-stream",
+                endpoint,
+                body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+                hosted_names,
+                self.idle_timeout.as_secs()
+            ),
+        );
 
         let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
         let start_time = std::time::Instant::now();
@@ -481,6 +604,26 @@ impl HttpTransport {
             return Err(EngineError::Llm(msg));
         }
 
+        let http_ver = http_version_label(resp.version());
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        crate::diag::info(
+            "phone_buddy::sse",
+            &format!(
+                "[HTTP] {} status={} version={} content-type='{}' hosted=[{}] idle={}s",
+                endpoint,
+                status,
+                http_ver,
+                content_type,
+                hosted_names,
+                self.idle_timeout.as_secs()
+            ),
+        );
+
         if self.dumper.should_dump_success() {
             let resp_headers_dump = self.dumper.extract_headers(resp.headers());
             let status_text = resp.status().canonical_reason().unwrap_or("OK").to_string();
@@ -518,11 +661,39 @@ impl HttpTransport {
         };
         let chunk_stream = async_stream::stream! {
             futures_util::pin_mut!(sse);
+            let started_at = Instant::now();
+            let mut last_sse_at = Instant::now();
+            let mut last_heartbeat_at = Instant::now();
+            let mut last_sse_type = String::from("(none)");
+            let mut sse_events: u32 = 0;
+            let mut sse_parsed: u32 = 0;
+            let mut sse_dropped: u32 = 0;
+            let mut sse_bytes: u64 = 0;
+            crate::diag::info(
+                "phone_buddy::sse",
+                &format!(
+                    "[SSE] waiting for first event (idle={}s http={})",
+                    idle_timeout.as_secs(),
+                    http_ver
+                ),
+            );
             loop {
                 let next = tokio::time::timeout(idle_timeout, sse.next()).await;
                 let event = match next {
                     Ok(Some(ev)) => ev,
                     Ok(None) => {
+                        crate::diag::info(
+                            "phone_buddy::sse",
+                            &format!(
+                                "[SSE] closed events={} parsed={} dropped={} bytes={} elapsed={}ms last={}",
+                                sse_events,
+                                sse_parsed,
+                                sse_dropped,
+                                sse_bytes,
+                                started_at.elapsed().as_millis(),
+                                last_sse_type
+                            ),
+                        );
                         // Terminal: act on confident doom-loop signals.
                         if let Some(ref c) = collector {
                             if let Some(triggers) = c.abort_triggers() {
@@ -532,6 +703,21 @@ impl HttpTransport {
                         break;
                     }
                     Err(_) => {
+                        crate::diag::info(
+                            "phone_buddy::sse",
+                            &format!(
+                                "[SSE] idle-timeout after {}ms silence last={} events={} parsed={} dropped={} bytes={} elapsed={}ms idle={}s http={}",
+                                last_sse_at.elapsed().as_millis(),
+                                last_sse_type,
+                                sse_events,
+                                sse_parsed,
+                                sse_dropped,
+                                sse_bytes,
+                                started_at.elapsed().as_millis(),
+                                idle_timeout.as_secs(),
+                                http_ver
+                            ),
+                        );
                         yield Err(EngineError::StreamIdleTimeout(idle_timeout));
                         return;
                     }
@@ -539,6 +725,13 @@ impl HttpTransport {
                 let event = match event {
                     Ok(ev) => ev,
                     Err(e) => {
+                        crate::diag::info(
+                            "phone_buddy::sse",
+                            &format!(
+                                "[SSE] decode-error after {} events last={}: {e}",
+                                sse_events, last_sse_type
+                            ),
+                        );
                         yield Err(EngineError::Stream(format!("SSE error: {e}")));
                         return;
                     }
@@ -557,7 +750,40 @@ impl HttpTransport {
                     }
                 }
 
+                let data_len = event.data.len();
+                sse_bytes += data_len as u64;
+                sse_events += 1;
+                let gap_ms = last_sse_at.elapsed().as_millis();
+                last_sse_at = Instant::now();
+                let label = sse_event_label(&event.event, &event.data);
+                last_sse_type = label.clone();
+
                 let res = adapter_for(backend).parse_event(&event.event, &event.data);
+                let outcome = match &res {
+                    Ok(Some(_)) => {
+                        sse_parsed += 1;
+                        "parsed"
+                    }
+                    Ok(None) => {
+                        sse_dropped += 1;
+                        "dropped"
+                    }
+                    Err(_) => "error",
+                };
+                if sse_events <= 8
+                    || gap_ms >= 5_000
+                    || is_notable_sse(&label)
+                    || last_heartbeat_at.elapsed() >= Duration::from_secs(5)
+                {
+                    crate::diag::info(
+                        "phone_buddy::sse",
+                        &format!(
+                            "[SSE] #{sse_events} +{gap_ms}ms type={label} bytes={data_len} {outcome}"
+                        ),
+                    );
+                    last_heartbeat_at = Instant::now();
+                }
+                let is_terminal = is_terminal_sse(backend, &event.event, &event.data);
                 match res {
                     Ok(Some(chunk)) => yield Ok(chunk),
                     Ok(None) => {}
@@ -565,6 +791,27 @@ impl HttpTransport {
                         yield Err(e);
                         return;
                     }
+                }
+                if is_terminal {
+                    crate::diag::info(
+                        "phone_buddy::sse",
+                        &format!(
+                            "[SSE] closed (terminal event) events={} parsed={} dropped={} bytes={} elapsed={}ms last={}",
+                            sse_events,
+                            sse_parsed,
+                            sse_dropped,
+                            sse_bytes,
+                            started_at.elapsed().as_millis(),
+                            last_sse_type
+                        ),
+                    );
+                    // Terminal: act on confident doom-loop signals.
+                    if let Some(ref c) = collector {
+                        if let Some(triggers) = c.abort_triggers() {
+                            yield Err(EngineError::DoomLoopServer(triggers.join(", ")));
+                        }
+                    }
+                    break;
                 }
             }
         };
@@ -854,6 +1101,76 @@ mod tests {
         ConversationRequest::from_chat(req)
     }
 
+    #[test]
+    fn sse_event_label_prefers_event_name_then_json_type() {
+        assert_eq!(
+            sse_event_label("response.web_search_call.searching", "{}"),
+            "response.web_search_call.searching"
+        );
+        assert_eq!(
+            sse_event_label(
+                "message",
+                r#"{"type":"response.web_search_call.in_progress"}"#
+            ),
+            "response.web_search_call.in_progress"
+        );
+        assert!(is_notable_sse("response.web_search_call.searching"));
+        assert!(is_notable_sse("response.completed"));
+        assert!(!is_notable_sse("response.output_text.delta"));
+    }
+
+    #[test]
+    fn test_is_terminal_sse() {
+        // [DONE] is terminal for all backends
+        assert!(is_terminal_sse(ApiBackend::Responses, "message", "[DONE]"));
+        assert!(is_terminal_sse(ApiBackend::ChatCompletions, "message", "data: [DONE]\n\n".trim_start_matches("data: ")));
+        assert!(is_terminal_sse(ApiBackend::Messages, "message", "[DONE]"));
+
+        // Responses API
+        assert!(is_terminal_sse(ApiBackend::Responses, "response.completed", "{}"));
+        assert!(is_terminal_sse(ApiBackend::Responses, "response.incomplete", "{}"));
+        assert!(is_terminal_sse(ApiBackend::Responses, "response.failed", "{}"));
+        assert!(is_terminal_sse(
+            ApiBackend::Responses,
+            "message",
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#
+        ));
+        assert!(is_terminal_sse(
+            ApiBackend::Responses,
+            "message",
+            r#"{"type":"response.incomplete"}"#
+        ));
+        // Intermediate events must NOT be terminal
+        assert!(!is_terminal_sse(
+            ApiBackend::Responses,
+            "response.web_search_call.completed",
+            "{}"
+        ));
+        assert!(!is_terminal_sse(
+            ApiBackend::Responses,
+            "response.output_item.done",
+            "{}"
+        ));
+        assert!(!is_terminal_sse(
+            ApiBackend::Responses,
+            "response.output_text.delta",
+            r#"{"delta":"hello"}"#
+        ));
+
+        // Messages API
+        assert!(is_terminal_sse(ApiBackend::Messages, "message_stop", "{}"));
+        assert!(is_terminal_sse(
+            ApiBackend::Messages,
+            "message",
+            r#"{"type":"message_stop"}"#
+        ));
+        assert!(!is_terminal_sse(
+            ApiBackend::Messages,
+            "content_block_delta",
+            r#"{"type":"content_block_delta"}"#
+        ));
+    }
+
     #[tokio::test]
     async fn codex_turn_state_header_is_scoped_to_one_logical_turn() {
         use futures_util::StreamExt as _;
@@ -913,6 +1230,11 @@ mod tests {
         server.await.unwrap();
 
         let headers = observed_headers.lock().unwrap();
+        assert!(
+            headers[0].to_ascii_lowercase().contains("accept: text/event-stream"),
+            "grok-build sets Accept: text/event-stream on streaming responses; got:\n{}",
+            headers[0]
+        );
         assert!(!headers[0]
             .to_ascii_lowercase()
             .contains("x-codex-turn-state:"));
@@ -1197,12 +1519,21 @@ mod tests {
         assert!(HostedTool::for_request(true, true, ApiBackend::Messages).is_empty());
         assert!(HostedTool::for_request(true, true, ApiBackend::Gemini).is_empty());
         assert!(HostedTool::for_request(false, false, ApiBackend::Responses).is_empty());
-        assert!(
-            HostedTool::for_conversation_request(false, None, ApiBackend::Responses).is_empty()
+        assert!(HostedTool::for_conversation_request(
+            false,
+            None,
+            false,
+            None,
+            ApiBackend::Responses
+        )
+        .is_empty());
+        assert_eq!(
+            HostedTool::for_conversation_request(false, None, true, None, ApiBackend::Responses),
+            vec![HostedTool::XSearch { options: None }]
         );
         assert_eq!(
-            HostedTool::for_conversation_request(true, None, ApiBackend::Responses),
-            vec![HostedTool::XSearch { options: None }]
+            HostedTool::for_conversation_request(true, None, false, None, ApiBackend::Responses),
+            vec![HostedTool::WebSearch { options: None }]
         );
     }
 

@@ -958,17 +958,25 @@ impl HostedTool {
 
     /// Hosted tools that ride the **agent conversation** SSE.
     ///
-    /// `{type: web_search}` is omitted on purpose. Inlining it turns the
-    /// agent stream into grok-build's server-side search loop; proxies
-    /// often go silent for tens of seconds and trip SSE idle timeout.
-    /// The client `web_search` function tool owns that capability
-    /// (DuckDuckGo first, then a *separate* hosted-search request).
+    /// Matches grok-build: `{type: web_search}` is inlined when the model
+    /// exposes backend search, so the server-side search loop runs inside
+    /// the same Responses stream. Buffering proxies that close while a
+    /// `web_search_call` is still `in_progress` are salvaged by the
+    /// engine as client `web_search` executions.
     pub fn for_conversation_request(
+        enable_web_search: bool,
+        web_search_options: Option<WebSearchOptions>,
         enable_x_search: bool,
         x_search_options: Option<XSearchOptions>,
         api_backend: ApiBackend,
     ) -> Vec<Self> {
-        Self::for_request_with_options(false, None, enable_x_search, x_search_options, api_backend)
+        Self::for_request_with_options(
+            enable_web_search,
+            web_search_options,
+            enable_x_search,
+            x_search_options,
+            api_backend,
+        )
     }
 
     /// Creates hosted tools with their respective options for the Responses API request.

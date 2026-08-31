@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::EngineConfig;
-use crate::conversation::ConversationItem;
+use crate::conversation::{salvage_unfinished_hosted_searches, ConversationItem};
 use crate::error::{EngineError, EngineResult};
 use crate::events::NullObserver;
 use crate::llm::client::LlmClient;
@@ -374,6 +374,8 @@ impl TaskManager {
             req_items.extend(items.clone());
 
             let hosted = HostedTool::for_conversation_request(
+                self.config.enable_web_search,
+                self.config.web_search_options.clone(),
                 self.config.enable_x_search,
                 self.config.x_search_options.clone(),
                 self.config.api_backend,
@@ -413,6 +415,7 @@ impl TaskManager {
                     {
                         a.origin = Some(origin);
                     }
+                    salvage_unfinished_hosted_searches(&mut turn_items);
                     let client_calls: Vec<_> = turn_items
                         .iter()
                         .rev()

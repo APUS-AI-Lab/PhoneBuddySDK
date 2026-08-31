@@ -362,7 +362,7 @@ let config = EngineConfig::for_claude_code("sk-ant-...", "claude-opus-5")
 | `x_search_options` | Object | 否 | `null` | `x_search` 的可选配置（例如 `{"from_date": "2026-01-01", "to_date": "2026-08-28"}` 指定时间范围过滤）。 |
 | `agent_name` | String | 否 | `PhoneBuddy` | 系统提示词中的身份名（`You are {agent_name}…`）。空值回退为 `PhoneBuddy` |
 | `system_prompt_extra` | String | 否 | `null` | 追加到 System Prompt 尾部的自定义人设或业务指令 |
-| `stream_idle_timeout_secs`| Integer | 否 | `120` | 流式连接空闲超时时间（秒） |
+| `stream_idle_timeout_secs`| Integer | 否 | `300` | 流式连接空闲超时时间（秒，对齐 grok-build） |
 | `max_retries` | Integer | 否 | `5` | HTTP 请求发生错误时的指数退避最大重试次数 |
 | `extra_headers` | Object | 否 | `{}` | 附加到 LLM 请求的自定义 HTTP Header 字典 |
 | `extra_body` | Object | 否 | `{}` | 透传合并到 LLM 请求 JSON 体顶层的自定义字段 |

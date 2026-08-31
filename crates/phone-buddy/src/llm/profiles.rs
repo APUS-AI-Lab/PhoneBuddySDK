@@ -302,6 +302,7 @@ mod tests {
         assert_eq!(h_grok.get("x-grok-client-identifier").unwrap(), "grok-cli");
         assert_eq!(h_grok.get("x-grok-doom-loop-check").unwrap(), "1");
         assert_eq!(h_grok.get("authorization").unwrap(), "Bearer test_key");
+        assert_eq!(h_grok.get("accept").unwrap(), "text/event-stream");
 
         let h_codex = build_profile_headers(
             ClientProfile::Codex,

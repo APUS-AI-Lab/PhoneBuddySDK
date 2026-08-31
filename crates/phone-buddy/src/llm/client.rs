@@ -448,10 +448,11 @@ impl LlmClient {
             out.hosted_tools.clear();
             out.tool_choice = Some(serde_json::json!("none"));
         } else {
-            // Never inline `{type: web_search}` on the agent SSE. That
-            // flag only authorizes the client function tool's hosted
-            // fallback (a separate request). x_search stays hosted.
+            // grok-build inlines `{type: web_search}` on the agent SSE
+            // when the slot exposes backend search. x_search stays hosted.
             out.hosted_tools = HostedTool::for_conversation_request(
+                slot.enable_web_search,
+                slot.web_search_options.clone(),
                 slot.enable_x_search,
                 slot.x_search_options.clone(),
                 slot.api_backend,
@@ -2794,7 +2795,10 @@ mod tests {
         assert_eq!(ep.base_url, "https://sub.wududu.com/v1");
         assert_eq!(ep.api_backend, ApiBackend::Responses);
         assert_eq!(ep.model, "grok-4.6");
-        assert_eq!(ep.extra_headers.get("X-Test").map(String::as_str), Some("1"));
+        assert_eq!(
+            ep.extra_headers.get("X-Test").map(String::as_str),
+            Some("1")
+        );
 
         client.set_last_success_provider_for_test("p2");
         let ep = client.current_endpoint().expect("failover member");

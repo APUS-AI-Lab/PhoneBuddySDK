@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::agent::doom_loop::{stationarity_nudge_message, step_signature, IdenticalToolCallRun};
 use crate::config::{EngineConfig, LlmMode};
-use crate::conversation::{user_assistant_count, ConversationItem};
+use crate::conversation::{
+    salvage_unfinished_hosted_searches, user_assistant_count, ConversationItem,
+};
 use crate::error::{EngineError, EngineResult};
 use crate::events::{AgentEvent, AgentObserver, NullObserver, UsageSummary};
 use crate::llm::client::LlmClient;
@@ -465,6 +467,8 @@ impl PhoneBuddyEngine {
         stream: bool,
     ) -> EngineResult<ConversationRequest> {
         let hosted = HostedTool::for_conversation_request(
+            self.config.enable_web_search,
+            self.config.web_search_options.clone(),
             self.config.enable_x_search,
             self.config.x_search_options.clone(),
             self.config.api_backend,
@@ -740,13 +744,25 @@ impl PhoneBuddyEngine {
             };
             stamp_origin(&mut turn_items, &origin);
 
+            // grok-build keeps hosted search in the same SSE until it
+            // finishes. Proxies often close after `web_search_call`
+            // `in_progress`; salvage those into client web_search so the
+            // agent loop continues instead of returning the plan text.
+            let salvaged = salvage_unfinished_hosted_searches(&mut turn_items);
+            if !salvaged.is_empty() {
+                tracing::info!(
+                    count = salvaged.len(),
+                    "salvaged unfinished hosted web_search into client tool calls"
+                );
+            }
+
             let client_calls: Vec<ToolCall> = turn_items
                 .iter()
                 .rev()
                 .find_map(|i| i.as_assistant().map(|a| a.tool_calls.clone()))
                 .unwrap_or_default();
 
-            // Surface hosted/backend tool call results to the observer.
+            // Surface completed hosted/backend tool call results to the observer.
             for item in &turn_items {
                 if let ConversationItem::BackendToolCall(b) = item {
                     let name = b.display_name();

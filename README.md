@@ -366,7 +366,7 @@ During execution, `PhoneBuddyEngine` emits structured JSON event objects to the 
 | `x_search_options` | Object | No | `null` | Optional configuration for `x_search` (e.g. `{"from_date": "2026-01-01", "to_date": "2026-08-28"}`). |
 | `agent_name` | String | No | `PhoneBuddy` | Identity used in the system prompt (`You are {agent_name}…`). Empty falls back to `PhoneBuddy`. |
 | `system_prompt_extra` | String | No | `null` | Custom persona or product instructions appended to system prompt |
-| `stream_idle_timeout_secs`| Integer | No | `120` | Streaming connection idle timeout in seconds |
+| `stream_idle_timeout_secs`| Integer | No | `300` | Streaming connection idle timeout in seconds (matches grok-build) |
 | `max_retries` | Integer | No | `5` | Maximum exponential backoff retry attempts in single-provider mode. Ignored for failover decisions when `fallback_providers` is set. See [docs/retry-and-provider-fallback.md](docs/retry-and-provider-fallback.md) |
 | `fallback_providers` | Array | No | `[]` | Ordered backup HTTP endpoints. Non-empty enables chain mode (fast-fail ~6s per provider, then switch). Empty keeps historical single-provider behaviour |
 | `failover_max_attempts` | Integer | No | `3` | Chain mode only: total tries per provider per request (initial + 2 retries) |

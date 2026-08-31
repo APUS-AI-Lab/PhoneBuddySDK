@@ -1,8 +1,11 @@
 //! `web_search` tool.
 //!
-//! Search always runs as a **client function tool**, never inlined in the
-//! agent Responses SSE (that is grok-build's hosted `{type: web_search}`
-//! server-side loop, which stalls buffering proxies).
+//! grok-build inlines hosted `{type: web_search}` on the agent Responses
+//! SSE when the model exposes backend search. This client function tool
+//! is the fallback used when:
+//! - hosted search is off for the provider, or
+//! - the stream closed while a `web_search_call` was still `in_progress`
+//!   (buffering proxies) and the engine salvaged it into a client call.
 //!
 //! Order:
 //! 1. iOS/Android: DuckDuckGo Lite in the host WebView, unless a recent

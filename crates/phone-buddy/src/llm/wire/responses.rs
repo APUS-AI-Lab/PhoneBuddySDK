@@ -441,6 +441,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_search_call_searching_is_server_tool_progress() {
+        let chunk = parse_responses_chunk(
+            "response.web_search_call.searching",
+            &serde_json::json!({
+                "type": "response.web_search_call.searching",
+                "item_id": "ws_abc",
+                "output_index": 2
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .expect("searching must not be dropped");
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.kind.as_deref(), Some("server"));
+        assert_eq!(tc.id.as_deref(), Some("ws_abc"));
+        assert_eq!(
+            tc.function.as_ref().unwrap().name.as_deref(),
+            Some("web_search")
+        );
+        assert!(tc.function.as_ref().unwrap().arguments.is_none());
+    }
+
+    #[test]
+    fn parse_web_search_call_in_progress_without_item_is_server_tool() {
+        let chunk = parse_responses_chunk(
+            "response.web_search_call.in_progress",
+            &serde_json::json!({
+                "type": "response.web_search_call.in_progress",
+                "item_id": "ws_1",
+                "output_index": 0
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .expect("in_progress must not be dropped");
+        assert_eq!(
+            chunk.choices[0].delta.tool_calls[0].id.as_deref(),
+            Some("ws_1")
+        );
+    }
+
+    #[test]
     fn responses_payload_local_shell_and_custom_tool_serialization() {
         let r = req(vec![
             ConversationItem::Assistant(AssistantItem {
@@ -784,6 +826,32 @@ pub fn parse_responses_chunk(
         delta
             .tool_calls
             .push(function_call_arguments_event(&v, args));
+    } else if (type_str.contains("web_search_call") || json_type.contains("web_search_call"))
+        && !type_str.contains("output_item")
+        && !json_type.contains("output_item")
+    {
+        // grok-build treats `response.web_search_call.in_progress|searching|completed`
+        // as real progress (resets idle). These frames have item_id, not a
+        // full `item` snapshot — without this branch they were dropped.
+        let id = v
+            .get("item_id")
+            .or_else(|| v.get("id"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        delta.tool_calls.push(ToolCallDelta {
+            index: output_index_of(&v),
+            id,
+            item_id: v
+                .get("item_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            kind: Some("server".to_string()),
+            function: Some(ToolCallFunctionDelta {
+                name: Some("web_search".to_string()),
+                arguments: None,
+            }),
+            thought_signature: None,
+        });
     } else if type_str.contains("custom_tool_call_input.delta")
         || json_type.contains("custom_tool_call_input.delta")
     {

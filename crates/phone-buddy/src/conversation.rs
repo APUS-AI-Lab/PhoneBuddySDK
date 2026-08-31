@@ -268,9 +268,10 @@ impl UserItem {
         if audios > MAX_AUDIOS_PER_TURN {
             return Err(EngineError::TooManyAudio(audios));
         }
-        let has_text = self.parts.iter().any(|p| {
-            matches!(p, UserContentPart::Text { text } if !text.trim().is_empty())
-        });
+        let has_text = self
+            .parts
+            .iter()
+            .any(|p| matches!(p, UserContentPart::Text { text } if !text.trim().is_empty()));
         if images == 0 && audios == 0 && !has_text {
             return Err(EngineError::InvalidUserTurn(
                 "turn has no text, image, or audio parts".into(),
@@ -313,7 +314,10 @@ impl UserItem {
                     if *byte_size > MAX_AUDIO_BYTES {
                         return Err(EngineError::AttachmentInvalid(
                             attachment_id.clone(),
-                            format!("audio exceeds maximum size ({} > {MAX_AUDIO_BYTES})", byte_size),
+                            format!(
+                                "audio exceeds maximum size ({} > {MAX_AUDIO_BYTES})",
+                                byte_size
+                            ),
                         ));
                     }
                 }
@@ -334,8 +338,8 @@ struct UserTurnV2Wire {
 
 /// Parse a versioned `pb_engine_chat_v2` turn JSON. No text fallback.
 pub fn parse_user_turn_v2(json: &str) -> EngineResult<UserItem> {
-    let turn: UserTurnV2Wire = serde_json::from_str(json)
-        .map_err(|e| EngineError::InvalidUserTurn(e.to_string()))?;
+    let turn: UserTurnV2Wire =
+        serde_json::from_str(json).map_err(|e| EngineError::InvalidUserTurn(e.to_string()))?;
     if turn.schema_version != 1 {
         return Err(EngineError::InvalidUserTurn(format!(
             "unsupported schema_version {}",
@@ -398,6 +402,101 @@ impl BackendToolCallItem {
         }
         server_tool_function_name(&self.item_type)
     }
+
+    pub fn status(&self) -> Option<&str> {
+        self.payload.get("status").and_then(|v| v.as_str())
+    }
+
+    /// Hosted `{type: web_search}` that the server did not finish.
+    ///
+    /// grok-build keeps the Responses stream open until search completes.
+    /// Buffering proxies often close after the `web_search_call` lands
+    /// with `status: in_progress` and empty `sources`. Those turns must
+    /// not be treated as a final answer.
+    pub fn is_unfinished_hosted_search(&self) -> bool {
+        let name = self.display_name();
+        if name != "web_search" && self.item_type != "web_search_call" {
+            return false;
+        }
+        match self.status() {
+            Some("completed") | Some("failed") => false,
+            Some("in_progress") | Some("incomplete") | Some("searching") => true,
+            _ => self
+                .payload
+                .pointer("/action/sources")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.is_empty()),
+        }
+    }
+
+    /// Client `web_search` function call that can finish a truncated hosted search.
+    pub fn to_client_web_search_call(&self) -> ToolCall {
+        let query = self
+            .payload
+            .pointer("/action/query")
+            .or_else(|| self.payload.pointer("/arguments/query"))
+            .or_else(|| self.payload.get("query"));
+        let arguments = match query {
+            Some(q) => serde_json::json!({ "query": q }).to_string(),
+            None => self
+                .payload
+                .get("action")
+                .or_else(|| self.payload.get("arguments"))
+                .map(|v| {
+                    if let Some(s) = v.as_str() {
+                        s.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "{}".into()),
+        };
+        let id = if self.id.is_empty() {
+            "ws_salvage".to_string()
+        } else {
+            self.id.clone()
+        };
+        ToolCall {
+            id,
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "web_search".into(),
+                arguments,
+            },
+            thought_signature: None,
+        }
+    }
+}
+
+/// Rewrite unfinished hosted `web_search_call` items into client function
+/// calls on the assistant item so the engine can execute DuckDuckGo /
+/// hosted-search fallback instead of stopping the turn.
+pub fn salvage_unfinished_hosted_searches(items: &mut Vec<ConversationItem>) -> Vec<ToolCall> {
+    let mut salvaged = Vec::new();
+    items.retain(|item| {
+        if let ConversationItem::BackendToolCall(b) = item {
+            if b.is_unfinished_hosted_search() {
+                salvaged.push(b.to_client_web_search_call());
+                return false;
+            }
+        }
+        true
+    });
+    if salvaged.is_empty() {
+        return salvaged;
+    }
+    if let Some(a) = items.iter_mut().rev().find_map(|i| i.as_assistant_mut()) {
+        a.tool_calls.extend(salvaged.clone());
+    } else {
+        items.push(ConversationItem::Assistant(AssistantItem {
+            content: String::new(),
+            tool_calls: salvaged.clone(),
+            reasoning_content: None,
+            encrypted_reasoning: None,
+            origin: None,
+        }));
+    }
+    salvaged
 }
 
 impl ConversationItem {
@@ -526,7 +625,11 @@ pub fn server_tool_function_name(item_type: &str) -> String {
 
 /// Reconstruct a minimal Responses payload from a legacy `kind == "server"`
 /// tool call. Documented lossy: only `type`/`id`/`action`/`arguments` survive.
-pub fn reconstruct_backend_payload(item_type: &str, id: &str, arguments: &str) -> serde_json::Value {
+pub fn reconstruct_backend_payload(
+    item_type: &str,
+    id: &str,
+    arguments: &str,
+) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
         "type".into(),
@@ -585,11 +688,8 @@ pub fn items_from_chat_messages(messages: &[ChatMessage]) -> Vec<ConversationIte
                 for tc in &msg.tool_calls {
                     if tc.kind == "server" {
                         let item_type = server_tool_item_type(&tc.function.name);
-                        let payload = reconstruct_backend_payload(
-                            &item_type,
-                            &tc.id,
-                            &tc.function.arguments,
-                        );
+                        let payload =
+                            reconstruct_backend_payload(&item_type, &tc.id, &tc.function.arguments);
                         out.push(ConversationItem::BackendToolCall(BackendToolCallItem {
                             item_type,
                             id: tc.id.clone(),
@@ -758,7 +858,12 @@ pub fn backend_to_legacy_tool_call(b: &BackendToolCallItem) -> ToolCall {
 pub fn user_assistant_count(items: &[ConversationItem]) -> usize {
     items
         .iter()
-        .filter(|i| matches!(i, ConversationItem::User(_) | ConversationItem::Assistant(_)))
+        .filter(|i| {
+            matches!(
+                i,
+                ConversationItem::User(_) | ConversationItem::Assistant(_)
+            )
+        })
         .count()
 }
 
@@ -945,7 +1050,8 @@ mod tests {
 
     #[test]
     fn parse_user_turn_v2_rejects_unknown_schema_and_too_many_images() {
-        let bad_ver = r#"{"schema_version":2,"type":"user_turn","parts":[{"type":"text","text":"hi"}]}"#;
+        let bad_ver =
+            r#"{"schema_version":2,"type":"user_turn","parts":[{"type":"text","text":"hi"}]}"#;
         match parse_user_turn_v2(bad_ver) {
             Err(EngineError::InvalidUserTurn(msg)) => assert!(msg.contains("schema_version")),
             other => panic!("{other:?}"),
@@ -1087,5 +1193,121 @@ mod tests {
             parse_user_turn_v2(&exceeds_short.to_string()),
             Err(EngineError::AttachmentInvalid(_, msg)) if msg.contains("exceeds 1024x768")
         ));
+    }
+
+    fn backend_search(id: &str, payload: serde_json::Value) -> ConversationItem {
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            item_type: "web_search_call".into(),
+            id: id.into(),
+            payload,
+        })
+    }
+
+    #[test]
+    fn unfinished_hosted_search_detects_in_progress_and_empty_sources() {
+        let in_progress = BackendToolCallItem {
+            item_type: "web_search_call".into(),
+            id: "ws_1".into(),
+            payload: serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "in_progress",
+                "action": {"type": "search", "query": "today news", "sources": []}
+            }),
+        };
+        assert!(in_progress.is_unfinished_hosted_search());
+        let call = in_progress.to_client_web_search_call();
+        assert_eq!(call.id, "ws_1");
+        assert_eq!(call.kind, "function");
+        assert_eq!(call.function.name, "web_search");
+        assert_eq!(call.function.arguments, r#"{"query":"today news"}"#);
+
+        let completed = BackendToolCallItem {
+            item_type: "web_search_call".into(),
+            id: "ws_2".into(),
+            payload: serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_2",
+                "status": "completed",
+                "action": {"type": "search", "query": "today news", "sources": []}
+            }),
+        };
+        assert!(!completed.is_unfinished_hosted_search());
+
+        let reconstructed_empty_sources = BackendToolCallItem {
+            item_type: "web_search_call".into(),
+            id: "ws_3".into(),
+            payload: serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_3",
+                "action": {"type": "search", "query": "today news", "sources": []}
+            }),
+        };
+        assert!(reconstructed_empty_sources.is_unfinished_hosted_search());
+
+        let reconstructed_query_only = BackendToolCallItem {
+            item_type: "web_search_call".into(),
+            id: "ws_4".into(),
+            payload: serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_4",
+                "action": {"query": "today news"}
+            }),
+        };
+        assert!(!reconstructed_query_only.is_unfinished_hosted_search());
+    }
+
+    #[test]
+    fn salvage_moves_unfinished_hosted_search_onto_assistant_tool_calls() {
+        let mut items = vec![
+            backend_search(
+                "ws_1",
+                serde_json::json!({
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "in_progress",
+                    "action": {"type": "search", "query": "today news", "sources": []}
+                }),
+            ),
+            ConversationItem::assistant("先搜集今天的新闻。"),
+        ];
+        let salvaged = salvage_unfinished_hosted_searches(&mut items);
+        assert_eq!(salvaged.len(), 1);
+        assert_eq!(salvaged[0].function.arguments, r#"{"query":"today news"}"#);
+        assert!(items
+            .iter()
+            .all(|i| !matches!(i, ConversationItem::BackendToolCall(_))));
+        let assistant = items
+            .iter()
+            .find_map(|i| i.as_assistant())
+            .expect("assistant");
+        assert_eq!(assistant.content, "先搜集今天的新闻。");
+        assert_eq!(assistant.tool_calls.len(), 1);
+        assert_eq!(assistant.tool_calls[0].id, "ws_1");
+        assert_eq!(assistant.tool_calls[0].function.name, "web_search");
+    }
+
+    #[test]
+    fn salvage_leaves_completed_hosted_search_in_place() {
+        let mut items = vec![
+            backend_search(
+                "ws_ok",
+                serde_json::json!({
+                    "type": "web_search_call",
+                    "id": "ws_ok",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "today news",
+                        "sources": [{"type": "url", "url": "https://example.com"}]
+                    }
+                }),
+            ),
+            ConversationItem::assistant("Here is the latest news."),
+        ];
+        let salvaged = salvage_unfinished_hosted_searches(&mut items);
+        assert!(salvaged.is_empty());
+        assert!(matches!(items[0], ConversationItem::BackendToolCall(_)));
+        assert!(items[1].as_assistant().unwrap().tool_calls.is_empty());
     }
 }
