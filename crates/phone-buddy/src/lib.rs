@@ -33,6 +33,7 @@
 pub mod agent;
 pub mod config;
 pub mod conversation;
+pub mod diag;
 pub mod engine;
 pub mod error;
 pub mod events;

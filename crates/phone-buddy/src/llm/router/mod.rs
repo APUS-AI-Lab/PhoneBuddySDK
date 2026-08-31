@@ -152,6 +152,7 @@ impl LlmRouter {
             Ok(mut plan) => {
                 plan.generation = *generation;
                 plan.retry = pool.retry.clone();
+                emit_ranked_server_list(&plan, config, health, now);
                 Ok(plan)
             }
             Err(SelectError::FailFast { retry_after_ms }) => Err(EngineError::PoolExhausted {
@@ -240,6 +241,60 @@ impl LlmRouter {
             tracing::warn!("failed to persist router health at {}: {e}", path.display());
         }
     }
+}
+
+/// Ranked catalog dumped immediately before an LLM HTTP visit plan is used.
+///
+/// Goes through [`crate::diag`] so release `.so` builds still reach logcat;
+/// `tracing::info!` is compiled out of those binaries.
+fn emit_ranked_server_list(
+    plan: &VisitPlan,
+    config: &LlmRoutingConfig,
+    health: &HashMap<String, ProviderHealthRecord>,
+    now: DateTime<Utc>,
+) {
+    let window = Duration::from_secs(config.health.penalty_window_secs.max(1));
+    let pool = config.pools.get(&plan.pool_id);
+    let lines: Vec<String> = plan
+        .provider_ids
+        .iter()
+        .enumerate()
+        .map(|(rank, pid)| {
+            let member = pool.and_then(|p| p.members.iter().find(|m| m.provider_id == *pid));
+            let target = config.provider(pid);
+            let base = member.map(|m| m.base_score).unwrap_or(DEFAULT_BASE_SCORE);
+            let rec = health.get(pid);
+            let score = rec
+                .map(|r| r.effective_score(base, now, window))
+                .unwrap_or(base);
+            let group = member
+                .map(|m| m.routing_group.as_str())
+                .unwrap_or("default");
+            let url = target.map(|t| t.base_url.as_str()).unwrap_or("");
+            let model = target.map(|t| t.model.as_str()).unwrap_or("default");
+            let mut tags = String::new();
+            if rec.map(|r| r.is_cooling(now)).unwrap_or(false) {
+                let remaining = rec
+                    .map(|r| r.cooldown_remaining(now).as_secs())
+                    .unwrap_or(0);
+                tags.push_str(&format!(" [cooling: {remaining}s left]"));
+            }
+            if rank == 0 {
+                tags.push_str(" ★ PRIMARY");
+            }
+            format!(
+                "  #{rank} [score: {score} base={base}] {pid} ({url} | model: {model} | group: {group}){tags}"
+            )
+        })
+        .collect();
+    let msg = format!(
+        "[LLM Request] Pool '{}' Server List ({} servers, ranked by live score):\n{}",
+        plan.pool_id,
+        plan.provider_ids.len(),
+        lines.join("\n")
+    );
+    tracing::info!(target: "phone_buddy::router", "{msg}");
+    crate::diag::info("phone_buddy::router", &msg);
 }
 
 #[cfg(test)]
@@ -389,5 +444,24 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_visit_emits_ranked_server_list_to_diag() {
+        let _ = crate::diag::take_test_messages();
+        let router = LlmRouter::in_memory(two_provider_config(false)).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        router.record_trip_at("op1", "p-a", FailureClass::RetryableHttp, None, t);
+        let plan = router.plan_visit_at("main", t).unwrap();
+        assert_eq!(plan.provider_ids[0], "p-b");
+        let logs = crate::diag::take_test_messages();
+        let dump = logs
+            .iter()
+            .find(|line| line.contains("[LLM Request] Pool 'main' Server List"))
+            .expect("ranked server list should be dumped before the visit");
+        assert!(dump.contains("p-b"), "{dump}");
+        assert!(dump.contains("p-a"), "{dump}");
+        assert!(dump.contains("★ PRIMARY"), "{dump}");
+        assert!(dump.contains("[cooling:"), "{dump}");
     }
 }

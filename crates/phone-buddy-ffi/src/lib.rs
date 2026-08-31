@@ -1138,14 +1138,42 @@ pub unsafe extern "C" fn pb_string_free(ptr: *mut c_char) {
     }
 }
 
+fn forward_host_diag(level: i32, target: &str, message: &str) {
+    let cb = match GLOBAL_LOG_CALLBACK.read() {
+        Ok(guard) => *guard,
+        Err(_) => None,
+    };
+    let Some(cb) = cb else {
+        return;
+    };
+    let Ok(target_c) = CString::new(target) else {
+        return;
+    };
+    let sanitized = message.replace('\0', "");
+    let Ok(msg_c) = CString::new(sanitized) else {
+        return;
+    };
+    unsafe {
+        cb(level, target_c.as_ptr(), msg_c.as_ptr());
+    }
+}
+
 /// Initialize native logging for debugging.
 /// `min_level`: 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE, <=0=disabled.
 /// On Android, automatically attaches logcat layer alongside the host callback.
 /// In release builds (`release_max_level_off`), tracing macros are stripped at compile-time.
+/// Ranked server-list dumps use [`phone_buddy::diag`] so they still reach the
+/// host callback in those release binaries.
 #[no_mangle]
 pub unsafe extern "C" fn pb_init_logging(callback: PbLogCallback, min_level: i32) {
     if let Ok(mut guard) = GLOBAL_LOG_CALLBACK.write() {
         *guard = callback;
+    }
+
+    if callback.is_some() && min_level > 0 {
+        phone_buddy::diag::set_sink(Some(forward_host_diag));
+    } else {
+        phone_buddy::diag::set_sink(None);
     }
 
     if min_level <= 0 {

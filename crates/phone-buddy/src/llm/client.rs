@@ -576,6 +576,19 @@ impl LlmClient {
                 slot.fingerprint,
                 operation_id
             );
+            crate::diag::info(
+                "phone_buddy::client",
+                &format!(
+                    "[LLM Request] pool='{}' visit {}/{} -> '{}' (model='{}', fingerprint='{}', op={})",
+                    self.pool_id,
+                    visit_idx + 1,
+                    plan.provider_ids.len(),
+                    provider_id,
+                    slot.model,
+                    slot.fingerprint,
+                    operation_id
+                ),
+            );
 
             match self
                 .try_provider(
