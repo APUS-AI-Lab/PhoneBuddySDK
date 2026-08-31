@@ -956,6 +956,21 @@ impl HostedTool {
         Self::for_request_with_options(enable_web_search, None, enable_x_search, None, api_backend)
     }
 
+    /// Hosted tools that ride the **agent conversation** SSE.
+    ///
+    /// `{type: web_search}` is omitted on purpose. Inlining it turns the
+    /// agent stream into grok-build's server-side search loop; proxies
+    /// often go silent for tens of seconds and trip SSE idle timeout.
+    /// The client `web_search` function tool owns that capability
+    /// (DuckDuckGo first, then a *separate* hosted-search request).
+    pub fn for_conversation_request(
+        enable_x_search: bool,
+        x_search_options: Option<XSearchOptions>,
+        api_backend: ApiBackend,
+    ) -> Vec<Self> {
+        Self::for_request_with_options(false, None, enable_x_search, x_search_options, api_backend)
+    }
+
     /// Creates hosted tools with their respective options for the Responses API request.
     pub fn for_request_with_options(
         enable_web_search: bool,

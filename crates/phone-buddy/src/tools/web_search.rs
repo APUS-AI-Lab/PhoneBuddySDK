@@ -1,14 +1,18 @@
 //! `web_search` tool.
 //!
-//! Provides high-reliability web search with:
-//! 1. Primary on iOS/Android: DuckDuckGo Lite loaded in the host system WebView
-//!    (WKWebView / Android WebView) so TLS and cookies match a real browser.
-//! 2. Desktop / C hosts (`c_demo`, CLI): skip scraping and go straight to the
-//!    configured LLM search API.
-//! 3. Automatic resilience fallback: if the host WebView is blocked or fails,
-//!    retry via the LLM Responses / Messages / ChatCompletions API.
+//! Search always runs as a **client function tool**, never inlined in the
+//! agent Responses SSE (that is grok-build's hosted `{type: web_search}`
+//! server-side loop, which stalls buffering proxies).
+//!
+//! Order:
+//! 1. iOS/Android: DuckDuckGo Lite in the host WebView, unless a recent
+//!    failure put DDG in cooldown.
+//! 2. If DDG fails and the current pool member has `enable_web_search`,
+//!    a *separate* Responses request with `{type: web_search}` — the same
+//!    shape as grok-build's `WebSearchClient`, not the agent stream.
+//! 3. If that member has no hosted search, try later pool members that do.
 //! 4. Domain filtering (`allowed_domains`, `blocked_domains`).
-//! 5. Markdown hyperlink formatting `[Title](URL)` for easy source citations.
+//! 5. Markdown hyperlink formatting `[Title](URL)` for source citations.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +43,8 @@ pub struct WebSearchConfig {
     pub api_backend: Option<ApiBackend>,
     pub extra_headers: std::collections::HashMap<String, String>,
     pub extra_body: std::collections::HashMap<String, serde_json::Value>,
+    /// This credential set may call hosted `{type: web_search}` on Responses.
+    pub enable_web_search: bool,
 }
 
 pub struct WebSearchTool {
@@ -95,22 +101,73 @@ impl WebSearchTool {
         if let Some(provider) = &self.endpoint_provider {
             if let Some(ep) = provider.current_endpoint() {
                 if !ep.api_key.trim().is_empty() && !ep.base_url.trim().is_empty() {
-                    return WebSearchConfig {
-                        api_key: Some(ep.api_key),
-                        base_url: Some(ep.base_url),
-                        model: if ep.model.trim().is_empty() {
-                            self.config.model.clone()
-                        } else {
-                            Some(ep.model)
-                        },
-                        api_backend: Some(ep.api_backend),
-                        extra_headers: ep.extra_headers,
-                        extra_body: ep.extra_body,
-                    };
+                    return Self::config_from_endpoint(&ep, &self.config);
                 }
             }
         }
         self.config.clone()
+    }
+
+    fn config_from_endpoint(ep: &crate::llm::endpoint::LlmEndpoint, engine: &WebSearchConfig) -> WebSearchConfig {
+        WebSearchConfig {
+            api_key: Some(ep.api_key.clone()),
+            base_url: Some(ep.base_url.clone()),
+            model: if ep.model.trim().is_empty() {
+                engine.model.clone()
+            } else {
+                Some(ep.model.clone())
+            },
+            api_backend: Some(ep.api_backend),
+            extra_headers: ep.extra_headers.clone(),
+            extra_body: ep.extra_body.clone(),
+            enable_web_search: ep.enable_web_search,
+        }
+    }
+
+    /// Pool members that may run hosted `{type: web_search}` as a
+    /// separate request. Current member first, then the rest of the pool.
+    fn hosted_search_candidates(&self) -> Vec<(String, WebSearchConfig)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |out: &mut Vec<(String, WebSearchConfig)>,
+                    seen: &mut std::collections::HashSet<String>,
+                    id: String,
+                    cfg: WebSearchConfig| {
+            if !cfg.enable_web_search {
+                return;
+            }
+            if !matches!(cfg.api_backend, Some(ApiBackend::Responses)) {
+                return;
+            }
+            if !seen.insert(id.clone()) {
+                return;
+            }
+            out.push((id, cfg));
+        };
+
+        if let Some(provider) = &self.endpoint_provider {
+            if let Some(ep) = provider.current_endpoint() {
+                if !ep.api_key.trim().is_empty() && !ep.base_url.trim().is_empty() {
+                    let id = ep.provider_id.clone();
+                    push(&mut out, &mut seen, id, Self::config_from_endpoint(&ep, &self.config));
+                }
+            }
+            for ep in provider.fallback_endpoints() {
+                if ep.api_key.trim().is_empty() || ep.base_url.trim().is_empty() {
+                    continue;
+                }
+                let id = ep.provider_id.clone();
+                push(&mut out, &mut seen, id, Self::config_from_endpoint(&ep, &self.config));
+            }
+        } else {
+            push(
+                &mut out,
+                &mut seen,
+                "engine".to_string(),
+                self.resolved_fallback_config(),
+            );
+        }
+        out
     }
 
     pub fn from_engine_config(cfg: &crate::config::EngineConfig) -> Self {
@@ -141,6 +198,7 @@ impl WebSearchTool {
                 api_backend: Some(cfg.api_backend),
                 extra_headers: cfg.extra_headers.clone(),
                 extra_body: cfg.extra_body.clone(),
+                enable_web_search: cfg.enable_web_search,
             },
             webview,
         )
@@ -267,14 +325,15 @@ impl WebSearchTool {
         Ok(truncate_chars(output.trim(), MAX_TOTAL_OUTPUT_CHARS))
     }
 
-    /// Fallback search provider: Dispatches to LLM backend (Messages, Responses, or ChatCompletions) based on configuration.
+    /// Separate (non-agent-stream) LLM search. Responses backends send
+    /// hosted `{type: web_search}` the way grok-build's `WebSearchClient` does.
     async fn search_llm_fallback(
         &self,
+        config: &WebSearchConfig,
         query: &str,
         allowed_domains: &[String],
         blocked_domains: &[String],
     ) -> Result<String, String> {
-        let config = self.resolved_fallback_config();
         let backend = config.api_backend.unwrap_or_else(|| {
             match std::env::var("PHONEBUDDY_API_BACKEND").as_deref() {
                 Ok("messages") => ApiBackend::Messages,
@@ -627,8 +686,8 @@ impl Tool for WebSearchTool {
                 "beyond training knowledge. ",
                 "Prefer `allowed_domains` (e.g. [\"docs.rs\", \"github.com\"]) when looking up a specific library. ",
                 "After using results, cite relevant URLs as markdown links [Title](URL). ",
-                "On iOS/Android, searches DuckDuckGo Lite through the system WebView; ",
-                "otherwise uses the configured LLM API."
+                "On iOS/Android this first searches DuckDuckGo Lite through the system WebView, ",
+                "then falls back to the model's hosted web_search when the provider supports it."
             )
             .into(),
             parameters: schema_object(
@@ -667,12 +726,9 @@ impl Tool for WebSearchTool {
             ));
         }
 
-        // Unified search pipeline:
-        // 1. Mobile: host system WebView (WKWebView / Android WebView) with DuckDuckGo Lite.
-        //    - First checks if DuckDuckGo is in memory cooldown.
-        //    - If not in cooldown, performs a fast connectivity probe (5s) to avoid WebView timeouts.
-        // 2. Desktop / C hosts: skip scraping.
-        // 3. Fallback: configured LLM search API.
+        // 1. Mobile WebView + DuckDuckGo Lite (skipped while in cooldown).
+        // 2. Hosted `{type: web_search}` on a *separate* Responses request,
+        //    walking the pool until a member with enable_web_search succeeds.
         let webview_err = if self.webview.is_available() {
             if self.is_ddg_in_cooldown() {
                 tracing::info!(
@@ -725,49 +781,54 @@ impl Tool for WebSearchTool {
             None
         };
 
-        let backend = self.config.api_backend.unwrap_or(ApiBackend::ChatCompletions);
-        let backend_name = match backend {
-            ApiBackend::Messages => "Messages API",
-            ApiBackend::Responses => "Responses API",
-            ApiBackend::ChatCompletions => "ChatCompletions API",
-            ApiBackend::Gemini => "Gemini API",
+        let ddg_line = match &webview_err {
+            Some(err) => format!("1. DuckDuckGo: {err}\n"),
+            None => "1. System WebView: not available on this host (skipped)\n".to_string(),
         };
-        tracing::info!(
-            "[web_search] Executing LLM search API fallback ({backend_name}) for query='{query}'"
-        );
-        match self
-            .search_llm_fallback(&query, &allowed_domains, &blocked_domains)
-            .await
-        {
-            Ok(resp_results) => {
-                tracing::info!(
-                    "[web_search] LLM search fallback ({backend_name}) succeeded for query='{query}', result_len={}",
-                    resp_results.len()
-                );
-                if webview_err.is_some() {
-                    let notice = format!(
-                        "[Notice: DuckDuckGo search connection failed]\n\n{resp_results}"
+        let candidates = self.hosted_search_candidates();
+        if candidates.is_empty() {
+            tracing::warn!(
+                "[web_search] DuckDuckGo unavailable and no pool member exposes hosted web_search for query='{query}'"
+            );
+            return Ok(ToolOutput::new(format!(
+                "[WebSearch Error]: Search failed for query '{query}':\n{ddg_line}2. LLM hosted web_search: not available on this model (enableWebSearch=false); tried no further providers"
+            )));
+        }
+
+        let mut last_err = String::new();
+        for (provider_id, cfg) in &candidates {
+            tracing::info!(
+                "[web_search] Trying hosted {{type: web_search}} on '{provider_id}' (model={}) for query='{query}'",
+                cfg.model.as_deref().unwrap_or("default")
+            );
+            match self
+                .search_llm_fallback(cfg, &query, &allowed_domains, &blocked_domains)
+                .await
+            {
+                Ok(resp_results) => {
+                    tracing::info!(
+                        "[web_search] Hosted web_search on '{provider_id}' succeeded for query='{query}', result_len={}",
+                        resp_results.len()
                     );
-                    Ok(ToolOutput::new(notice))
-                } else {
-                    Ok(ToolOutput::new(resp_results))
+                    if webview_err.is_some() {
+                        return Ok(ToolOutput::new(format!(
+                            "[Notice: DuckDuckGo search connection failed; used hosted web_search on {provider_id}]\n\n{resp_results}"
+                        )));
+                    }
+                    return Ok(ToolOutput::new(resp_results));
+                }
+                Err(resp_err) => {
+                    tracing::warn!(
+                        "[web_search] Hosted web_search on '{provider_id}' failed for query='{query}': {resp_err}"
+                    );
+                    last_err = format!("{provider_id}: {resp_err}");
                 }
             }
-            Err(resp_err) => {
-                tracing::warn!(
-                    "[web_search] LLM search fallback ({backend_name}) failed for query='{query}': {resp_err}"
-                );
-                let ddg_line = match webview_err {
-                    Some(err) => format!("1. DuckDuckGo: {err}\n"),
-                    None => {
-                        "1. System WebView: not available on this host (skipped)\n".to_string()
-                    }
-                };
-                Ok(ToolOutput::new(format!(
-                    "[WebSearch Error]: Search failed for query '{query}':\n{ddg_line}2. LLM {backend_name} fallback: {resp_err}"
-                )))
-            }
         }
+
+        Ok(ToolOutput::new(format!(
+            "[WebSearch Error]: Search failed for query '{query}':\n{ddg_line}2. LLM hosted web_search: {last_err}"
+        )))
     }
 }
 
@@ -1168,6 +1229,7 @@ mod tests {
                 model: "grok-4.6".into(),
                 extra_headers: Default::default(),
                 extra_body: Default::default(),
+                enable_web_search: true,
             }),
         ));
         let resolved = tool.resolved_fallback_config();
@@ -1178,6 +1240,7 @@ mod tests {
         );
         assert_eq!(resolved.api_backend, Some(ApiBackend::Responses));
         assert_eq!(resolved.model.as_deref(), Some("grok-4.6"));
+        assert!(resolved.enable_web_search);
     }
 
     #[test]
@@ -1192,6 +1255,68 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("sk-engine"));
         assert_eq!(resolved.base_url.as_deref(), Some("https://api.x.ai/v1"));
         assert_eq!(resolved.api_backend, Some(ApiBackend::Responses));
+        assert!(!resolved.enable_web_search);
+    }
+
+    struct ChainEndpoints {
+        current: crate::llm::endpoint::LlmEndpoint,
+        rest: Vec<crate::llm::endpoint::LlmEndpoint>,
+    }
+
+    impl crate::llm::endpoint::LlmEndpointProvider for ChainEndpoints {
+        fn current_endpoint(&self) -> Option<crate::llm::endpoint::LlmEndpoint> {
+            Some(self.current.clone())
+        }
+        fn fallback_endpoints(&self) -> Vec<crate::llm::endpoint::LlmEndpoint> {
+            self.rest.clone()
+        }
+    }
+
+    fn ep(id: &str, backend: ApiBackend, hosted: bool) -> crate::llm::endpoint::LlmEndpoint {
+        crate::llm::endpoint::LlmEndpoint {
+            provider_id: id.into(),
+            api_key: format!("sk-{id}"),
+            base_url: format!("https://{id}.example/v1"),
+            api_backend: backend,
+            model: "grok-4.6".into(),
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            enable_web_search: hosted,
+        }
+    }
+
+    #[test]
+    fn hosted_search_candidates_skip_current_without_flag_and_walk_pool() {
+        let tool = WebSearchTool::new().with_endpoint_provider(Arc::new(ChainEndpoints {
+            current: ep("packy", ApiBackend::ChatCompletions, false),
+            rest: vec![
+                ep("openlux-gpt", ApiBackend::Responses, false),
+                ep("wududu-grok", ApiBackend::Responses, true),
+            ],
+        }));
+        let ids: Vec<_> = tool
+            .hosted_search_candidates()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["wududu-grok".to_string()]);
+    }
+
+    #[test]
+    fn hosted_search_candidates_prefer_current_when_it_has_hosted_search() {
+        let tool = WebSearchTool::new().with_endpoint_provider(Arc::new(ChainEndpoints {
+            current: ep("wududu-grok", ApiBackend::Responses, true),
+            rest: vec![ep("openlux-grok", ApiBackend::Responses, true)],
+        }));
+        let ids: Vec<_> = tool
+            .hosted_search_candidates()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["wududu-grok".to_string(), "openlux-grok".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1238,6 +1363,11 @@ mod tests {
         assert!(
             res.text.contains("System WebView: not available"),
             "expected skip-to-API path, got: {}",
+            res.text
+        );
+        assert!(
+            res.text.contains("enableWebSearch=false"),
+            "expected no hosted fallback when the flag is off, got: {}",
             res.text
         );
         assert!(!res.text.contains("DuckDuckGo returned"));
@@ -1314,8 +1444,9 @@ mod tests {
             "WebView should have been skipped during active cooldown"
         );
 
-        // Fallback error should report DuckDuckGo failure cleanly
+        // Fallback error should report DuckDuckGo failure and skip hosted search
         assert!(res.text.contains("DuckDuckGo: DuckDuckGo search connection failed"));
+        assert!(res.text.contains("enableWebSearch=false"));
 
         // Clear cooldown
         tool.clear_ddg_cooldown();

@@ -68,19 +68,13 @@ pub struct EngineConfig {
     /// Reasoning effort level for thinking models (e.g. Low, Medium, High).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Attach Grok-style backend-hosted search on the Responses API.
-    ///
-    /// When true and [`api_backend`] is [`ApiBackend::Responses`], the engine
-    /// adds `{ "type": "web_search" }` to the request `tools` array — the same
-    /// wire shape as Grok Build's `supports_backend_search`. The client-side
-    /// `web_search` function tool is then omitted from that request so the
-    /// two do not collide.
-    ///
-    /// This is **not** xAI Chat Completions `search_parameters` (Grok Build
-    /// never sends that field). Gateways that do not implement Grok hosted
-    /// search (for example PackyAPI) must leave this off; the local
-    /// DuckDuckGo / LLM-fallback `web_search` function tool stays registered
-    /// independently.
+    /// This model/gateway exposes hosted `{ "type": "web_search" }` on
+    /// Responses. The agent conversation does **not** inline that tool
+    /// (inlining it is grok-build's server-side search loop and stalls
+    /// buffering proxies). The client `web_search` function always tries
+    /// DuckDuckGo first; this flag only authorizes a *separate* hosted
+    /// search request after DDG fails. Gateways without hosted search
+    /// (PackyAPI, chat-completions models) must leave this off.
     #[serde(default)]
     pub enable_web_search: bool,
     /// Optional configuration options for WebSearch (allowed/excluded domains).
@@ -194,8 +188,8 @@ pub struct ProviderEndpoint {
     pub extra_headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub extra_body: std::collections::HashMap<String, serde_json::Value>,
-    /// Hosted `{type: web_search}` on Responses. Independent of the
-    /// client-side DuckDuckGo function tool.
+    /// Hosted `{type: web_search}` available as the function-tool fallback
+    /// after DuckDuckGo. Not inlined on the agent conversation SSE.
     #[serde(default)]
     pub enable_web_search: bool,
     /// Optional configuration options for WebSearch.
@@ -350,7 +344,7 @@ impl EngineConfig {
             .model(model)
     }
 
-    /// True when hosted `{type: web_search}` should ride the Responses request.
+    /// True when hosted `{type: web_search}` is available as a function-tool fallback.
     pub fn backend_search_active(&self) -> bool {
         self.enable_web_search && matches!(self.api_backend, ApiBackend::Responses)
     }

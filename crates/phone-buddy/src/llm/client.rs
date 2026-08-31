@@ -448,9 +448,10 @@ impl LlmClient {
             out.hosted_tools.clear();
             out.tool_choice = Some(serde_json::json!("none"));
         } else {
-            out.hosted_tools = HostedTool::for_request_with_options(
-                slot.enable_web_search,
-                slot.web_search_options.clone(),
+            // Never inline `{type: web_search}` on the agent SSE. That
+            // flag only authorizes the client function tool's hosted
+            // fallback (a separate request). x_search stays hosted.
+            out.hosted_tools = HostedTool::for_conversation_request(
                 slot.enable_x_search,
                 slot.x_search_options.clone(),
                 slot.api_backend,
@@ -1033,9 +1034,17 @@ fn has_incomplete_tool_calls(turn: &CollectedTurn) -> bool {
     })
 }
 
-/// Idle-timeout partial is already a usable tool-calling hop: execute it.
+/// Idle-timeout partial is already a usable *client* tool-calling hop.
+///
+/// Hosted/server tools (`web_search`, `x_search`, …) run inside the
+/// Responses stream. Timing out while they are in flight is not a completed
+/// hop — grok-build keeps the stream open (300s idle) until the model
+/// either emits a client function call or `response.completed`. Accepting a
+/// server-only partial here makes the engine stop with the model's progress
+/// text and never execute `write_file` / `edit_file`.
 fn should_accept_partial_as_complete(turn: &CollectedTurn) -> bool {
-    !turn.tool_calls.is_empty() && !has_incomplete_tool_calls(turn)
+    let has_client_tool = turn.tool_calls.iter().any(|tc| tc.kind != "server");
+    has_client_tool && !has_incomplete_tool_calls(turn)
 }
 
 /// Prefix-continue only when we have visible text and no tool calls at all.
@@ -1435,6 +1444,25 @@ impl LlmEndpointProvider for LlmClient {
             .last_success_provider_id(&snapshot)
             .or_else(|| self.primary_provider_id(&snapshot))?;
         self.endpoint_for_provider(&snapshot, &provider_id)
+    }
+
+    fn fallback_endpoints(&self) -> Vec<LlmEndpoint> {
+        if self.http_factory.is_none() {
+            return Vec::new();
+        }
+        let (_, snapshot) = self.router.snapshot();
+        let current_id = self
+            .last_success_provider_id(&snapshot)
+            .or_else(|| self.primary_provider_id(&snapshot));
+        let Some(pool) = snapshot.pools.get(&self.pool_id) else {
+            return Vec::new();
+        };
+        pool.members
+            .iter()
+            .filter(|m| m.enabled)
+            .filter(|m| current_id.as_deref() != Some(m.provider_id.as_str()))
+            .filter_map(|m| self.endpoint_for_provider(&snapshot, &m.provider_id))
+            .collect()
     }
 }
 
@@ -2356,6 +2384,61 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    struct HostedSearchThenIdle {
+        hits: Arc<AtomicU32>,
+    }
+
+    impl LlmTransport for HostedSearchThenIdle {
+        async fn request_stream(
+            &self,
+            _req: &ConversationRequest,
+        ) -> EngineResult<crate::llm::transport::ChunkStream> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            let stream = async_stream::stream! {
+                let mut d = ChatChunkDelta::default();
+                d.content = Some("材料已齐，正在写成一份 HTML。".into());
+                d.tool_calls.push(crate::llm::types::ToolCallDelta {
+                    index: 0,
+                    id: Some("ws_1".into()),
+                    kind: Some("server".into()),
+                    function: Some(crate::llm::types::ToolCallFunctionDelta {
+                        name: Some("web_search".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                    ..Default::default()
+                });
+                yield Ok(ChatCompletionChunk {
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: d,
+                        finish_reason: None,
+                    }],
+                    ..Default::default()
+                });
+                yield Err(EngineError::StreamIdleTimeout(Duration::from_secs(60)));
+            };
+            Ok(Box::pin(stream))
+        }
+
+        fn name(&self) -> &str {
+            "p"
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_with_hosted_web_search_does_not_accept_as_complete() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let t = Arc::new(HostedSearchThenIdle { hits: hits.clone() });
+        let client = LlmClient::new(t as Arc<dyn LlmTransportObj>, 5);
+        let observer = RecordingObserver::new();
+        let err = client.complete(&req(), &observer).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::StreamIdleTimeout(_)),
+            "hosted-only idle timeout must not look like a finished turn, got {err}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn skip_prefix_chunk_strips_matching_prefix() {
         let mut remaining = "Hello world".to_string();
@@ -2719,6 +2802,10 @@ mod tests {
         assert_eq!(ep.api_key, "sk-b");
         assert_eq!(ep.base_url, "https://cf.api.fan/v1");
         assert_eq!(ep.api_backend, ApiBackend::ChatCompletions);
+
+        let fallbacks = client.fallback_endpoints();
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(fallbacks[0].provider_id, "p1");
     }
 
     #[test]

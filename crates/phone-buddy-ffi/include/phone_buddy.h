@@ -349,6 +349,8 @@ void pb_string_free(char *ptr);
  * `min_level`: 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE, <=0=disabled.
  * On Android, automatically attaches logcat layer alongside the host callback.
  * In release builds (`release_max_level_off`), tracing macros are stripped at compile-time.
+ * Ranked server-list dumps use [`phone_buddy::diag`] so they still reach the
+ * host callback in those release binaries.
  */
 void pb_init_logging(PbLogCallback callback, int32_t min_level);
 

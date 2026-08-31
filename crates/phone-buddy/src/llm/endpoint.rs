@@ -20,6 +20,8 @@ pub struct LlmEndpoint {
     pub model: String,
     pub extra_headers: HashMap<String, String>,
     pub extra_body: HashMap<String, serde_json::Value>,
+    /// This provider's Responses API exposes hosted `{type: web_search}`.
+    pub enable_web_search: bool,
 }
 
 impl LlmEndpoint {
@@ -32,6 +34,7 @@ impl LlmEndpoint {
             model: target.model.clone(),
             extra_headers: target.extra_headers.clone(),
             extra_body: target.extra_body.clone(),
+            enable_web_search: target.enable_web_search,
         }
     }
 }
@@ -42,6 +45,12 @@ impl LlmEndpoint {
 /// host transports). Callers then fall back to a static snapshot / env.
 pub trait LlmEndpointProvider: Send + Sync {
     fn current_endpoint(&self) -> Option<LlmEndpoint>;
+    /// Other enabled pool members after `current_endpoint`, in declared
+    /// order. Used by `web_search` when DuckDuckGo fails and the current
+    /// model has no hosted `{type: web_search}`.
+    fn fallback_endpoints(&self) -> Vec<LlmEndpoint> {
+        Vec::new()
+    }
 }
 
 pub type SharedLlmEndpointProvider = Arc<dyn LlmEndpointProvider>;

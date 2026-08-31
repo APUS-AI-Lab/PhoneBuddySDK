@@ -373,9 +373,7 @@ impl TaskManager {
             let mut req_items = vec![ConversationItem::system(&system_prompt)];
             req_items.extend(items.clone());
 
-            let hosted = HostedTool::for_request_with_options(
-                self.config.enable_web_search,
-                self.config.web_search_options.clone(),
+            let hosted = HostedTool::for_conversation_request(
                 self.config.enable_x_search,
                 self.config.x_search_options.clone(),
                 self.config.api_backend,

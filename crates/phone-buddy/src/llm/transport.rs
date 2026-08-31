@@ -1197,6 +1197,13 @@ mod tests {
         assert!(HostedTool::for_request(true, true, ApiBackend::Messages).is_empty());
         assert!(HostedTool::for_request(true, true, ApiBackend::Gemini).is_empty());
         assert!(HostedTool::for_request(false, false, ApiBackend::Responses).is_empty());
+        assert!(
+            HostedTool::for_conversation_request(false, None, ApiBackend::Responses).is_empty()
+        );
+        assert_eq!(
+            HostedTool::for_conversation_request(true, None, ApiBackend::Responses),
+            vec![HostedTool::XSearch { options: None }]
+        );
     }
 
     #[test]
