@@ -14,12 +14,19 @@ use crate::conversation::{ImageDetail, UserContentPart, UserItem};
 use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{ChatCompletionChunk, ConversationRequest};
 
-/// One protocol's request builder + SSE parser.
+/// One protocol's request builder plus streaming and buffered parsers.
 pub(crate) trait WireAdapter {
     fn endpoint(&self, base: &str, model: &str, stream: bool) -> String;
     fn build_payload(&self, req: &ConversationRequest) -> EngineResult<serde_json::Value>;
     /// One SSE frame → zero or one internal chunk (unchanged chunk model).
     fn parse_event(&self, event: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>>;
+    /// One complete JSON response → zero or one internal chunk.
+    ///
+    /// Protocols whose buffered response has the same shape as an SSE data
+    /// frame can use the default implementation.
+    fn parse_response(&self, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+        self.parse_event("", data)
+    }
 }
 
 fn require_image(

@@ -32,6 +32,10 @@ pub type ChunkStream =
 #[derive(Default)]
 pub struct LlmTurnContext {
     turn_states: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Optional request timeout assigned by the routed client for the current
+    /// provider visit. Agent turns leave this unset; one-shot operations use
+    /// it to preserve time for later providers in the same deadline.
+    request_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
 impl LlmTurnContext {
@@ -49,6 +53,16 @@ impl LlmTurnContext {
     pub(crate) fn set_turn_state(&self, transport_key: &str, state: String) {
         if let Ok(mut states) = self.turn_states.lock() {
             states.insert(transport_key.to_string(), state);
+        }
+    }
+
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout.lock().ok().and_then(|timeout| *timeout)
+    }
+
+    pub(crate) fn set_request_timeout(&self, timeout: Option<Duration>) {
+        if let Ok(mut current) = self.request_timeout.lock() {
+            *current = timeout;
         }
     }
 }
@@ -267,10 +281,10 @@ impl HttpTransport {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn endpoint(&self) -> String {
-        self.endpoint_for_model("")
+        self.endpoint_for_model("", true)
     }
 
-    fn endpoint_for_model(&self, model: &str) -> String {
+    fn endpoint_for_model(&self, model: &str, stream: bool) -> String {
         let trimmed = self.base_url.trim_end_matches('/');
         let root = if let Some(stripped) = trimmed.strip_suffix("/chat/completions") {
             stripped
@@ -281,7 +295,7 @@ impl HttpTransport {
         } else {
             trimmed
         };
-        adapter_for(self.api_backend).endpoint(root, model, true)
+        adapter_for(self.api_backend).endpoint(root, model, stream)
     }
 }
 
@@ -397,7 +411,8 @@ impl HttpTransport {
         context: &LlmTurnContext,
     ) -> EngineResult<ChunkStream> {
         let adapter = adapter_for(self.api_backend);
-        let endpoint = self.endpoint_for_model(&req.model);
+        let requested_stream = req.stream.unwrap_or(true);
+        let endpoint = self.endpoint_for_model(&req.model, requested_stream);
         let mut builder = self.client.post(&endpoint);
 
         let mut req_headers_map = std::collections::BTreeMap::new();
@@ -412,6 +427,9 @@ impl HttpTransport {
         );
 
         for (k, v) in profile_headers {
+            if k.eq_ignore_ascii_case("accept") {
+                continue;
+            }
             builder = builder.header(&k, &v);
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(&k, &v));
         }
@@ -435,14 +453,12 @@ impl HttpTransport {
 
         // 2. Extra headers override anything from the profile
         for (k, v) in &self.extra_headers {
+            if k.eq_ignore_ascii_case("accept") {
+                continue;
+            }
             builder = builder.header(k, v);
             req_headers_map.insert(k.to_ascii_lowercase(), self.dumper.mask_header_value(k, v));
         }
-
-        // grok-build sets Accept last on the streaming request so a proxy
-        // cannot treat the body as a buffered JSON document.
-        builder = builder.header("accept", "text/event-stream");
-        req_headers_map.insert("accept".to_string(), "text/event-stream".to_string());
 
         let mut body = adapter.build_payload(req)?;
 
@@ -490,6 +506,23 @@ impl HttpTransport {
         }
 
         merge_extra_body(&mut body, &self.extra_body);
+        let streaming = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(requested_stream);
+        let request_timeout = context.request_timeout();
+        if let Some(timeout) = request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        let accept = if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        // Set Accept after profile and custom headers. A buffered one-shot
+        // must not be routed through a proxy's SSE-specific path.
+        builder = builder.header("accept", accept);
+        req_headers_map.insert("accept".to_string(), accept.to_string());
         req_headers_map.insert("content-type".to_string(), "application/json".to_string());
 
         let hosted_names = req
@@ -501,11 +534,15 @@ impl HttpTransport {
         crate::diag::info(
             "phone_buddy::sse",
             &format!(
-                "[HTTP] POST {} stream={} hosted=[{}] idle={}s accept=text/event-stream",
+                "[HTTP] POST {} stream={} hosted=[{}] idle={}s request_timeout_ms={} accept={}",
                 endpoint,
-                body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+                streaming,
                 hosted_names,
-                self.idle_timeout.as_secs()
+                self.idle_timeout.as_secs(),
+                request_timeout
+                    .map(|timeout| timeout.as_millis().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                accept,
             ),
         );
 
@@ -623,6 +660,95 @@ impl HttpTransport {
                 self.idle_timeout.as_secs()
             ),
         );
+
+        if !streaming {
+            let resp_headers_dump = self.dumper.extract_headers(resp.headers());
+            let status_text = resp.status().canonical_reason().unwrap_or("OK").to_string();
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    let mut msg = format!("error reading buffered response: {e}");
+                    if self.dumper.should_dump_error() {
+                        let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                            schema_version: "1.0".into(),
+                            request_id: req_id,
+                            timestamp: timestamp_str,
+                            duration_ms: start_time.elapsed().as_millis() as u64,
+                            request: req_dump,
+                            response: Some(crate::llm::dumper::HttpResponseDump {
+                                status,
+                                status_text,
+                                headers: resp_headers_dump,
+                                body_text: String::new(),
+                            }),
+                            error: Some(msg.clone()),
+                        };
+                        if let Some(path) = self.dumper.dump(&dump_rec) {
+                            msg.push_str(&format!(" [HTTP dump: {}]", path.display()));
+                        }
+                    }
+                    return Err(EngineError::Llm(msg));
+                }
+            };
+
+            crate::diag::info(
+                "phone_buddy::sse",
+                &format!(
+                    "[HTTP] buffered response bytes={} elapsed={}ms",
+                    text.len(),
+                    start_time.elapsed().as_millis()
+                ),
+            );
+
+            let parsed = match adapter.parse_response(&text) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let mut msg = e.to_string();
+                    if self.dumper.should_dump_error() {
+                        let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                            schema_version: "1.0".into(),
+                            request_id: req_id,
+                            timestamp: timestamp_str,
+                            duration_ms: start_time.elapsed().as_millis() as u64,
+                            request: req_dump,
+                            response: Some(crate::llm::dumper::HttpResponseDump {
+                                status,
+                                status_text,
+                                headers: resp_headers_dump,
+                                body_text: text,
+                            }),
+                            error: Some(msg.clone()),
+                        };
+                        if let Some(path) = self.dumper.dump(&dump_rec) {
+                            msg.push_str(&format!(" [HTTP dump: {}]", path.display()));
+                        }
+                    }
+                    return Err(EngineError::Stream(msg));
+                }
+            };
+
+            if self.dumper.should_dump_success() {
+                let dump_rec = crate::llm::dumper::HttpDumpRecord {
+                    schema_version: "1.0".into(),
+                    request_id: req_id,
+                    timestamp: timestamp_str,
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                    request: req_dump,
+                    response: Some(crate::llm::dumper::HttpResponseDump {
+                        status,
+                        status_text,
+                        headers: resp_headers_dump,
+                        body_text: text,
+                    }),
+                    error: None,
+                };
+                self.dumper.dump(&dump_rec);
+            }
+
+            return Ok(Box::pin(futures_util::stream::iter(
+                parsed.into_iter().map(Ok),
+            )));
+        }
 
         if self.dumper.should_dump_success() {
             let resp_headers_dump = self.dumper.extract_headers(resp.headers());
@@ -1097,6 +1223,37 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    async fn read_http_request_with_body(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     fn conv(req: ChatCompletionRequest) -> ConversationRequest {
         ConversationRequest::from_chat(req)
     }
@@ -1360,9 +1517,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            t_gem.endpoint_for_model("gemini-2.5-flash"),
+            t_gem.endpoint_for_model("gemini-2.5-flash", true),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
         );
+        assert_eq!(
+            t_gem.endpoint_for_model("gemini-2.5-flash", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_requests_return_collected_text_for_every_backend() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = observed_requests.clone();
+        let response_bodies = vec![
+            serde_json::json!({
+                "id": "chatcmpl_buffered",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "聊天标题"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "resp_buffered",
+                "object": "response",
+                "status": "completed",
+                "model": "qwen3.8-flash",
+                "output": [{
+                    "id": "msg_buffered",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "响应标题", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 11, "output_tokens": 2, "total_tokens": 13}
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "msg_buffered",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-haiku",
+                "content": [{"type": "text", "text": "消息标题"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 12, "output_tokens": 2}
+            })
+            .to_string(),
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "双子标题"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 13,
+                    "candidatesTokenCount": 2,
+                    "totalTokenCount": 15
+                },
+                "modelVersion": "gemini-flash"
+            })
+            .to_string(),
+        ];
+        let server = tokio::spawn(async move {
+            for body in response_bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request_with_body(&mut socket).await;
+                server_requests.lock().unwrap().push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let request = conv(ChatCompletionRequest {
+            model: "ignored-by-router".into(),
+            messages: vec![ChatMessage::user("Title this")],
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: Some(32),
+            reasoning_effort: None,
+            search_parameters: None,
+            hosted_tools: vec![],
+            previous_response_id: None,
+        });
+        let base_url = format!("http://{address}/v1");
+        let mut titles = Vec::new();
+        for backend in [
+            ApiBackend::ChatCompletions,
+            ApiBackend::Responses,
+            ApiBackend::Messages,
+            ApiBackend::Gemini,
+        ] {
+            let transport = HttpTransport::new(
+                &base_url,
+                "test-key",
+                Duration::from_secs(2),
+                backend,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            let stream = transport.request_stream(&request).await.unwrap();
+            let turn = crate::llm::stream::collect_stream(
+                stream,
+                &crate::events::NullObserver,
+            )
+            .await
+            .unwrap();
+            titles.push(turn.text);
+        }
+        server.await.unwrap();
+
+        assert_eq!(titles, vec!["聊天标题", "响应标题", "消息标题", "双子标题"]);
+        let requests = observed_requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter() {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("accept: application/json"));
+            assert!(!lower.contains("accept: text/event-stream"));
+            let body = request.split("\r\n\r\n").nth(1).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+            if let Some(stream) = payload.get("stream") {
+                assert_eq!(stream, false);
+            }
+            assert!(payload.get("stream_options").is_none());
+        }
     }
 
     #[test]

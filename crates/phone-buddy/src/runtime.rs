@@ -322,10 +322,17 @@ impl PhoneBuddyRuntime {
         }
 
         let conv = one_shot_conversation_request(&request);
+        let operation_timeout = request.timeout_ms.map(Duration::from_millis);
 
         let work = async {
             let session = client.begin_turn();
-            session.complete(&conv, &OneShotDiagnostics).await
+            session
+                .complete_with_operation_timeout(
+                    &conv,
+                    &OneShotDiagnostics,
+                    operation_timeout,
+                )
+                .await
         };
 
         let turn = if let Some(ms) = request.timeout_ms {
@@ -386,7 +393,10 @@ fn one_shot_conversation_request(request: &GenerateTextRequest) -> ConversationR
     ConversationRequest {
         model: String::new(),
         items,
-        stream: Some(true),
+        // One-shot callers only observe the terminal callback. Asking the
+        // provider for SSE adds a proxy/parser failure mode without exposing
+        // any incremental value to the host.
+        stream: Some(false),
         tools: None,
         tool_choice: Some(serde_json::json!("none")),
         temperature: request.temperature,
@@ -809,6 +819,11 @@ mod generate_text_tests {
         let captured = t.captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let conv = &captured[0];
+        assert_eq!(
+            conv.stream,
+            Some(false),
+            "one-shot returns only a terminal result and must not depend on SSE"
+        );
         assert!(conv.tools.is_none(), "one-shot must not send tools");
         assert_eq!(
             conv.tool_choice.as_ref().and_then(|v| v.as_str()),
@@ -1066,6 +1081,44 @@ mod generate_text_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::OperationTimedOut));
+    }
+
+    #[tokio::test]
+    async fn timeout_budget_leaves_time_for_the_next_provider() {
+        let hung = HangTransport::new();
+        let healthy = CapturingTransport::new("p-healthy", "Recovered title");
+        let (_dir, runtime) = title_runtime(
+            vec![
+                target_with("p-hung", ApiBackend::Responses, false),
+                target_with("p-healthy", ApiBackend::Responses, false),
+            ],
+            vec![member("p-hung", 0), member("p-healthy", 1)],
+            ExhaustionPolicy::ProbeEarliest,
+        );
+        let mut transports: HashMap<String, Arc<dyn LlmTransportObj>> = HashMap::new();
+        transports.insert("p-hung".into(), hung.clone() as Arc<dyn LlmTransportObj>);
+        transports.insert(
+            "p-healthy".into(),
+            healthy.clone() as Arc<dyn LlmTransportObj>,
+        );
+        let mut request = req();
+        request.timeout_ms = Some(200);
+
+        let result = runtime
+            .generate_text_with_transports(request, transports, CancellationToken::new())
+            .await
+            .expect("a hung provider must not consume the fallback's budget");
+
+        assert_eq!(result.text, "Recovered title");
+        assert_eq!(result.provider_id, "p-healthy");
+        assert_eq!(result.attempts, 2);
+        assert_eq!(hung.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy.captured.lock().unwrap().len(), 1);
+        assert!(runtime
+            .router()
+            .health_record("p-hung")
+            .expect("hung provider health")
+            .is_cooling(chrono::Utc::now()));
     }
 
     #[tokio::test]

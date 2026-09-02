@@ -1,7 +1,7 @@
 //! OpenAI-compatible Chat Completions adapter. Also the host-transport contract.
 
 use crate::conversation::{backend_call_summary, chat_messages_from_items, ConversationItem};
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{
     sanitize_tool_arguments, ChatCompletionChunk, ChatCompletionRequest, ConversationRequest, Role,
 };
@@ -22,13 +22,22 @@ impl WireAdapter for ChatCompletionsAdapter {
     fn parse_event(&self, _event: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
         crate::llm::stream::parse_chunk(data)
     }
+
+    fn parse_response(&self, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+        parse_chat_completions_response(data)
+    }
 }
 
 pub fn build_chat_completions_payload(req: &ConversationRequest) -> EngineResult<serde_json::Value> {
     let host = items_to_chat_request(req)?;
     let mut val = serde_json::to_value(&host).unwrap_or_else(|_| serde_json::json!({}));
-    val["stream"] = serde_json::Value::Bool(true);
-    val["stream_options"] = serde_json::json!({ "include_usage": true });
+    let streaming = req.stream.unwrap_or(true);
+    val["stream"] = serde_json::Value::Bool(streaming);
+    if streaming {
+        val["stream_options"] = serde_json::json!({ "include_usage": true });
+    } else if let Some(obj) = val.as_object_mut() {
+        obj.remove("stream_options");
+    }
     if let Some(arr) = val.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for m in arr {
             if let Some(obj) = m.as_object_mut() {
@@ -42,6 +51,35 @@ pub fn build_chat_completions_payload(req: &ConversationRequest) -> EngineResult
         val["response_format"] = format.to_chat_completions();
     }
     Ok(val)
+}
+
+/// Convert a buffered Chat Completions response (`choices[].message`) into
+/// the internal chunk shape used by the stream collector (`choices[].delta`).
+pub fn parse_chat_completions_response(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+    let mut value: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+        EngineError::Stream(format!(
+            "failed to parse buffered Chat Completions response: {e}: {data:.120}"
+        ))
+    })?;
+    if let Some(choices) = value.get_mut("choices").and_then(|v| v.as_array_mut()) {
+        for choice in choices {
+            let Some(obj) = choice.as_object_mut() else {
+                continue;
+            };
+            if !obj.contains_key("delta") {
+                if let Some(message) = obj.remove("message") {
+                    obj.insert("delta".into(), message);
+                }
+            }
+        }
+    }
+    let chunk: ChatCompletionChunk = serde_json::from_value(value).map_err(|e| {
+        EngineError::Stream(format!("invalid buffered Chat Completions response: {e}"))
+    })?;
+    if chunk.choices.is_empty() && chunk.usage.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(chunk))
 }
 
 /// Host-contract Chat Completions request (no item types, origin stripped

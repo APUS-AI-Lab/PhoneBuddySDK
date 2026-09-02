@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
@@ -97,7 +97,20 @@ impl LlmTurnSession<'_> {
         observer: &dyn AgentObserver,
     ) -> EngineResult<CollectedTurn> {
         self.client
-            .complete_in_context(req, observer, &self.context)
+            .complete_in_context(req, observer, &self.context, None)
+            .await
+    }
+
+    /// Complete a one-shot operation while reserving a fair share of its
+    /// deadline for each remaining provider in the captured visit plan.
+    pub(crate) async fn complete_with_operation_timeout(
+        &self,
+        req: &ConversationRequest,
+        observer: &dyn AgentObserver,
+        operation_timeout: Option<Duration>,
+    ) -> EngineResult<CollectedTurn> {
+        self.client
+            .complete_in_context(req, observer, &self.context, operation_timeout)
             .await
     }
 }
@@ -539,10 +552,14 @@ impl LlmClient {
         req: &ConversationRequest,
         observer: &dyn AgentObserver,
         context: &LlmTurnContext,
+        operation_timeout: Option<Duration>,
     ) -> EngineResult<CollectedTurn> {
         let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
         let captured = self.capture_operation()?;
         let plan = &captured.plan;
+        let operation_deadline = operation_timeout.and_then(|timeout| {
+            Instant::now().checked_add(timeout)
+        });
         let chain_mode = plan.chain_mode;
         let mut last_error: Option<EngineError> = None;
         let mut tried_ids: Vec<String> = Vec::new();
@@ -592,19 +609,65 @@ impl LlmClient {
                 ),
             );
 
-            match self
-                .try_provider(
-                    slot,
-                    &rewritten,
-                    &skipper,
-                    chain_mode,
-                    context,
-                    &operation_id,
-                    plan.retry.max_retries,
-                    plan.retry.failover_max_attempts,
-                )
-                .await
-            {
+            let visits_remaining = plan.provider_ids.len().saturating_sub(visit_idx);
+            let provider_budget = operation_deadline
+                .filter(|_| visits_remaining > 1)
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .checked_div(visits_remaining as u32)
+                        .unwrap_or_default()
+                        .max(Duration::from_millis(1))
+                });
+            // Let reqwest surface and dump its timeout slightly before the
+            // client-level guard. The guard remains necessary for injected or
+            // custom transports that do not consume LlmTurnContext.
+            let transport_timeout = provider_budget.map(|budget| {
+                let headroom = (budget / 10).min(Duration::from_millis(250));
+                budget
+                    .saturating_sub(headroom)
+                    .max(Duration::from_millis(1))
+            });
+            context.set_request_timeout(transport_timeout);
+
+            let provider_future = self.try_provider(
+                slot,
+                &rewritten,
+                &skipper,
+                chain_mode,
+                context,
+                &operation_id,
+                plan.retry.max_retries,
+                plan.retry.failover_max_attempts,
+            );
+            let provider_result = match provider_budget {
+                Some(budget) => match tokio::time::timeout(budget, provider_future).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let error = EngineError::Llm(format!(
+                            "timeout after {}ms waiting for provider '{}'",
+                            budget.as_millis(),
+                            provider_id
+                        ));
+                        tracing::warn!(
+                            target: "phone_buddy::client",
+                            "Provider '{}' exceeded its one-shot deadline share ({}ms, op={})",
+                            provider_id,
+                            budget.as_millis(),
+                            operation_id
+                        );
+                        Err(ProviderAttemptError::Failover {
+                            error,
+                            cooldown_override: None,
+                            continue_from: None,
+                        })
+                    }
+                },
+                None => provider_future.await,
+            };
+            context.set_request_timeout(None);
+
+            match provider_result {
                 Ok(turn) => {
                     let mut turn = match &continue_from {
                         Some(partial) => merge_continued_turn(partial, turn),

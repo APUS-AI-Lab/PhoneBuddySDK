@@ -3,7 +3,7 @@
 use crate::conversation::{backend_call_summary, ConversationItem};
 use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{
-    ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ConversationRequest, ToolCallDelta,
+    ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ConversationRequest, Role, ToolCallDelta,
     ToolCallFunctionDelta, Usage,
 };
 
@@ -22,6 +22,10 @@ impl WireAdapter for MessagesAdapter {
 
     fn parse_event(&self, event: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
         parse_messages_chunk(event, data)
+    }
+
+    fn parse_response(&self, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+        parse_messages_response(data)
     }
 }
 
@@ -153,7 +157,7 @@ pub fn build_messages_payload(req: &ConversationRequest) -> EngineResult<serde_j
         "model": req.model,
         "messages": messages,
         "max_tokens": req.max_tokens.unwrap_or(8192),
-        "stream": true,
+        "stream": req.stream.unwrap_or(true),
     });
 
     if !system_text.is_empty() {
@@ -189,6 +193,130 @@ pub fn build_messages_payload(req: &ConversationRequest) -> EngineResult<serde_j
     }
 
     Ok(payload)
+}
+
+/// Parse one complete Anthropic Messages response into the internal chunk
+/// model used by the ordinary collector.
+pub fn parse_messages_response(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+    let value: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+        EngineError::Stream(format!(
+            "failed to parse buffered Messages response: {e}: {data:.120}"
+        ))
+    })?;
+    let mut delta = ChatChunkDelta {
+        role: Some(Role::Assistant),
+        ..Default::default()
+    };
+    let mut text = String::new();
+    let mut reasoning = String::new();
+
+    if let Some(content) = value.get("content").and_then(|v| v.as_array()) {
+        for (index, block) in content.iter().enumerate() {
+            match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(part) = block.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(part);
+                    }
+                }
+                "thinking" => {
+                    if let Some(part) = block.get("thinking").and_then(|v| v.as_str()) {
+                        reasoning.push_str(part);
+                    }
+                    if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                        if !signature.is_empty() {
+                            delta.encrypted_reasoning = Some(signature.to_string());
+                        }
+                    }
+                }
+                "tool_use" => {
+                    delta.tool_calls.push(ToolCallDelta {
+                        index: index as u32,
+                        id: block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        kind: Some("function".into()),
+                        function: Some(ToolCallFunctionDelta {
+                            name: block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            arguments: Some(
+                                block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}))
+                                    .to_string(),
+                            ),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if !text.is_empty() {
+        delta.content = Some(text);
+    }
+    if !reasoning.is_empty() {
+        delta.reasoning_content = Some(reasoning);
+    }
+
+    let usage = value.get("usage").map(|usage| {
+        let prompt_tokens = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    });
+    let finish_reason = value
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    if delta.content.is_none()
+        && delta.reasoning_content.is_none()
+        && delta.encrypted_reasoning.is_none()
+        && delta.tool_calls.is_empty()
+        && usage.is_none()
+        && finish_reason.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(ChatCompletionChunk {
+        id: value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        object: value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message")
+            .to_string(),
+        created: 0,
+        model: value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta,
+            finish_reason,
+        }],
+        usage,
+    }))
 }
 
 pub fn parse_messages_chunk(

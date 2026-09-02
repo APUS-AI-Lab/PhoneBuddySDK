@@ -460,7 +460,13 @@ Mandatory behavior:
 - expose no tool definitions and force tool choice to none;
 - do not create/load/save an agent session;
 - do not run compaction, agent prompts, task state, or a tool loop;
-- collect the streamed transport response internally and return one result;
+- request a buffered response because the host only observes the terminal
+  result; normalize that JSON through the same canonical chunk collector used
+  by streaming turns, without exposing provider-specific response shapes;
+- when a deadline covers multiple providers, reserve a proportional share for
+  every later visit so a silent endpoint cannot consume the whole operation;
+  a visit that spends its share is recorded as a connection failure and the
+  router continues with the next provider;
 - use a fresh logical operation context and never accept a
   `previous_response_id` from the app;
 - support timeout and cancellation independently of an agent session ID.

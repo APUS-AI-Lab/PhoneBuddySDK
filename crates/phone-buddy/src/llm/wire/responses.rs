@@ -1,7 +1,7 @@
 //! OpenAI / xAI Responses API adapter.
 
 use crate::conversation::ConversationItem;
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::llm::types::{
     parse_output_item, sanitize_tool_arguments, ChatChunkChoice, ChatChunkDelta,
     ChatCompletionChunk, ConversationRequest, OutputItemWire, ReasoningItem, ToolCallDelta,
@@ -23,6 +23,10 @@ impl WireAdapter for ResponsesAdapter {
 
     fn parse_event(&self, event: &str, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
         parse_responses_chunk(event, data)
+    }
+
+    fn parse_response(&self, data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+        parse_responses_response(data)
     }
 }
 
@@ -139,21 +143,24 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
         reasoning["effort"] = serde_json::Value::String(effort.as_str().to_string());
     }
 
+    let streaming = req.stream.unwrap_or(true);
     let mut payload = serde_json::json!({
         "model": req.model,
         "input": input,
-        "stream": true,
+        "stream": streaming,
         "store": false,
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
         "reasoning": reasoning,
-        "stream_options": {
-            "reasoning_summary_delivery": "sequential_cutoff"
-        },
         "text": {
             "verbosity": "medium"
         },
     });
+    if streaming {
+        payload["stream_options"] = serde_json::json!({
+            "reasoning_summary_delivery": "sequential_cutoff"
+        });
+    }
     if let Some(ref id) = req.previous_response_id {
         if !id.is_empty() {
             payload["previous_response_id"] = serde_json::Value::String(id.clone());
@@ -207,6 +214,21 @@ pub fn build_responses_payload(req: &ConversationRequest) -> EngineResult<serde_
     }
 
     Ok(payload)
+}
+
+/// Adapt a complete Responses API object to the canonical terminal-event
+/// parser so buffered and SSE generation share `response.output` handling.
+pub fn parse_responses_response(data: &str) -> EngineResult<Option<ChatCompletionChunk>> {
+    let response: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+        EngineError::Stream(format!(
+            "failed to parse buffered Responses response: {e}: {data:.120}"
+        ))
+    })?;
+    let event = serde_json::json!({
+        "type": "response.completed",
+        "response": response,
+    });
+    parse_responses_chunk("response.completed", &event.to_string())
 }
 
 fn reasoning_to_input_item(r: &ReasoningItem) -> serde_json::Value {
@@ -987,4 +1009,3 @@ pub fn parse_responses_chunk(
         usage,
     }))
 }
-

@@ -265,3 +265,6 @@ The printer logs `Retrying` and `ProviderSwitched` events on stderr.
 9. Every routed operation reports its `workload` (`main`, `subagent`,
    `one_shot`) alongside `pool_id` and `operation_id`. One-shot calls have
    no host event stream, so their routing diagnostics go to `tracing`.
+10. A timed one-shot with multiple providers partitions its remaining deadline
+    across provider visits. A silent provider is tripped when its share expires,
+    leaving the rest of the deadline available for failover.
