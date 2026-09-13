@@ -571,6 +571,40 @@ creates a private runtime and synthesizes a legacy `main` pool. Mobile
 wrappers should expose the same runtime/operation lifecycle without leaking
 Rust implementation details.
 
+### 12.1 Mixed HTTP + host:// providers
+
+Pool members may use `host://llama-rn` as `base_url`. Those targets are
+bound to `HostLlmTransport` when the caller sets `allow_host_llm`. Historic
+`from_router()` and native background tasks keep `allow_host_llm=false` and
+filter host members before building a visit plan.
+
+Visit order is `fallback_tier` ascending, then the existing
+group/health/order rules. Cloud members stay ahead of local members even
+when the cloud score has decayed to 1. After a local member is attempted,
+cooling cloud members are not retried in the same operation.
+
+Host requests are delivered as an envelope JSON:
+
+`{request_id, operation_id, pool_id, provider_id, deadline_unix_ms, request_json}`
+
+`request_json` remains Chat Completions. Structured host failures use
+`HostUnavailable {code, scope, before_output, message}` so the router can
+fail over to the next local candidate without treating the error as a cloud
+connection failure.
+
+New FFI:
+
+- `pb_capabilities()` → `{"mixed_host_provider_v1":true,"runtime_host_llm_v1":true}`
+- `pb_runtime_set_host_llm_callbacks(runtime, request_cb, cancel_cb, user_data)`
+- `pb_runtime_llm_push_chunk` / `finish` / `fail` / `fail_v2`
+- `pb_engine_llm_fail_v2`
+
+`GenerateTextRequest.allow_host_llm` defaults to false.
+`cloud_phase_timeout_ms` skips remaining cloud members when local candidates
+remain. Published text/reasoning on an agent turn blocks a later
+cloud→local switch; one-shot results are not published incrementally and may
+retry locally from the original request.
+
 One-shot completion callbacks should return a versioned JSON envelope and a
 stable operation ID. They should not reuse chat session callbacks because a
 utility request has no session lifecycle or agent events.

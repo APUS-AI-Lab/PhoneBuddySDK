@@ -366,25 +366,12 @@ mod tests {
         records.insert("keep".into(), live_rec);
 
         let mut cfg = LlmRoutingConfig {
-            providers: vec![ProviderTarget {
-                provider_id: "keep".into(),
-                base_url: "https://api.example.com/v1".into(),
-                api_key: "k".into(),
-                model: "m".into(),
-                api_backend: Default::default(),
-                client_profile: Default::default(),
-                client_version: None,
-                client_session_id: None,
-                reasoning_compatibility_key: None,
-                capabilities: Default::default(),
-                extra_headers: HashMap::new(),
-                extra_body: HashMap::new(),
-                enable_web_search: false,
-                web_search_options: None,
-                enable_x_search: false,
-                x_search_options: None,
-                reasoning_effort: None,
-            }],
+            providers: vec![ProviderTarget::http(
+                "keep",
+                "https://api.example.com/v1",
+                "k",
+                "m",
+            )],
             pools: BTreeMap::new(),
             health: health_cfg(),
         };
@@ -397,6 +384,7 @@ mod tests {
                     base_score: 10,
                     order: 0,
                     enabled: true,
+                    fallback_tier: 0,
                 }],
                 ..Default::default()
             },

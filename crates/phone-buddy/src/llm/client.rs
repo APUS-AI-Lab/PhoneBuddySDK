@@ -10,7 +10,7 @@
 //! to the observer, so the UI never sees duplicated deltas — except for
 //! SSE idle-timeout prefix continuation (same provider once, then failover).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,13 @@ use crate::llm::transport::{
 use crate::llm::types::{
     drop_colliding_function_tools, CollectedTurn, ConversationRequest, HostedTool,
 };
+
+/// Optional Host transport bindings for mixed HTTP + `host://` pools.
+#[derive(Clone, Default)]
+pub struct TransportBindings {
+    pub host_hub: Option<Arc<crate::llm::host::HostLlmHub>>,
+    pub allow_host_llm: bool,
+}
 
 pub struct LlmClient {
     router: Arc<LlmRouter>,
@@ -72,6 +79,7 @@ struct HttpSlotFactory {
     http_dump: crate::llm::dumper::HttpDumpConfig,
     dumps_dir: std::path::PathBuf,
     enable_doom_loop_check: Option<bool>,
+    bindings: TransportBindings,
 }
 
 struct CapturedOperation {
@@ -97,20 +105,29 @@ impl LlmTurnSession<'_> {
         observer: &dyn AgentObserver,
     ) -> EngineResult<CollectedTurn> {
         self.client
-            .complete_in_context(req, observer, &self.context, None)
+            .complete_in_context(req, observer, &self.context, None, None, None)
             .await
     }
 
     /// Complete a one-shot operation while reserving a fair share of its
     /// deadline for each remaining provider in the captured visit plan.
-    pub(crate) async fn complete_with_operation_timeout(
+    pub(crate) async fn complete_with_budgets(
         &self,
         req: &ConversationRequest,
         observer: &dyn AgentObserver,
         operation_timeout: Option<Duration>,
+        cloud_phase_timeout: Option<Duration>,
+        operation_id: Option<String>,
     ) -> EngineResult<CollectedTurn> {
         self.client
-            .complete_in_context(req, observer, &self.context, operation_timeout)
+            .complete_in_context(
+                req,
+                observer,
+                &self.context,
+                operation_timeout,
+                cloud_phase_timeout,
+                operation_id,
+            )
             .await
     }
 }
@@ -129,6 +146,11 @@ struct ProviderSlot {
     web_search_options: Option<crate::llm::types::WebSearchOptions>,
     enable_x_search: bool,
     x_search_options: Option<crate::llm::types::XSearchOptions>,
+    origin: Option<String>,
+    fallback_tier: u32,
+    is_host: bool,
+    context_window_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
 }
 
 /// Object-safe wrapper so the client can hold `Arc<dyn ...>`.
@@ -208,6 +230,11 @@ impl LlmClient {
             web_search_options: None,
             enable_x_search: false,
             x_search_options: None,
+            origin: None,
+            fallback_tier: 0,
+            is_host: false,
+            context_window_tokens: None,
+            max_output_tokens: None,
         };
         let router = synthetic_router(
             std::slice::from_ref(&slot),
@@ -260,6 +287,11 @@ impl LlmClient {
                 web_search_options: None,
                 enable_x_search: false,
                 x_search_options: None,
+                origin: None,
+                fallback_tier: 0,
+                is_host: false,
+                context_window_tokens: None,
+                max_output_tokens: None,
             };
             if primary_compat_key.is_empty() {
                 primary_compat_key = slot.compat_key.clone();
@@ -298,18 +330,29 @@ impl LlmClient {
     }
 
     /// Bind this client to `pool_id` on a shared router, building HTTP
-    /// transports from the current routing snapshot.
+    /// transports from the current routing snapshot. Host members are
+    /// filtered (cloud-only), matching historic `from_router` behaviour.
     pub fn from_router(
         router: Arc<LlmRouter>,
         pool_id: impl Into<String>,
         cfg: &EngineConfig,
+    ) -> EngineResult<Self> {
+        Self::from_router_with_bindings(router, pool_id, cfg, TransportBindings::default())
+    }
+
+    /// Bind HTTP and optional `host://` members according to `bindings`.
+    pub fn from_router_with_bindings(
+        router: Arc<LlmRouter>,
+        pool_id: impl Into<String>,
+        cfg: &EngineConfig,
+        bindings: TransportBindings,
     ) -> EngineResult<Self> {
         let pool_id = pool_id.into();
         if !router.has_pool(&pool_id) {
             return Err(EngineError::RouteNotConfigured { pool_id });
         }
         let (generation, snapshot) = router.snapshot();
-        let factory = HttpSlotFactory::from_engine(cfg);
+        let factory = HttpSlotFactory::from_engine_with_bindings(cfg, bindings);
         let bound = bind_http_slots(&pool_id, generation, &snapshot, &factory)?;
         Ok(Self {
             router,
@@ -443,7 +486,7 @@ impl LlmClient {
         req: &ConversationRequest,
         slot: &ProviderSlot,
         primary_compat_key: &str,
-    ) -> ConversationRequest {
+    ) -> EngineResult<ConversationRequest> {
         let mut out = req.clone();
         if !slot.model.is_empty() {
             out.model = slot.model.clone();
@@ -479,7 +522,28 @@ impl LlmClient {
             target,
             primary_compat_key,
         );
-        out
+        if let Some(max_out) = slot.max_output_tokens {
+            let requested = out.max_tokens.unwrap_or(max_out);
+            out.max_tokens = Some(requested.min(max_out).max(1));
+        }
+        if let Some(window) = slot.context_window_tokens {
+            let output = out.max_tokens.unwrap_or(1024);
+            if self.workload == Workload::OneShot {
+                let used: u32 = out
+                    .items
+                    .iter()
+                    .map(crate::llm::context_budget::estimate_item_tokens)
+                    .sum();
+                if used + output + 64 > window {
+                    return Err(EngineError::LocalContextExceeded);
+                }
+            } else {
+                out.items = crate::llm::context_budget::trim_history_to_window(
+                    &out.items, window, output,
+                )?;
+            }
+        }
+        Ok(out)
     }
 
     /// Align local slots with `generation`. HTTP clients rebuild transports
@@ -510,8 +574,27 @@ impl LlmClient {
 
     fn capture_operation(&self) -> EngineResult<CapturedOperation> {
         for _ in 0..4 {
-            let plan = self.router.plan_visit(&self.pool_id)?;
-            self.sync_slots(plan.generation, &plan.retry)?;
+            let (generation, snapshot) = self.router.snapshot();
+            let retry = snapshot
+                .pools
+                .get(&self.pool_id)
+                .map(|p| p.retry.clone())
+                .unwrap_or_default();
+            self.sync_slots(generation, &retry)?;
+            let plan = if self.http_factory.is_some() {
+                let allowed: HashSet<String> = self
+                    .slots
+                    .lock()
+                    .unwrap()
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect();
+                self.router
+                    .plan_visit_filtered(&self.pool_id, Some(&allowed))?
+            } else {
+                self.router.plan_visit(&self.pool_id)?
+            };
             let slots = self.slots.lock().unwrap();
             if slots.generation != plan.generation {
                 continue;
@@ -553,18 +636,35 @@ impl LlmClient {
         observer: &dyn AgentObserver,
         context: &LlmTurnContext,
         operation_timeout: Option<Duration>,
+        cloud_phase_timeout: Option<Duration>,
+        operation_id: Option<String>,
     ) -> EngineResult<CollectedTurn> {
-        let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
+        let operation_id =
+            operation_id.unwrap_or_else(|| format!("op_{}", uuid::Uuid::new_v4().simple()));
         let captured = self.capture_operation()?;
         let plan = &captured.plan;
-        let operation_deadline = operation_timeout.and_then(|timeout| {
-            Instant::now().checked_add(timeout)
-        });
+        let now = Instant::now();
+        let operation_deadline = operation_timeout.and_then(|timeout| now.checked_add(timeout));
+        let cloud_phase_deadline =
+            cloud_phase_timeout.and_then(|timeout| now.checked_add(timeout));
+        context.set_operation_id(Some(operation_id.clone()));
+        context.set_pool_id(Some(self.pool_id.clone()));
+        if let Some(deadline) = operation_deadline {
+            let unix_ms = std::time::SystemTime::now()
+                .checked_add(deadline.saturating_duration_since(Instant::now()))
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            context.set_deadline_unix_ms(unix_ms);
+        }
         let chain_mode = plan.chain_mode;
         let mut last_error: Option<EngineError> = None;
         let mut tried_ids: Vec<String> = Vec::new();
+        let mut skipped_origins: HashSet<String> = HashSet::new();
+        let mut max_attempted_tier: u32 = 0;
+        let mut host_codes: Vec<String> = Vec::new();
         let skipper = PrefixSkippingObserver::new(observer);
         let mut continue_from: Option<CollectedTurn> = None;
+        let has_local = captured.providers.values().any(|s| s.fallback_tier > 0);
 
         for (visit_idx, provider_id) in plan.provider_ids.iter().enumerate() {
             let Some(slot) = captured.providers.get(provider_id) else {
@@ -573,13 +673,48 @@ impl LlmClient {
                     self.pool_id
                 )));
             };
+            if slot.fallback_tier < max_attempted_tier {
+                continue;
+            }
+            if let Some(origin) = slot.origin.as_ref() {
+                if skipped_origins.contains(origin) {
+                    continue;
+                }
+            }
+            let cloud_phase_expired = cloud_phase_deadline
+                .map(|d| Instant::now() >= d)
+                .unwrap_or(false);
+            if cloud_phase_expired && slot.fallback_tier == 0 && has_local {
+                continue;
+            }
+            context.set_provider_id(Some(provider_id.clone()));
             tried_ids.push(provider_id.clone());
-            let rewritten = self.rewrite_request_for(req, slot, &captured.primary_compat_key);
+            max_attempted_tier = max_attempted_tier.max(slot.fallback_tier);
+            let rewritten = match self.rewrite_request_for(req, slot, &captured.primary_compat_key)
+            {
+                Ok(r) => r,
+                Err(e) if e.is_provider_scoped_host_failure() => {
+                    if let EngineError::HostUnavailable { code, .. } = &e {
+                        host_codes.push(code.clone());
+                    }
+                    last_error = Some(e);
+                    if !chain_mode {
+                        return Err(last_error.take().unwrap());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let rewritten = if let Some(ref partial) = continue_from {
-                skipper.set_skip(&partial.text, &partial.reasoning);
-                // Response ids are host-bound; keep encrypted reasoning
-                // items in the prefix but drop previous_response_id.
-                prefix_continue_request(&rewritten, partial, false)
+                if slot.fallback_tier > 0 && self.workload != Workload::OneShot {
+                    skipper.set_skip("", "");
+                    rewritten
+                } else {
+                    skipper.set_skip(&partial.text, &partial.reasoning);
+                    // Response ids are host-bound; keep encrypted reasoning
+                    // items in the prefix but drop previous_response_id.
+                    prefix_continue_request(&rewritten, partial, false)
+                }
             } else {
                 rewritten
             };
@@ -711,6 +846,12 @@ impl LlmClient {
                     cooldown_override,
                     continue_from: cf,
                 }) => {
+                    if let EngineError::ConnectFailed { origin, .. } = &error {
+                        skipped_origins.insert(origin.clone());
+                    }
+                    if let EngineError::HostUnavailable { code, .. } = &error {
+                        host_codes.push(code.clone());
+                    }
                     if let Some(partial) = cf {
                         let merged = match continue_from {
                             Some(prev) => merge_continued_turn(&prev, partial),
@@ -733,9 +874,14 @@ impl LlmClient {
                         class,
                         cooldown_override,
                     );
-                    let next = plan.provider_ids[visit_idx + 1..]
-                        .iter()
-                        .find(|id| captured.providers.contains_key(*id));
+                    let next = plan.provider_ids[visit_idx + 1..].iter().find(|id| {
+                        captured.providers.get(*id).is_some_and(|s| {
+                            s.fallback_tier >= max_attempted_tier
+                                && s.origin
+                                    .as_ref()
+                                    .is_none_or(|o| !skipped_origins.contains(o))
+                        })
+                    });
                     let Some(next_id) = next else {
                         tracing::warn!(
                             target: "phone_buddy::client",
@@ -745,12 +891,41 @@ impl LlmClient {
                             tried_ids,
                             operation_id
                         );
+                        if !host_codes.is_empty() {
+                            return Err(EngineError::LocalFallbackUnavailable {
+                                pool_id: self.pool_id.clone(),
+                                reason: last_error
+                                    .as_ref()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "local candidates exhausted".into()),
+                                candidate_codes: host_codes,
+                            });
+                        }
                         return Err(EngineError::ProviderAttemptsExhausted {
                             pool_id: self.pool_id.clone(),
                             tried_provider_ids: tried_ids,
                         });
                     };
                     let next_slot = captured.providers.get(next_id).unwrap();
+                    let crossing_to_local =
+                        next_slot.fallback_tier > slot.fallback_tier && next_slot.is_host;
+                    if crossing_to_local
+                        && self.workload != Workload::OneShot
+                        && (skipper.has_published_output()
+                            || continue_from
+                                .as_ref()
+                                .is_some_and(|t| !t.text.is_empty() || !t.reasoning.is_empty()))
+                    {
+                        return Err(last_error.take().unwrap_or_else(|| {
+                            EngineError::Llm(
+                                "refusing cloud-to-local switch after published output".into(),
+                            )
+                        }));
+                    }
+                    if crossing_to_local && self.workload == Workload::OneShot {
+                        continue_from = None;
+                        skipper.set_skip("", "");
+                    }
                     let reason = last_error
                         .as_ref()
                         .map(|e| e.to_string())
@@ -930,6 +1105,13 @@ impl LlmClient {
                         return Err(ProviderAttemptError::Terminal(err));
                     }
                     Err(CollectStreamError::Other(e)) => {
+                        if e.is_provider_scoped_host_failure() {
+                            return Err(ProviderAttemptError::Failover {
+                                error: e,
+                                cooldown_override: None,
+                                continue_from: None,
+                            });
+                        }
                         // Mid-stream: deltas may already have reached the UI.
                         return Err(ProviderAttemptError::Terminal(e));
                     }
@@ -937,6 +1119,15 @@ impl LlmClient {
                 Err(e) => {
                     if is_veto(&e) {
                         return Err(ProviderAttemptError::Veto(e));
+                    }
+                    if matches!(e, EngineError::ConnectFailed { .. })
+                        || e.is_provider_scoped_host_failure()
+                    {
+                        return Err(ProviderAttemptError::Failover {
+                            error: e,
+                            cooldown_override: None,
+                            continue_from: None,
+                        });
                     }
                     let class = retry_class_for_error(&e);
                     match class {
@@ -1034,6 +1225,7 @@ struct PrefixSkippingObserver<'a> {
     inner: &'a dyn AgentObserver,
     skip_text: Mutex<String>,
     skip_reasoning: Mutex<String>,
+    published: Mutex<bool>,
 }
 
 impl<'a> PrefixSkippingObserver<'a> {
@@ -1042,12 +1234,17 @@ impl<'a> PrefixSkippingObserver<'a> {
             inner,
             skip_text: Mutex::new(String::new()),
             skip_reasoning: Mutex::new(String::new()),
+            published: Mutex::new(false),
         }
     }
 
     fn set_skip(&self, text: &str, reasoning: &str) {
         *self.skip_text.lock().unwrap() = text.to_string();
         *self.skip_reasoning.lock().unwrap() = reasoning.to_string();
+    }
+
+    fn has_published_output(&self) -> bool {
+        *self.published.lock().unwrap()
     }
 }
 
@@ -1057,12 +1254,14 @@ impl AgentObserver for PrefixSkippingObserver<'_> {
             AgentEvent::TextDelta { text } => {
                 let rest = skip_prefix_chunk(&mut self.skip_text.lock().unwrap(), &text);
                 if !rest.is_empty() {
+                    *self.published.lock().unwrap() = true;
                     self.inner.on_event(AgentEvent::TextDelta { text: rest });
                 }
             }
             AgentEvent::ReasoningDelta { text } => {
                 let rest = skip_prefix_chunk(&mut self.skip_reasoning.lock().unwrap(), &text);
                 if !rest.is_empty() {
+                    *self.published.lock().unwrap() = true;
                     self.inner
                         .on_event(AgentEvent::ReasoningDelta { text: rest });
                 }
@@ -1328,6 +1527,12 @@ fn failure_class_of(err: &EngineError) -> FailureClass {
     if matches!(err, EngineError::EmptyResponse) {
         return FailureClass::EmptyResponse;
     }
+    if matches!(err, EngineError::ConnectFailed { .. }) {
+        return FailureClass::Connection;
+    }
+    if err.is_provider_scoped_host_failure() {
+        return FailureClass::Other;
+    }
     match retry_class_for_error(err) {
         RetryClass::RateLimited => FailureClass::RateLimited,
         RetryClass::Retry => {
@@ -1347,9 +1552,13 @@ fn is_veto(err: &EngineError) -> bool {
             if is_retry_vetoed_message(msg) {
                 return true;
             }
+            let status = status_from_error(err);
+            if status == Some(401) {
+                return true;
+            }
             // A gateway account's quota is independent of provider health.
             // Parse the error code, rather than matching words in its message.
-            if status_from_error(err) != Some(403) {
+            if status != Some(403) {
                 return false;
             }
             let Some(start) = msg.find('{') else {
@@ -1363,17 +1572,19 @@ fn is_veto(err: &EngineError) -> bool {
                     == Some("insufficient_user_quota")
             })
         }
+        EngineError::HostUnavailable { scope, .. } if scope == "operation" => true,
         _ => false,
     }
 }
 
 impl HttpSlotFactory {
-    fn from_engine(cfg: &EngineConfig) -> Self {
+    fn from_engine_with_bindings(cfg: &EngineConfig, bindings: TransportBindings) -> Self {
         Self {
             stream_idle_timeout_secs: cfg.stream_idle_timeout_secs,
             http_dump: cfg.http_dump.clone(),
             dumps_dir: cfg.http_dumps_dir(),
             enable_doom_loop_check: cfg.enable_doom_loop_check,
+            bindings,
         }
     }
 }
@@ -1391,6 +1602,7 @@ fn bind_http_slots(
             pool_id: pool_id.to_string(),
         })?;
     let mut providers = HashMap::new();
+    let mut saw_host = false;
     for member in &pool.members {
         let target = snapshot.provider(&member.provider_id).ok_or_else(|| {
             EngineError::InvalidRoutingConfig(format!(
@@ -1398,10 +1610,21 @@ fn bind_http_slots(
                 member.provider_id
             ))
         })?;
-        providers.insert(
-            member.provider_id.clone(),
-            slot_from_target(factory, target)?,
-        );
+        if target.is_host() {
+            saw_host = true;
+            if !factory.bindings.allow_host_llm {
+                continue;
+            }
+            if factory.bindings.host_hub.is_none() {
+                return Err(EngineError::HostBindingNotReady);
+            }
+        }
+        let mut slot = slot_from_target(factory, target)?;
+        slot.fallback_tier = member.fallback_tier;
+        providers.insert(member.provider_id.clone(), slot);
+    }
+    if factory.bindings.allow_host_llm && saw_host && factory.bindings.host_hub.is_none() {
+        return Err(EngineError::HostBindingNotReady);
     }
     let primary_compat_key = pool
         .members
@@ -1462,6 +1685,11 @@ fn bind_injected_slots(
                 web_search_options: target.web_search_options.clone(),
                 enable_x_search: target.enable_x_search,
                 x_search_options: target.x_search_options.clone(),
+                origin: crate::llm::router::http_origin_key(&target.base_url),
+                fallback_tier: member.fallback_tier,
+                is_host: target.is_host(),
+                context_window_tokens: target.capabilities.context_window_tokens,
+                max_output_tokens: target.capabilities.max_output_tokens,
             },
         );
     }
@@ -1483,22 +1711,39 @@ fn slot_from_target(
     factory: &HttpSlotFactory,
     target: &ProviderTarget,
 ) -> EngineResult<ProviderSlot> {
-    let doom = factory.enable_doom_loop_check.unwrap_or(matches!(
-        target.api_backend,
-        crate::llm::types::ApiBackend::Responses
-    ));
-    let transport = Arc::new(http_transport(
-        factory,
-        &target.base_url,
-        &target.api_key,
-        target.api_backend,
-        target.client_profile,
-        target.client_version.clone(),
-        target.client_session_id.clone(),
-        target.extra_headers.clone(),
-        target.extra_body.clone(),
-        doom,
-    )?);
+    let transport: Arc<dyn LlmTransportObj> = if target.is_host() {
+        let hub = factory
+            .bindings
+            .host_hub
+            .clone()
+            .ok_or(EngineError::HostBindingNotReady)?;
+        Arc::new(crate::llm::host::HostLlmTransport::with_provider_id(
+            hub,
+            target.provider_id.clone(),
+        ))
+    } else {
+        let doom = factory.enable_doom_loop_check.unwrap_or(matches!(
+            target.api_backend,
+            crate::llm::types::ApiBackend::Responses
+        ));
+        let idle = target
+            .stream_idle_timeout_secs
+            .unwrap_or(factory.stream_idle_timeout_secs);
+        Arc::new(http_transport(
+            factory,
+            &target.base_url,
+            &target.api_key,
+            target.api_backend,
+            target.client_profile,
+            target.client_version.clone(),
+            target.client_session_id.clone(),
+            target.extra_headers.clone(),
+            target.extra_body.clone(),
+            doom,
+            target.resolved_connect_timeout(),
+            idle,
+        )?)
+    };
     Ok(ProviderSlot {
         provider_id: target.provider_id.clone(),
         fingerprint: provider_fingerprint(&target.base_url, &target.model),
@@ -1510,6 +1755,11 @@ fn slot_from_target(
         web_search_options: target.web_search_options.clone(),
         enable_x_search: target.enable_x_search,
         x_search_options: target.x_search_options.clone(),
+        origin: crate::llm::router::http_origin_key(&target.base_url),
+        fallback_tier: 0,
+        is_host: target.is_host(),
+        context_window_tokens: target.capabilities.context_window_tokens,
+        max_output_tokens: target.capabilities.max_output_tokens,
         transport,
     })
 }
@@ -1563,6 +1813,11 @@ impl ProviderSlot {
             web_search_options: self.web_search_options.clone(),
             enable_x_search: self.enable_x_search,
             x_search_options: self.x_search_options.clone(),
+            origin: self.origin.clone(),
+            fallback_tier: self.fallback_tier,
+            is_host: self.is_host,
+            context_window_tokens: self.context_window_tokens,
+            max_output_tokens: self.max_output_tokens,
         }
     }
 }
@@ -1598,6 +1853,8 @@ fn synthetic_router(
             enable_x_search: slot.enable_x_search,
             x_search_options: slot.x_search_options.clone(),
             reasoning_effort: slot.reasoning_effort,
+            connect_timeout_ms: None,
+            stream_idle_timeout_secs: None,
         });
         members.push(PoolMember {
             provider_id: slot.provider_id.clone(),
@@ -1605,6 +1862,7 @@ fn synthetic_router(
             base_score: crate::llm::router::DEFAULT_BASE_SCORE,
             order: i as u32,
             enabled: true,
+            fallback_tier: 0,
         });
     }
     let pool = ProviderPool {
@@ -1639,13 +1897,15 @@ fn http_transport(
     extra_headers: std::collections::HashMap<String, String>,
     extra_body: std::collections::HashMap<String, serde_json::Value>,
     doom_loop: bool,
+    connect_timeout: Duration,
+    idle_secs: u64,
 ) -> EngineResult<crate::llm::transport::HttpTransport> {
     let dumper =
         crate::llm::dumper::HttpDumper::new(factory.http_dump.clone(), factory.dumps_dir.clone());
-    crate::llm::transport::HttpTransport::new_with_all_options(
+    crate::llm::transport::HttpTransport::new_with_connect_timeout(
         base_url,
         api_key,
-        Duration::from_secs(factory.stream_idle_timeout_secs),
+        Duration::from_secs(idle_secs),
         api_backend,
         client_profile,
         client_version,
@@ -1654,6 +1914,7 @@ fn http_transport(
         extra_body,
         doom_loop,
         dumper,
+        connect_timeout,
     )
 }
 
@@ -1819,6 +2080,8 @@ mod tests {
             enable_x_search: false,
             x_search_options: None,
             reasoning_effort: None,
+            connect_timeout_ms: None,
+            stream_idle_timeout_secs: None,
         }
     }
 
@@ -1829,6 +2092,7 @@ mod tests {
             base_score: 10,
             order,
             enabled: true,
+            fallback_tier: 0,
         }
     }
 
@@ -1932,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_401_fails_over_immediately() {
+    async fn fatal_401_is_account_veto_and_does_not_failover() {
         tokio::time::pause();
         let a_hits = Arc::new(AtomicU32::new(0));
         let b_hits = Arc::new(AtomicU32::new(0));
@@ -1949,10 +2213,11 @@ mod tests {
             120,
         );
         let observer = RecordingObserver::new();
-        client.complete(&req(), &observer).await.unwrap();
+        let err = client.complete(&req(), &observer).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
         assert_eq!(a_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
-        assert!(observer
+        assert_eq!(b_hits.load(Ordering::SeqCst), 0);
+        assert!(!observer
             .snapshot()
             .iter()
             .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })));
@@ -2944,5 +3209,150 @@ mod tests {
         let t = ScriptedTransport::failing("inline", 0, "", hits);
         let client = LlmClient::new(t as Arc<dyn LlmTransportObj>, 1);
         assert!(client.current_endpoint().is_none());
+    }
+
+    fn mixed_routing() -> LlmRoutingConfig {
+        let mut cloud = ProviderTarget::http(
+            "cloud/a",
+            "https://api.example.com/v1",
+            "k",
+            "grok-4.6",
+        );
+        cloud.connect_timeout_ms = Some(3_000);
+        let mut local = ProviderTarget::http(
+            "local/apus-model-0.8b",
+            "host://llama-rn",
+            "",
+            "apus-model-0.8b",
+        );
+        local.api_key.clear();
+        local.base_url = "host://llama-rn".into();
+        local.capabilities.context_window_tokens = Some(4096);
+        local.capabilities.max_output_tokens = Some(1024);
+        let mut pools = BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: vec![
+                    PoolMember {
+                        provider_id: "cloud/a".into(),
+                        routing_group: "cloud".into(),
+                        base_score: 1,
+                        order: 0,
+                        enabled: true,
+                        fallback_tier: 0,
+                    },
+                    PoolMember {
+                        provider_id: "local/apus-model-0.8b".into(),
+                        routing_group: "local".into(),
+                        base_score: 5,
+                        order: 1,
+                        enabled: true,
+                        fallback_tier: 1,
+                    },
+                ],
+                retry: RetryPolicy {
+                    failover_max_attempts: 1,
+                    max_retries: 1,
+                },
+                when_exhausted: ExhaustionPolicy::FailFast,
+            },
+        );
+        LlmRoutingConfig {
+            providers: vec![cloud, local],
+            pools,
+            health: Default::default(),
+        }
+    }
+
+    #[test]
+    fn from_router_skips_host_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = LlmRouter::in_memory(mixed_routing()).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.root_dir = dir.path().to_path_buf();
+        let client = LlmClient::from_router(router, MAIN_POOL_ID, &cfg).unwrap();
+        let plan = client.capture_operation().unwrap();
+        assert_eq!(plan.plan.provider_ids, vec!["cloud/a"]);
+        assert!(!plan.providers.contains_key("local/apus-model-0.8b"));
+    }
+
+    #[test]
+    fn allow_host_without_hub_is_binding_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = LlmRouter::in_memory(mixed_routing()).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.root_dir = dir.path().to_path_buf();
+        match LlmClient::from_router_with_bindings(
+            router,
+            MAIN_POOL_ID,
+            &cfg,
+            TransportBindings {
+                host_hub: None,
+                allow_host_llm: true,
+            },
+        ) {
+            Err(EngineError::HostBindingNotReady) => {}
+            Err(other) => panic!("expected HostBindingNotReady, got {other}"),
+            Ok(_) => panic!("expected HostBindingNotReady, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_pool_failsover_to_host_before_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::llm::host::HostLlmHub::new();
+        let hub_push = hub.clone();
+        hub.set_notify(std::sync::Arc::new(move |req_id, _json| {
+            let hub = hub_push.clone();
+            std::thread::spawn(move || {
+                let mut delta = ChatChunkDelta::default();
+                delta.role = Some(Role::Assistant);
+                delta.content = Some("local-ok".into());
+                let _ = hub.push_chunk(
+                    &req_id,
+                    ChatCompletionChunk {
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta,
+                            finish_reason: Some("stop".into()),
+                        }],
+                        ..Default::default()
+                    },
+                );
+                let _ = hub.finish(&req_id);
+            });
+        }));
+        let hits = Arc::new(AtomicU32::new(0));
+        let cloud = ScriptedTransport::failing("cloud", u32::MAX, "status=503 busy", hits.clone());
+        let mut routing = mixed_routing();
+        routing.providers[0].base_url = "https://cloud.example/v1".into();
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.root_dir = dir.path().to_path_buf();
+        let client = LlmClient::from_router_with_transports(
+            router,
+            MAIN_POOL_ID,
+            HashMap::from([
+                ("cloud/a".into(), cloud as Arc<dyn LlmTransportObj>),
+                (
+                    "local/apus-model-0.8b".into(),
+                    Arc::new(crate::llm::host::HostLlmTransport::with_provider_id(
+                        hub,
+                        "local/apus-model-0.8b",
+                    )) as Arc<dyn LlmTransportObj>,
+                ),
+            ]),
+        )
+        .unwrap();
+        // Injected slots default fallback_tier=0; set local to 1 via capture after
+        // rewriting membership is already in routing. Injected bind copies member.fallback_tier.
+        let turn = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "local-ok");
+        assert_eq!(turn.provider_id, "local/apus-model-0.8b");
+        assert!(hits.load(Ordering::SeqCst) >= 1);
     }
 }

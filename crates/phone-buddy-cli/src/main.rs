@@ -279,6 +279,7 @@ fn run_generate(input: &str, pool_id: &str, json: bool) -> anyhow::Result<()> {
             reasoning_effort: None,
             response_format: json.then_some(ResponseFormat::JsonObject),
             timeout_ms: Some(30_000),
+            ..Default::default()
         },
         tokio_util::sync::CancellationToken::new(),
     )?;

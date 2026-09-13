@@ -101,25 +101,7 @@ fn engine_cfg(root: &std::path::Path) -> EngineConfig {
 }
 
 fn target(id: &str, url: &str, model: &str) -> ProviderTarget {
-    ProviderTarget {
-        provider_id: id.into(),
-        base_url: url.into(),
-        api_key: "k".into(),
-        model: model.into(),
-        api_backend: Default::default(),
-        client_profile: Default::default(),
-        client_version: None,
-        client_session_id: None,
-        reasoning_compatibility_key: None,
-        capabilities: Default::default(),
-        extra_headers: Default::default(),
-        extra_body: Default::default(),
-        enable_web_search: false,
-        web_search_options: None,
-        enable_x_search: false,
-        x_search_options: None,
-        reasoning_effort: None,
-    }
+    ProviderTarget::http(id, url, "k", model)
 }
 
 fn member(id: &str, order: u32) -> PoolMember {
@@ -129,6 +111,7 @@ fn member(id: &str, order: u32) -> PoolMember {
         base_score: 10,
         order,
         enabled: true,
+        fallback_tier: 0,
     }
 }
 

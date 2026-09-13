@@ -19,6 +19,18 @@ typedef struct PbEngine PbEngine;
 typedef struct PbRuntime PbRuntime;
 
 /**
+ * Host LLM request callback.
+ *
+ * Fired when the engine needs a completion. `request_id` and `request_json`
+ * are valid only for the duration of the call. Respond with
+ * [`pb_engine_llm_push_chunk`] / [`pb_engine_llm_finish`] /
+ * [`pb_engine_llm_fail`].
+ */
+typedef void (*PbLlmRequestCallback)(const char *request_id,
+                                     const char *request_json,
+                                     void *user_data);
+
+/**
  * One-shot `generate_text` completion callback.
  *
  * `envelope_json` is a versioned JSON object valid only for the duration of
@@ -35,18 +47,6 @@ typedef void (*PbOperationCallback)(const char *envelope_json, void *user_data);
  * The callback may be invoked from a background engine thread.
  */
 typedef void (*PbEventCallback)(const char *event_json, void *user_data);
-
-/**
- * Host LLM request callback.
- *
- * Fired when the engine needs a completion. `request_id` and `request_json`
- * are valid only for the duration of the call. Respond with
- * [`pb_engine_llm_push_chunk`] / [`pb_engine_llm_finish`] /
- * [`pb_engine_llm_fail`].
- */
-typedef void (*PbLlmRequestCallback)(const char *request_id,
-                                     const char *request_json,
-                                     void *user_data);
 
 /**
  * Host tool request callback.
@@ -83,6 +83,11 @@ typedef void (*PbLogCallback)(int32_t level, const char *target, const char *mes
  * Library version string. Do not free.
  */
 const char *pb_version(void);
+
+/**
+ * JSON object of ABI capabilities. Do not free.
+ */
+const char *pb_capabilities(void);
 
 /**
  * Create an engine from a JSON configuration.
@@ -127,6 +132,34 @@ struct PbRuntime *pb_runtime_new(const char *routing_config_json,
 int32_t pb_runtime_update_routing(struct PbRuntime *runtime,
                                   const char *routing_config_json,
                                   char **err_out);
+
+/**
+ * Register Runtime Host LLM callbacks. `llm_cb` receives `(request_id, envelope_json)`.
+ *
+ * # Safety
+ * Callbacks may be invoked from worker threads. `user_data` must remain valid
+ * until [`pb_runtime_set_host_llm_callbacks`] is called again with null or
+ * the runtime is freed.
+ */
+void pb_runtime_set_host_llm_callbacks(struct PbRuntime *runtime,
+                                       PbLlmRequestCallback llm_cb,
+                                       PbLlmRequestCallback cancel_cb,
+                                       void *user_data);
+
+/**
+ * Push one OpenAI-compatible chunk for a Runtime Host LLM request.
+ */
+int32_t pb_runtime_llm_push_chunk(struct PbRuntime *runtime,
+                                  const char *request_id,
+                                  const char *chunk_json,
+                                  char **err_out);
+
+int32_t pb_runtime_llm_finish(struct PbRuntime *runtime, const char *request_id, char **err_out);
+
+int32_t pb_runtime_llm_fail(struct PbRuntime *runtime,
+                            const char *request_id,
+                            const char *error_msg,
+                            char **err_out);
 
 /**
  * Create an engine bound to `runtime`. `main_pool_id` defaults to `"main"` when null.
@@ -285,6 +318,19 @@ int32_t pb_engine_llm_fail(struct PbEngine *engine,
                            const char *request_id,
                            const char *error_msg,
                            char **err_out);
+
+/**
+ * Fail a host LLM stream with a structured JSON body (`code`, `scope`, `before_output`, `message`).
+ */
+int32_t pb_engine_llm_fail_v2(struct PbEngine *engine,
+                              const char *request_id,
+                              const char *error_json,
+                              char **err_out);
+
+int32_t pb_runtime_llm_fail_v2(struct PbRuntime *runtime,
+                               const char *request_id,
+                               const char *error_json,
+                               char **err_out);
 
 /**
  * Register host tools from an OpenAI tools JSON array.

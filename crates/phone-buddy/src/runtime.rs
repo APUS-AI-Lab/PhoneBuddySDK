@@ -39,6 +39,34 @@ pub struct GenerateTextRequest {
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Allow this one-shot to bind `host://` members. Default false so native
+    /// background tasks stay cloud-only even when a Runtime Hub exists.
+    #[serde(default)]
+    pub allow_host_llm: bool,
+    /// Optional cloud-phase budget. Ignored when no local candidates remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_phase_timeout_ms: Option<u64>,
+    /// Host-assigned operation id. When unset the runtime generates one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+impl Default for GenerateTextRequest {
+    fn default() -> Self {
+        Self {
+            pool_id: String::new(),
+            instructions: None,
+            input: String::new(),
+            max_output_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            response_format: None,
+            timeout_ms: None,
+            allow_host_llm: false,
+            cloud_phase_timeout_ms: None,
+            operation_id: None,
+        }
+    }
 }
 
 /// One-shot result. Never includes API keys.
@@ -138,7 +166,9 @@ pub struct PhoneBuddyRuntime {
     root_dir: PathBuf,
     operations: Mutex<HashMap<String, CancellationToken>>,
     http_settings: Mutex<OneShotHttpSettings>,
-    one_shot_clients: Mutex<HashMap<String, Arc<LlmClient>>>,
+    one_shot_clients: Mutex<HashMap<(String, bool, u64), Arc<LlmClient>>>,
+    host_llm: Arc<crate::llm::host::HostLlmHub>,
+    host_binding_generation: Mutex<u64>,
 }
 
 impl PhoneBuddyRuntime {
@@ -155,6 +185,8 @@ impl PhoneBuddyRuntime {
             operations: Mutex::new(HashMap::new()),
             http_settings: Mutex::new(OneShotHttpSettings::from_engine(&EngineConfig::default())),
             one_shot_clients: Mutex::new(HashMap::new()),
+            host_llm: crate::llm::host::HostLlmHub::new(),
+            host_binding_generation: Mutex::new(0),
         }))
     }
 
@@ -201,6 +233,26 @@ impl PhoneBuddyRuntime {
         }
     }
 
+    pub fn host_llm(&self) -> Arc<crate::llm::host::HostLlmHub> {
+        self.host_llm.clone()
+    }
+
+    pub fn set_host_llm_notify(&self, cb: crate::llm::host::HostLlmNotify) {
+        self.host_llm.set_notify(cb);
+        *self.host_binding_generation.lock().unwrap() += 1;
+        self.one_shot_clients.lock().unwrap().clear();
+    }
+
+    pub fn set_host_llm_cancel_notify(&self, cb: crate::llm::host::HostLlmCancelNotify) {
+        self.host_llm.set_cancel_notify(cb);
+    }
+
+    pub fn clear_host_llm_notify(&self) {
+        self.host_llm.clear_notify();
+        *self.host_binding_generation.lock().unwrap() += 1;
+        self.one_shot_clients.lock().unwrap().clear();
+    }
+
     fn http_engine_config(&self) -> EngineConfig {
         let settings = self.http_settings.lock().unwrap();
         EngineConfig {
@@ -212,18 +264,33 @@ impl PhoneBuddyRuntime {
         }
     }
 
-    fn client_for_pool(&self, pool_id: &str) -> EngineResult<Arc<LlmClient>> {
-        if let Some(client) = self.one_shot_clients.lock().unwrap().get(pool_id) {
+    fn client_for_pool(
+        &self,
+        pool_id: &str,
+        allow_host_llm: bool,
+    ) -> EngineResult<Arc<LlmClient>> {
+        let generation = *self.host_binding_generation.lock().unwrap();
+        let key = (pool_id.to_string(), allow_host_llm, generation);
+        if let Some(client) = self.one_shot_clients.lock().unwrap().get(&key) {
             return Ok(client.clone());
         }
+        let bindings = crate::llm::client::TransportBindings {
+            host_hub: allow_host_llm.then(|| self.host_llm.clone()),
+            allow_host_llm,
+        };
         let client = Arc::new(
-            LlmClient::from_router(self.router(), pool_id, &self.http_engine_config())?
-                .with_workload(Workload::OneShot),
+            LlmClient::from_router_with_bindings(
+                self.router(),
+                pool_id,
+                &self.http_engine_config(),
+                bindings,
+            )?
+            .with_workload(Workload::OneShot),
         );
         self.one_shot_clients
             .lock()
             .unwrap()
-            .insert(pool_id.to_string(), client.clone());
+            .insert(key, client.clone());
         Ok(client)
     }
 
@@ -234,15 +301,12 @@ impl PhoneBuddyRuntime {
         cancellation: CancellationToken,
     ) -> EngineResult<GenerateTextResult> {
         if !self.router.has_pool(&request.pool_id) {
-            self.one_shot_clients
-                .lock()
-                .unwrap()
-                .remove(&request.pool_id);
+            self.one_shot_clients.lock().unwrap().retain(|(id, _, _), _| id != &request.pool_id);
             return Err(EngineError::RouteNotConfigured {
                 pool_id: request.pool_id,
             });
         }
-        let client = self.client_for_pool(&request.pool_id)?;
+        let client = self.client_for_pool(&request.pool_id, request.allow_host_llm)?;
         self.generate_text_on(&client, request, cancellation).await
     }
 
@@ -262,7 +326,11 @@ impl PhoneBuddyRuntime {
         request: GenerateTextRequest,
         on_done: impl FnOnce(String, EngineResult<GenerateTextResult>) + Send + 'static,
     ) -> EngineResult<String> {
-        let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
+        let operation_id = request
+            .operation_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("op_{}", uuid::Uuid::new_v4().simple()));
         let token = CancellationToken::new();
         self.operations
             .lock()
@@ -270,6 +338,8 @@ impl PhoneBuddyRuntime {
             .insert(operation_id.clone(), token.clone());
         let this = self.clone();
         let op = operation_id.clone();
+        let mut request = request;
+        request.operation_id = Some(op.clone());
         crate::engine::shared_runtime()?.spawn(async move {
             let result = AssertUnwindSafe(this.generate_text(request, token))
                 .catch_unwind()
@@ -294,6 +364,8 @@ impl PhoneBuddyRuntime {
         if let Some(token) = self.operations.lock().unwrap().get(operation_id) {
             token.cancel();
         }
+        self.host_llm
+            .abort_operation(operation_id, "operation cancelled");
     }
 
     /// Cancel every in-flight one-shot. Does not wait for last-Arc drop, so
@@ -304,6 +376,7 @@ impl PhoneBuddyRuntime {
                 token.cancel();
             }
         }
+        self.host_llm.abort_all("runtime cancelled");
     }
 
     async fn generate_text_on(
@@ -323,14 +396,18 @@ impl PhoneBuddyRuntime {
 
         let conv = one_shot_conversation_request(&request);
         let operation_timeout = request.timeout_ms.map(Duration::from_millis);
+        let cloud_phase_timeout = request.cloud_phase_timeout_ms.map(Duration::from_millis);
+        let operation_id = request.operation_id.clone();
 
         let work = async {
             let session = client.begin_turn();
             session
-                .complete_with_operation_timeout(
+                .complete_with_budgets(
                     &conv,
                     &OneShotDiagnostics,
                     operation_timeout,
+                    cloud_phase_timeout,
+                    operation_id,
                 )
                 .await
         };
@@ -438,25 +515,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn target(id: &str) -> ProviderTarget {
-        ProviderTarget {
-            provider_id: id.into(),
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "k".into(),
-            model: "m".into(),
-            api_backend: Default::default(),
-            client_profile: Default::default(),
-            client_version: None,
-            client_session_id: None,
-            reasoning_compatibility_key: None,
-            capabilities: Default::default(),
-            extra_headers: Default::default(),
-            extra_body: Default::default(),
-            enable_web_search: false,
-            web_search_options: None,
-            enable_x_search: false,
-            x_search_options: None,
-            reasoning_effort: None,
-        }
+        ProviderTarget::http(id, "https://api.example.com/v1", "k", "m")
     }
 
     #[test]
@@ -469,6 +528,7 @@ mod tests {
             base_score: 10,
             order: 0,
             enabled: true,
+            fallback_tier: 0,
         };
         pools.insert(
             MAIN_POOL_ID.into(),
@@ -517,6 +577,7 @@ mod tests {
                     base_score: 10,
                     order: 0,
                     enabled: true,
+                    fallback_tier: 0,
                 }],
                 ..Default::default()
             },
@@ -548,6 +609,7 @@ mod tests {
             base_score: 10,
             order: 0,
             enabled: true,
+            fallback_tier: 0,
         };
         let mut pools = std::collections::BTreeMap::new();
         pools.insert(
@@ -609,25 +671,15 @@ mod generate_text_tests {
     const TITLE_POOL: &str = "session_title";
 
     fn target_with(id: &str, backend: ApiBackend, web_search: bool) -> ProviderTarget {
-        ProviderTarget {
-            provider_id: id.into(),
-            base_url: format!("https://{id}.example.com/v1"),
-            api_key: "secret-key-must-not-leak".into(),
-            model: format!("{id}-model"),
-            api_backend: backend,
-            client_profile: Default::default(),
-            client_version: None,
-            client_session_id: None,
-            reasoning_compatibility_key: None,
-            capabilities: Default::default(),
-            extra_headers: Default::default(),
-            extra_body: Default::default(),
-            enable_web_search: web_search,
-            web_search_options: None,
-            enable_x_search: false,
-            x_search_options: None,
-            reasoning_effort: None,
-        }
+        let mut t = ProviderTarget::http(
+            id,
+            format!("https://{id}.example.com/v1"),
+            "secret-key-must-not-leak",
+            format!("{id}-model"),
+        );
+        t.api_backend = backend;
+        t.enable_web_search = web_search;
+        t
     }
 
     fn member(id: &str, order: u32) -> PoolMember {
@@ -637,6 +689,7 @@ mod generate_text_tests {
             base_score: 10,
             order,
             enabled: true,
+            fallback_tier: 0,
         }
     }
 
@@ -787,6 +840,7 @@ mod generate_text_tests {
             reasoning_effort: None,
             response_format: None,
             timeout_ms: None,
+            ..Default::default()
         }
     }
 

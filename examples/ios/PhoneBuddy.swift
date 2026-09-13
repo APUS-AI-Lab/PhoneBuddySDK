@@ -636,6 +636,9 @@ public struct GenerateTextRequest: Codable {
     public var reasoningEffort: String?
     public var responseFormat: GenerateTextResponseFormat?
     public var timeoutMs: UInt64?
+    public var allowHostLlm: Bool
+    public var cloudPhaseTimeoutMs: UInt64?
+    public var operationId: String?
 
     public init(
         poolId: String,
@@ -645,7 +648,10 @@ public struct GenerateTextRequest: Codable {
         temperature: Float? = nil,
         reasoningEffort: String? = nil,
         responseFormat: GenerateTextResponseFormat? = nil,
-        timeoutMs: UInt64? = nil
+        timeoutMs: UInt64? = nil,
+        allowHostLlm: Bool = false,
+        cloudPhaseTimeoutMs: UInt64? = nil,
+        operationId: String? = nil
     ) {
         self.poolId = poolId
         self.input = input
@@ -655,6 +661,9 @@ public struct GenerateTextRequest: Codable {
         self.reasoningEffort = reasoningEffort
         self.responseFormat = responseFormat
         self.timeoutMs = timeoutMs
+        self.allowHostLlm = allowHostLlm
+        self.cloudPhaseTimeoutMs = cloudPhaseTimeoutMs
+        self.operationId = operationId
     }
 
     enum CodingKeys: String, CodingKey {
@@ -666,6 +675,9 @@ public struct GenerateTextRequest: Codable {
         case reasoningEffort = "reasoning_effort"
         case responseFormat = "response_format"
         case timeoutMs = "timeout_ms"
+        case allowHostLlm = "allow_host_llm"
+        case cloudPhaseTimeoutMs = "cloud_phase_timeout_ms"
+        case operationId = "operation_id"
     }
 }
 
@@ -839,6 +851,61 @@ public final class PhoneBuddyRuntime {
         if let ptr = runtimePtr {
             pb_runtime_cancel_operation(ptr, operationId)
         }
+    }
+
+    public func setHostLlmCallbacks(
+        request: PbLlmRequestCallback,
+        cancel: PbLlmRequestCallback,
+        userData: UnsafeMutableRawPointer?
+    ) {
+        guard let ptr = runtimePtr else { return }
+        pb_runtime_set_host_llm_callbacks(ptr, request, cancel, userData)
+    }
+
+    public func pushHostLlmChunk(requestId: String, chunkJson: String) throws {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let rc = pb_runtime_llm_push_chunk(ptr, requestId, chunkJson, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.chatFailed(msg)
+        }
+        if rc != 0 {
+            throw PhoneBuddyError.chatFailed("pushHostLlmChunk failed")
+        }
+    }
+
+    public func finishHostLlm(requestId: String) throws {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let rc = pb_runtime_llm_finish(ptr, requestId, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.chatFailed(msg)
+        }
+        if rc != 0 {
+            throw PhoneBuddyError.chatFailed("finishHostLlm failed")
+        }
+    }
+
+    public func failHostLlm(requestId: String, errorJson: String) throws {
+        guard let ptr = runtimePtr else { throw PhoneBuddyError.engineClosed }
+        var errOut: UnsafeMutablePointer<CChar>? = nil
+        let rc = pb_runtime_llm_fail_v2(ptr, requestId, errorJson, &errOut)
+        if let err = errOut {
+            let msg = String(cString: err)
+            pb_string_free(err)
+            throw PhoneBuddyError.chatFailed(msg)
+        }
+        if rc != 0 {
+            throw PhoneBuddyError.chatFailed("failHostLlm failed")
+        }
+    }
+
+    public static var capabilities: String {
+        String(cString: pb_capabilities())
     }
 
     deinit {

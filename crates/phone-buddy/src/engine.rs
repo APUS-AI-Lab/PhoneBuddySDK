@@ -211,11 +211,16 @@ impl PhoneBuddyEngine {
         let host_tools = HostToolHub::new();
         let webview = WebViewHost::new();
         let sandbox = Arc::new(Sandbox::new(&config.root_dir)?);
+        let bindings = crate::llm::client::TransportBindings {
+            host_hub: config.allow_host_llm.then(|| host_llm.clone()),
+            allow_host_llm: config.allow_host_llm,
+        };
         let client = match config.llm_mode {
-            LlmMode::Http => Arc::new(LlmClient::from_router(
+            LlmMode::Http => Arc::new(LlmClient::from_router_with_bindings(
                 runtime.router(),
                 main_pool_id,
                 &config,
+                bindings.clone(),
             )?),
             LlmMode::Host => Arc::new(LlmClient::new(
                 Arc::new(HostLlmTransport::new(host_llm.clone())),
@@ -266,10 +271,21 @@ impl PhoneBuddyEngine {
 
         // Host / injected transports share the engine client; they have no named pools.
         let subagent_client = match (buddy_runtime.as_ref(), config.llm_mode) {
-            (Some(runtime), LlmMode::Http) => Arc::new(
-                LlmClient::from_router(runtime.router(), SUBAGENT_POOL_ID, &config)?
+            (Some(runtime), LlmMode::Http) => {
+                let bindings = crate::llm::client::TransportBindings {
+                    host_hub: config.allow_host_llm.then(|| host_llm.clone()),
+                    allow_host_llm: config.allow_host_llm,
+                };
+                Arc::new(
+                    LlmClient::from_router_with_bindings(
+                        runtime.router(),
+                        SUBAGENT_POOL_ID,
+                        &config,
+                        bindings,
+                    )?
                     .with_workload(Workload::Subagent),
-            ),
+                )
+            }
             _ => client.clone(),
         };
 
@@ -726,7 +742,13 @@ impl PhoneBuddyEngine {
                 _ = token.cancelled() => {
                     return Err(EngineError::Cancelled);
                 }
-                res = llm_turn.complete(&request, observer.as_ref()) => {
+                res = llm_turn.complete_with_budgets(
+                    &request,
+                    observer.as_ref(),
+                    self.config.operation_timeout_ms.map(std::time::Duration::from_millis),
+                    self.config.cloud_phase_timeout_ms.map(std::time::Duration::from_millis),
+                    None,
+                ) => {
                     res?
                 }
             };
@@ -1109,25 +1131,7 @@ mod tests {
     }
 
     fn target(id: &str) -> ProviderTarget {
-        ProviderTarget {
-            provider_id: id.into(),
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "k".into(),
-            model: "m".into(),
-            api_backend: Default::default(),
-            client_profile: Default::default(),
-            client_version: None,
-            client_session_id: None,
-            reasoning_compatibility_key: None,
-            capabilities: Default::default(),
-            extra_headers: Default::default(),
-            extra_body: Default::default(),
-            enable_web_search: false,
-            web_search_options: None,
-            enable_x_search: false,
-            x_search_options: None,
-            reasoning_effort: None,
-        }
+        ProviderTarget::http(id, "https://api.example.com/v1", "k", "m")
     }
 
     #[test]
@@ -1154,6 +1158,7 @@ mod tests {
             base_score: 10,
             order: 0,
             enabled: true,
+            fallback_tier: 0,
         };
         let mut pools = std::collections::BTreeMap::new();
         pools.insert(

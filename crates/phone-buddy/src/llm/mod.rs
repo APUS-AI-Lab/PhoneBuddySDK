@@ -1,6 +1,7 @@
 //! LLM layer: wire types, transports, streaming, retry, client.
 
 pub mod client;
+pub mod context_budget;
 pub mod doom_loop_collector;
 pub mod endpoint;
 pub mod doom_loop_wire;
@@ -16,10 +17,10 @@ pub mod transport;
 pub mod types;
 pub mod wire;
 
-pub use client::{LlmClient, LlmTransportObj, LlmTurnSession};
+pub use client::{LlmClient, LlmTransportObj, LlmTurnSession, TransportBindings};
 pub use endpoint::{LlmEndpoint, LlmEndpointProvider, SharedLlmEndpointProvider};
 pub use dumper::{HttpDumpConfig, HttpDumpMode, HttpDumper};
-pub use host::{HostLlmHub, HostLlmNotify, HostLlmTransport};
+pub use host::{HostLlmCancelNotify, HostLlmHub, HostLlmNotify, HostLlmTransport};
 pub use profiles::{
     build_profile_headers, get_profile_definition, render_user_agent, ClientProfile,
     ClientProfileDefinition,

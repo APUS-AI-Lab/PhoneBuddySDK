@@ -164,6 +164,22 @@ pub fn select_visit_order(
 }
 
 fn rank_eligible(members: &mut [ScoredMember<'_>]) -> Vec<String> {
+    let mut tiers: Vec<u32> = members.iter().map(|s| s.member.fallback_tier).collect();
+    tiers.sort_unstable();
+    tiers.dedup();
+    let mut out = Vec::with_capacity(members.len());
+    for tier in tiers {
+        let mut in_tier: Vec<ScoredMember<'_>> = members
+            .iter()
+            .filter(|s| s.member.fallback_tier == tier)
+            .cloned()
+            .collect();
+        out.extend(rank_eligible_within_tier(&mut in_tier));
+    }
+    out
+}
+
+fn rank_eligible_within_tier(members: &mut [ScoredMember<'_>]) -> Vec<String> {
     let mut groups: HashMap<&str, (i32, u32)> = HashMap::new();
     for s in members.iter() {
         let entry = groups
@@ -203,8 +219,10 @@ fn rank_probe_earliest(members: &mut [ScoredMember<'_>], now: DateTime<Utc>) -> 
     members.sort_by(|a, b| {
         let a_exp = a.cooldown_until.unwrap_or(now);
         let b_exp = b.cooldown_until.unwrap_or(now);
-        a_exp
-            .cmp(&b_exp)
+        a.member
+            .fallback_tier
+            .cmp(&b.member.fallback_tier)
+            .then(a_exp.cmp(&b_exp))
             .then(b.score.cmp(&a.score))
             .then(a.member.order.cmp(&b.member.order))
             .then(a.member.provider_id.cmp(&b.member.provider_id))
@@ -222,12 +240,17 @@ mod tests {
     use chrono::TimeZone;
 
     fn member(id: &str, group: &str, score: i32, order: u32) -> PoolMember {
+        member_tier(id, group, score, order, 0)
+    }
+
+    fn member_tier(id: &str, group: &str, score: i32, order: u32, fallback_tier: u32) -> PoolMember {
         PoolMember {
             provider_id: id.into(),
             routing_group: group.into(),
             base_score: score,
             order,
             enabled: true,
+            fallback_tier,
         }
     }
 
@@ -401,5 +424,73 @@ mod tests {
         let plan = select_visit_order("title", &pool, &health, &cfg(), t0()).unwrap();
         assert_eq!(plan.provider_ids, vec!["a"]);
         assert!(!plan.chain_mode);
+    }
+
+    #[test]
+    fn fallback_tier_outranks_health_score() {
+        let pool = ProviderPool {
+            members: vec![
+                member_tier("cloud-weak", "cloud", 1, 0, 0),
+                member_tier("local-strong", "local", 5, 1, 1),
+            ],
+            retry: RetryPolicy::default(),
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
+        };
+        let plan = select_visit_order("main", &pool, &HashMap::new(), &cfg(), t0()).unwrap();
+        assert_eq!(plan.provider_ids, vec!["cloud-weak", "local-strong"]);
+    }
+
+    #[test]
+    fn cooling_cloud_is_appended_after_eligible_local() {
+        let pool = ProviderPool {
+            members: vec![
+                member_tier("cloud-a", "cloud", 10, 0, 0),
+                member_tier("local-a", "local", 5, 1, 1),
+            ],
+            retry: RetryPolicy::default(),
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
+        };
+        let mut health = HashMap::new();
+        health.insert(
+            "cloud-a".into(),
+            ProviderHealthRecord {
+                cooldown_until: Some(t0() + chrono::Duration::seconds(120)),
+                consecutive_trips: 1,
+                ..Default::default()
+            },
+        );
+        let plan = select_visit_order("main", &pool, &health, &cfg(), t0()).unwrap();
+        assert_eq!(plan.provider_ids, vec!["local-a", "cloud-a"]);
+    }
+
+    #[test]
+    fn all_cooling_still_ranks_cloud_tier_before_local() {
+        let pool = ProviderPool {
+            members: vec![
+                member_tier("cloud-a", "cloud", 10, 0, 0),
+                member_tier("local-a", "local", 5, 1, 1),
+            ],
+            retry: RetryPolicy::default(),
+            when_exhausted: ExhaustionPolicy::ProbeEarliest,
+        };
+        let mut health = HashMap::new();
+        health.insert(
+            "cloud-a".into(),
+            ProviderHealthRecord {
+                cooldown_until: Some(t0() + chrono::Duration::seconds(40)),
+                consecutive_trips: 1,
+                ..Default::default()
+            },
+        );
+        health.insert(
+            "local-a".into(),
+            ProviderHealthRecord {
+                cooldown_until: Some(t0() + chrono::Duration::seconds(10)),
+                consecutive_trips: 1,
+                ..Default::default()
+            },
+        );
+        let plan = select_visit_order("main", &pool, &health, &cfg(), t0()).unwrap();
+        assert_eq!(plan.provider_ids, vec!["cloud-a", "local-a"]);
     }
 }

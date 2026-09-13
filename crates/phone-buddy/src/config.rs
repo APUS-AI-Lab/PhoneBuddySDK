@@ -158,6 +158,16 @@ pub struct EngineConfig {
     /// When false, a user turn with audio attachments fails with [`crate::error::EngineError::AudioUnsupported`].
     #[serde(default = "default_supports_audio_input")]
     pub supports_audio_input: bool,
+    /// Allow this engine's clients to bind `host://` pool members. Default false.
+    #[serde(default)]
+    pub allow_host_llm: bool,
+    /// Optional cloud-phase budget. When local candidates remain, expiry
+    /// skips remaining cloud members. Unset keeps historic behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_phase_timeout_ms: Option<u64>,
+    /// Optional total deadline for each LLM step (cloud + queue + host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_timeout_ms: Option<u64>,
 }
 
 fn default_supports_image_input() -> bool {
@@ -284,6 +294,9 @@ impl Default for EngineConfig {
             attachment_root: None,
             supports_image_input: true,
             supports_audio_input: true,
+            allow_host_llm: false,
+            cloud_phase_timeout_ms: None,
+            operation_timeout_ms: None,
         }
     }
 }

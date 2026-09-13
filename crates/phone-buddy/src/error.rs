@@ -113,6 +113,30 @@ pub enum EngineError {
 
     #[error("{backend} backend does not support the requested response_format")]
     ResponseFormatUnsupported { backend: String },
+
+    #[error("host LLM binding is not ready")]
+    HostBindingNotReady,
+
+    #[error("host LLM unavailable ({code}): {message}")]
+    HostUnavailable {
+        code: String,
+        scope: String,
+        before_output: bool,
+        message: String,
+    },
+
+    #[error("local context exceeded")]
+    LocalContextExceeded,
+
+    #[error("connect failed to {origin}: {message}")]
+    ConnectFailed { origin: String, message: String },
+
+    #[error("local fallback unavailable in pool '{pool_id}': {reason}")]
+    LocalFallbackUnavailable {
+        pool_id: String,
+        reason: String,
+        candidate_codes: Vec<String>,
+    },
 }
 
 impl EngineError {
@@ -151,6 +175,11 @@ impl EngineError {
             Self::OperationTimedOut => "OperationTimedOut",
             Self::OperationCancelled => "OperationCancelled",
             Self::ResponseFormatUnsupported { .. } => "ResponseFormatUnsupported",
+            Self::HostBindingNotReady => "HostBindingNotReady",
+            Self::HostUnavailable { .. } => "HostUnavailable",
+            Self::LocalContextExceeded => "LocalContextExceeded",
+            Self::ConnectFailed { .. } => "ConnectFailed",
+            Self::LocalFallbackUnavailable { .. } => "LocalFallbackUnavailable",
         }
     }
 
@@ -175,8 +204,43 @@ impl EngineError {
             Self::ResponseFormatUnsupported { backend } => {
                 serde_json::json!({ "api_backend": backend })
             }
+            Self::HostUnavailable {
+                code,
+                scope,
+                before_output,
+                message,
+            } => serde_json::json!({
+                "code": code,
+                "scope": scope,
+                "before_output": before_output,
+                "message": message,
+            }),
+            Self::ConnectFailed { origin, message } => serde_json::json!({
+                "origin": origin,
+                "message": message,
+            }),
+            Self::LocalFallbackUnavailable {
+                pool_id,
+                reason,
+                candidate_codes,
+            } => serde_json::json!({
+                "pool_id": pool_id,
+                "reason": reason,
+                "candidate_codes": candidate_codes,
+            }),
             _ => serde_json::json!({}),
         }
+    }
+
+    pub fn is_provider_scoped_host_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::HostUnavailable {
+                scope,
+                before_output: true,
+                ..
+            } if scope == "provider"
+        ) || matches!(self, Self::LocalContextExceeded)
     }
 }
 

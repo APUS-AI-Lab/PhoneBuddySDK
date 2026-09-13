@@ -301,6 +301,16 @@ pub extern "C" fn pb_version() -> *const c_char {
     v.as_ptr()
 }
 
+/// JSON object of ABI capabilities. Do not free.
+#[no_mangle]
+pub extern "C" fn pb_capabilities() -> *const c_char {
+    static CAPS: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    let v = CAPS.get_or_init(|| {
+        CString::new("{\"mixed_host_provider_v1\":true,\"runtime_host_llm_v1\":true}").unwrap()
+    });
+    v.as_ptr()
+}
+
 /// Create an engine from a JSON configuration.
 ///
 /// `config_json` must match [`phone_buddy::config::EngineConfig`].
@@ -449,6 +459,139 @@ pub unsafe extern "C" fn pb_runtime_update_routing(
             }
         }
     })
+}
+
+/// Register Runtime Host LLM callbacks. `llm_cb` receives `(request_id, envelope_json)`.
+///
+/// # Safety
+/// Callbacks may be invoked from worker threads. `user_data` must remain valid
+/// until [`pb_runtime_set_host_llm_callbacks`] is called again with null or
+/// the runtime is freed.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_set_host_llm_callbacks(
+    runtime: *mut PbRuntime,
+    llm_cb: PbLlmRequestCallback,
+    cancel_cb: PbLlmRequestCallback,
+    user_data: *mut c_void,
+) {
+    let Some(runtime) = runtime.as_ref() else {
+        return;
+    };
+    if let Some(cb) = llm_cb {
+        let ud = user_data as usize;
+        runtime.inner.set_host_llm_notify(std::sync::Arc::new(
+            move |request_id: String, request_json: String| {
+                let Ok(id_c) = CString::new(request_id) else {
+                    return;
+                };
+                let Ok(json_c) = CString::new(request_json) else {
+                    return;
+                };
+                unsafe {
+                    cb(id_c.as_ptr(), json_c.as_ptr(), ud as *mut c_void);
+                }
+            },
+        ));
+    } else {
+        runtime.inner.clear_host_llm_notify();
+    }
+    if let Some(cb) = cancel_cb {
+        let ud = user_data as usize;
+        runtime
+            .inner
+            .set_host_llm_cancel_notify(std::sync::Arc::new(move |request_id: String| {
+                let Ok(id_c) = CString::new(request_id) else {
+                    return;
+                };
+                unsafe {
+                    cb(id_c.as_ptr(), std::ptr::null(), ud as *mut c_void);
+                }
+            }));
+    }
+}
+
+/// Push one OpenAI-compatible chunk for a Runtime Host LLM request.
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_llm_push_chunk(
+    runtime: *mut PbRuntime,
+    request_id: *const c_char,
+    chunk_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(runtime) = runtime.as_ref() else {
+        set_err(err_out, "runtime is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    let Some(chunk_json) = str_from(chunk_json) else {
+        set_err(err_out, "chunk_json is null or invalid".into());
+        return -3;
+    };
+    let chunk: phone_buddy::llm::ChatCompletionChunk = match serde_json::from_str(chunk_json) {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err_out, format!("invalid chunk JSON: {e}"));
+            return -4;
+        }
+    };
+    match runtime.inner.host_llm().push_chunk(request_id, chunk) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -5
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_llm_finish(
+    runtime: *mut PbRuntime,
+    request_id: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(runtime) = runtime.as_ref() else {
+        set_err(err_out, "runtime is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    match runtime.inner.host_llm().finish(request_id) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_llm_fail(
+    runtime: *mut PbRuntime,
+    request_id: *const c_char,
+    error_msg: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let Some(runtime) = runtime.as_ref() else {
+        set_err(err_out, "runtime is null".into());
+        return -1;
+    };
+    let Some(request_id) = str_from(request_id) else {
+        set_err(err_out, "request_id is null or invalid".into());
+        return -2;
+    };
+    let msg = str_from(error_msg).unwrap_or("host LLM failed");
+    match runtime.inner.host_llm().fail(request_id, msg) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(err_out, e);
+            -3
+        }
+    }
 }
 
 /// Create an engine bound to `runtime`. `main_pool_id` defaults to `"main"` when null.
@@ -989,6 +1132,27 @@ pub unsafe extern "C" fn pb_engine_llm_fail(
             -3
         }
     }
+}
+
+/// Fail a host LLM stream with a structured JSON body (`code`, `scope`, `before_output`, `message`).
+#[no_mangle]
+pub unsafe extern "C" fn pb_engine_llm_fail_v2(
+    engine: *mut PbEngine,
+    request_id: *const c_char,
+    error_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    pb_engine_llm_fail(engine, request_id, error_json, err_out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pb_runtime_llm_fail_v2(
+    runtime: *mut PbRuntime,
+    request_id: *const c_char,
+    error_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    pb_runtime_llm_fail(runtime, request_id, error_json, err_out)
 }
 
 /// Register host tools from an OpenAI tools JSON array.
@@ -1881,6 +2045,15 @@ mod tests {
                 .to_string()
         };
         let _ = tx.send(s);
+    }
+
+    #[test]
+    fn test_pb_capabilities_advertises_mixed_host() {
+        let raw = unsafe { CStr::from_ptr(pb_capabilities()) }
+            .to_str()
+            .unwrap();
+        assert!(raw.contains("mixed_host_provider_v1"));
+        assert!(raw.contains("runtime_host_llm_v1"));
     }
 
     #[test]

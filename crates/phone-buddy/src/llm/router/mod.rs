@@ -12,10 +12,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 pub use config::{
-    synthesize_legacy_routing, ExhaustionPolicy, LlmRoutingConfig, PoolMember,
-    ProviderCapabilities, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, Workload,
-    DEFAULT_BASE_SCORE, DEFAULT_ROUTING_GROUP, LEGACY_PRIMARY_PROVIDER_ID, MAIN_POOL_ID,
-    SUBAGENT_POOL_ID,
+    http_origin_key, is_host_base_url, parse_host_provider_label, synthesize_legacy_routing,
+    ExhaustionPolicy, LlmRoutingConfig, PoolMember, ProviderCapabilities, ProviderPool,
+    ProviderTarget, RetryPolicy, RouterHealthConfig, Workload, DEFAULT_BASE_SCORE,
+    DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_ROUTING_GROUP, HOST_LLM_LLAMA_RN, HOST_LLM_SCHEME,
+    LEGACY_PRIMARY_PROVIDER_ID, MAIN_POOL_ID, SUBAGENT_POOL_ID,
 };
 pub use health::{health_file_path, FailureClass, ProviderHealthRecord};
 pub use select::VisitPlan;
@@ -129,17 +130,36 @@ impl LlmRouter {
     /// Capture a visit order for one operation. Health timestamps are pruned
     /// under the router lock before ranking.
     pub fn plan_visit(&self, pool_id: &str) -> EngineResult<VisitPlan> {
-        self.plan_visit_at(pool_id, Utc::now())
+        self.plan_visit_filtered(pool_id, None)
+    }
+
+    /// Like [`Self::plan_visit`], but only members in `allowed` are ranked.
+    /// Used so Host-disabled clients never receive unbound `host://` ids.
+    pub fn plan_visit_filtered(
+        &self,
+        pool_id: &str,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> EngineResult<VisitPlan> {
+        self.plan_visit_filtered_at(pool_id, allowed, Utc::now())
     }
 
     pub fn plan_visit_at(&self, pool_id: &str, now: DateTime<Utc>) -> EngineResult<VisitPlan> {
+        self.plan_visit_filtered_at(pool_id, None, now)
+    }
+
+    pub fn plan_visit_filtered_at(
+        &self,
+        pool_id: &str,
+        allowed: Option<&std::collections::HashSet<String>>,
+        now: DateTime<Utc>,
+    ) -> EngineResult<VisitPlan> {
         let mut inner = self.inner.lock().unwrap();
         let RouterInner {
             generation,
             config,
             health,
         } = &mut *inner;
-        let pool =
+        let mut pool =
             config
                 .pools
                 .get(pool_id)
@@ -147,6 +167,16 @@ impl LlmRouter {
                 .ok_or_else(|| EngineError::RouteNotConfigured {
                     pool_id: pool_id.to_string(),
                 })?;
+        if let Some(allowed) = allowed {
+            pool.members
+                .retain(|m| allowed.contains(&m.provider_id));
+            if pool.members.is_empty() {
+                return Err(EngineError::PoolExhausted {
+                    pool_id: pool_id.to_string(),
+                    retry_after_ms: 0,
+                });
+            }
+        }
         reconcile_health(health, config, now);
         match select_visit_order(pool_id, &pool, health, &config.health, now) {
             Ok(mut plan) => {
@@ -306,25 +336,7 @@ mod tests {
     use chrono::TimeZone;
 
     fn target(id: &str, url: &str) -> ProviderTarget {
-        ProviderTarget {
-            provider_id: id.into(),
-            base_url: url.into(),
-            api_key: "k".into(),
-            model: "m".into(),
-            api_backend: Default::default(),
-            client_profile: Default::default(),
-            client_version: None,
-            client_session_id: None,
-            reasoning_compatibility_key: None,
-            capabilities: Default::default(),
-            extra_headers: HashMap::new(),
-            extra_body: HashMap::new(),
-            enable_web_search: false,
-            web_search_options: None,
-            enable_x_search: false,
-            x_search_options: None,
-            reasoning_effort: None,
-        }
+        ProviderTarget::http(id, url, "k", "m")
     }
 
     fn member(id: &str, order: u32) -> PoolMember {
@@ -334,6 +346,7 @@ mod tests {
             base_score: 10,
             order,
             enabled: true,
+            fallback_tier: 0,
         }
     }
 

@@ -36,6 +36,10 @@ pub struct LlmTurnContext {
     /// provider visit. Agent turns leave this unset; one-shot operations use
     /// it to preserve time for later providers in the same deadline.
     request_timeout: Arc<Mutex<Option<Duration>>>,
+    operation_id: Arc<Mutex<Option<String>>>,
+    pool_id: Arc<Mutex<Option<String>>>,
+    provider_id: Arc<Mutex<Option<String>>>,
+    deadline_unix_ms: Arc<Mutex<Option<u64>>>,
 }
 
 impl LlmTurnContext {
@@ -63,6 +67,46 @@ impl LlmTurnContext {
     pub(crate) fn set_request_timeout(&self, timeout: Option<Duration>) {
         if let Ok(mut current) = self.request_timeout.lock() {
             *current = timeout;
+        }
+    }
+
+    pub(crate) fn operation_id(&self) -> Option<String> {
+        self.operation_id.lock().ok().and_then(|v| v.clone())
+    }
+
+    pub(crate) fn set_operation_id(&self, id: Option<String>) {
+        if let Ok(mut current) = self.operation_id.lock() {
+            *current = id;
+        }
+    }
+
+    pub(crate) fn pool_id(&self) -> Option<String> {
+        self.pool_id.lock().ok().and_then(|v| v.clone())
+    }
+
+    pub(crate) fn set_pool_id(&self, id: Option<String>) {
+        if let Ok(mut current) = self.pool_id.lock() {
+            *current = id;
+        }
+    }
+
+    pub(crate) fn provider_id(&self) -> Option<String> {
+        self.provider_id.lock().ok().and_then(|v| v.clone())
+    }
+
+    pub(crate) fn set_provider_id(&self, id: Option<String>) {
+        if let Ok(mut current) = self.provider_id.lock() {
+            *current = id;
+        }
+    }
+
+    pub(crate) fn deadline_unix_ms(&self) -> Option<u64> {
+        self.deadline_unix_ms.lock().ok().and_then(|v| *v)
+    }
+
+    pub(crate) fn set_deadline_unix_ms(&self, ms: Option<u64>) {
+        if let Ok(mut current) = self.deadline_unix_ms.lock() {
+            *current = ms;
         }
     }
 }
@@ -105,6 +149,10 @@ pub fn status_from_error(err: &EngineError) -> Option<u16> {
 /// Whether a transport error is worth retrying.
 pub fn retry_class_for_error(err: &EngineError) -> RetryClass {
     match err {
+        EngineError::ConnectFailed { .. } => RetryClass::Retry,
+        EngineError::HostUnavailable { .. } | EngineError::LocalContextExceeded => {
+            RetryClass::Fatal
+        }
         EngineError::Llm(msg) => {
             // Upstream vetoes first: x-should-retry=false / context overflow.
             if is_retry_vetoed_message(msg) {
@@ -132,6 +180,29 @@ pub fn retry_class_for_error(err: &EngineError) -> RetryClass {
     }
 }
 
+fn is_connect_failure(
+    err: &reqwest::Error,
+    connect_timeout: Duration,
+    start: Instant,
+) -> bool {
+    if err.is_connect() {
+        return true;
+    }
+    if err.status().is_some() {
+        return false;
+    }
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("dns")
+        || msg.contains("name resolution")
+        || msg.contains("tls handshake")
+        || msg.contains("certificate")
+        || msg.contains("ssl") && msg.contains("handshake")
+    {
+        return true;
+    }
+    err.is_timeout() && start.elapsed() <= connect_timeout + Duration::from_millis(250)
+}
+
 // ── HTTP transport ───────────────────────────────────────────────────────
 
 use crate::llm::profiles::ClientProfile;
@@ -154,6 +225,7 @@ pub struct HttpTransport {
     turn_state_key: String,
     /// HTTP Traffic Dumper for diagnostics
     dumper: crate::llm::dumper::HttpDumper,
+    connect_timeout: Duration,
 }
 
 impl HttpTransport {
@@ -248,11 +320,41 @@ impl HttpTransport {
         doom_loop_enabled: bool,
         dumper: crate::llm::dumper::HttpDumper,
     ) -> EngineResult<Self> {
+        Self::new_with_connect_timeout(
+            base_url,
+            api_key,
+            idle_timeout,
+            api_backend,
+            client_profile,
+            client_version,
+            client_session_id,
+            extra_headers,
+            extra_body,
+            doom_loop_enabled,
+            dumper,
+            Duration::from_secs(30),
+        )
+    }
+
+    pub fn new_with_connect_timeout(
+        base_url: &str,
+        api_key: &str,
+        idle_timeout: Duration,
+        api_backend: ApiBackend,
+        client_profile: ClientProfile,
+        client_version: Option<String>,
+        client_session_id: Option<String>,
+        extra_headers: std::collections::HashMap<String, String>,
+        extra_body: std::collections::HashMap<String, serde_json::Value>,
+        doom_loop_enabled: bool,
+        dumper: crate::llm::dumper::HttpDumper,
+        connect_timeout: Duration,
+    ) -> EngineResult<Self> {
         // Match grok-build's sampler HTTP client: Nagle off (HTTP/1.1 SSE
         // otherwise sits in TCP buffers) and HTTP/2 keepalive pings so a
         // silent hosted-search interval does not look like a dead socket.
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(connect_timeout)
             .timeout(Duration::from_secs(60 * 10))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(2)
@@ -276,6 +378,7 @@ impl HttpTransport {
             doom_loop_enabled: doom_loop_enabled && matches!(api_backend, ApiBackend::Responses),
             turn_state_key: uuid::Uuid::new_v4().to_string(),
             dumper,
+            connect_timeout,
         })
     }
 
@@ -579,6 +682,14 @@ impl HttpTransport {
                 let mut full_err = err_msg;
                 if let Some(path) = dump_path_opt {
                     full_err.push_str(&format!(" [HTTP dump: {}]", path.display()));
+                }
+                if is_connect_failure(&e, self.connect_timeout, start_time) {
+                    let origin = crate::llm::router::http_origin_key(&self.base_url)
+                        .unwrap_or_else(|| self.base_url.clone());
+                    return Err(EngineError::ConnectFailed {
+                        origin,
+                        message: full_err,
+                    });
                 }
                 return Err(EngineError::Llm(full_err));
             }
