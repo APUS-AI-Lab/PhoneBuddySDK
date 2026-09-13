@@ -180,9 +180,7 @@ impl HostLlmHub {
         let mut pending = self.pending.lock().unwrap();
         let ids: Vec<String> = pending.keys().cloned().collect();
         for (_id, stream) in pending.drain() {
-            let _ = stream
-                .tx
-                .send(Err(EngineError::Llm(message.to_string())));
+            let _ = stream.tx.send(Err(EngineError::Llm(message.to_string())));
         }
         drop(pending);
         let cancel = self.cancel_notify.lock().unwrap().clone();
@@ -202,9 +200,7 @@ impl HostLlmHub {
             .collect();
         for id in &ids {
             if let Some(stream) = pending.remove(id) {
-                let _ = stream
-                    .tx
-                    .send(Err(EngineError::Llm(message.to_string())));
+                let _ = stream.tx.send(Err(EngineError::Llm(message.to_string())));
             }
         }
         drop(pending);
@@ -279,10 +275,13 @@ impl Drop for HostStreamGuard {
 
 impl LlmTransport for HostLlmTransport {
     async fn request_stream(&self, req: &ConversationRequest) -> EngineResult<ChunkStream> {
-        self.request_stream_with_meta(req, HostRequestMeta {
-            provider_id: self.provider_id.clone(),
-            ..Default::default()
-        })
+        self.request_stream_with_meta(
+            req,
+            HostRequestMeta {
+                provider_id: self.provider_id.clone(),
+                ..Default::default()
+            },
+        )
         .await
     }
 
@@ -462,5 +461,65 @@ mod tests {
             Ok(_) => panic!("expected error without notify"),
             Err(e) => assert!(e.to_string().contains("notify"), "{e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_host_request_id_does_not_fail_another() {
+        let hub = HostLlmHub::new();
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let captured = ids.clone();
+        hub.set_notify(Arc::new(move |id, _json| {
+            captured.lock().unwrap().push(id);
+        }));
+
+        let mut rx_a = hub.begin(&sample_req()).unwrap();
+        let mut rx_b = hub.begin(&sample_req()).unwrap();
+        let ids = ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+
+        hub.fail(&ids[0], "cancelled").unwrap();
+        let err = rx_a.recv().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+
+        hub.push_chunk(&ids[1], text_chunk("ok")).unwrap();
+        hub.finish(&ids[1]).unwrap();
+        let chunk = rx_b.recv().await.unwrap().unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("ok"));
+        assert!(rx_b.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_operation_does_not_fail_other_operations() {
+        let hub = HostLlmHub::new();
+        hub.set_notify(Arc::new(|_id, _json| {}));
+
+        let (_id_a, mut rx_a) = hub
+            .begin_with_meta(
+                &sample_req(),
+                HostRequestMeta {
+                    operation_id: "op-a".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (id_b, mut rx_b) = hub
+            .begin_with_meta(
+                &sample_req(),
+                HostRequestMeta {
+                    operation_id: "op-b".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        hub.abort_operation("op-a", "operation cancelled");
+        let err = rx_a.recv().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+
+        hub.push_chunk(&id_b, text_chunk("ok")).unwrap();
+        hub.finish(&id_b).unwrap();
+        let chunk = rx_b.recv().await.unwrap().unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("ok"));
+        assert!(rx_b.recv().await.is_none());
     }
 }

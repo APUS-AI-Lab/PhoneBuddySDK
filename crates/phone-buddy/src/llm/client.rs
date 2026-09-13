@@ -26,8 +26,8 @@ use crate::llm::retry::{
 };
 use crate::llm::router::{
     synthesize_legacy_routing, ExhaustionPolicy, FailureClass, LlmRouter, LlmRoutingConfig,
-    PoolMember, ProviderPool, ProviderTarget, RetryPolicy, RouterHealthConfig, Workload,
-    MAIN_POOL_ID,
+    PoolMember, ProviderCapabilities, ProviderPool, ProviderTarget, RetryPolicy,
+    RouterHealthConfig, Workload, MAIN_POOL_ID,
 };
 use crate::llm::stream::{collect_stream, CollectStreamError};
 use crate::llm::transport::{
@@ -151,6 +151,7 @@ struct ProviderSlot {
     is_host: bool,
     context_window_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
+    capabilities: ProviderCapabilities,
 }
 
 /// Object-safe wrapper so the client can hold `Arc<dyn ...>`.
@@ -235,6 +236,7 @@ impl LlmClient {
             is_host: false,
             context_window_tokens: None,
             max_output_tokens: None,
+            capabilities: ProviderCapabilities::default(),
         };
         let router = synthetic_router(
             std::slice::from_ref(&slot),
@@ -292,6 +294,7 @@ impl LlmClient {
                 is_host: false,
                 context_window_tokens: None,
                 max_output_tokens: None,
+                capabilities: ProviderCapabilities::default(),
             };
             if primary_compat_key.is_empty() {
                 primary_compat_key = slot.compat_key.clone();
@@ -516,6 +519,21 @@ impl LlmClient {
             let tools = out.tools.take().unwrap_or_default();
             out.tools = drop_colliding_function_tools(tools, &out.hosted_tools);
         }
+        if slot.capabilities.supports_tools == Some(false)
+            && out.tools.as_ref().is_some_and(|t| !t.is_empty())
+        {
+            return Err(local_request_unsupported("provider does not support tools"));
+        }
+        if slot.capabilities.supports_structured_output == Some(false)
+            && out
+                .response_format
+                .as_ref()
+                .is_some_and(|format| !format.is_text())
+        {
+            return Err(local_request_unsupported(
+                "provider does not support structured output",
+            ));
+        }
         let target = slot.compat_key.as_str();
         out.items = crate::llm::failover::sanitize_items_for_provider(
             &out.items,
@@ -538,9 +556,8 @@ impl LlmClient {
                     return Err(EngineError::LocalContextExceeded);
                 }
             } else {
-                out.items = crate::llm::context_budget::trim_history_to_window(
-                    &out.items, window, output,
-                )?;
+                out.items =
+                    crate::llm::context_budget::trim_history_to_window(&out.items, window, output)?;
             }
         }
         Ok(out)
@@ -645,8 +662,7 @@ impl LlmClient {
         let plan = &captured.plan;
         let now = Instant::now();
         let operation_deadline = operation_timeout.and_then(|timeout| now.checked_add(timeout));
-        let cloud_phase_deadline =
-            cloud_phase_timeout.and_then(|timeout| now.checked_add(timeout));
+        let cloud_phase_deadline = cloud_phase_timeout.and_then(|timeout| now.checked_add(timeout));
         context.set_operation_id(Some(operation_id.clone()));
         context.set_pool_id(Some(self.pool_id.clone()));
         if let Some(deadline) = operation_deadline {
@@ -745,15 +761,16 @@ impl LlmClient {
             );
 
             let visits_remaining = plan.provider_ids.len().saturating_sub(visit_idx);
-            let provider_budget = operation_deadline
-                .filter(|_| visits_remaining > 1)
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .checked_div(visits_remaining as u32)
-                        .unwrap_or_default()
-                        .max(Duration::from_millis(1))
-                });
+            let provider_budget =
+                operation_deadline
+                    .filter(|_| visits_remaining > 1)
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .checked_div(visits_remaining as u32)
+                            .unwrap_or_default()
+                            .max(Duration::from_millis(1))
+                    });
             // Let reqwest surface and dump its timeout slightly before the
             // client-level guard. The guard remains necessary for injected or
             // custom transports that do not consume LlmTurnContext.
@@ -1690,6 +1707,7 @@ fn bind_injected_slots(
                 is_host: target.is_host(),
                 context_window_tokens: target.capabilities.context_window_tokens,
                 max_output_tokens: target.capabilities.max_output_tokens,
+                capabilities: target.capabilities.clone(),
             },
         );
     }
@@ -1760,6 +1778,7 @@ fn slot_from_target(
         is_host: target.is_host(),
         context_window_tokens: target.capabilities.context_window_tokens,
         max_output_tokens: target.capabilities.max_output_tokens,
+        capabilities: target.capabilities.clone(),
         transport,
     })
 }
@@ -1818,7 +1837,17 @@ impl ProviderSlot {
             is_host: self.is_host,
             context_window_tokens: self.context_window_tokens,
             max_output_tokens: self.max_output_tokens,
+            capabilities: self.capabilities.clone(),
         }
+    }
+}
+
+fn local_request_unsupported(message: &str) -> EngineError {
+    EngineError::HostUnavailable {
+        code: "local_request_unsupported".into(),
+        scope: "provider".into(),
+        before_output: true,
+        message: message.to_string(),
     }
 }
 
@@ -1936,7 +1965,10 @@ mod tests {
     use super::*;
     use crate::events::RecordingObserver;
     use crate::llm::router::SUBAGENT_POOL_ID;
-    use crate::llm::types::{ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, Role};
+    use crate::llm::types::{
+        ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, FunctionDefinitionWire,
+        ResponseFormat, Role, ToolDefinitionWire,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct ScriptedTransport {
@@ -1983,6 +2015,74 @@ mod tests {
                 });
             };
             Ok(Box::pin(stream))
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct ConnectFailTransport {
+        name: String,
+        origin: String,
+        hits: Arc<AtomicU32>,
+    }
+
+    impl ConnectFailTransport {
+        fn new(name: &str, origin: &str, hits: Arc<AtomicU32>) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                origin: origin.into(),
+                hits,
+            })
+        }
+    }
+
+    impl LlmTransport for ConnectFailTransport {
+        async fn request_stream(
+            &self,
+            _req: &ConversationRequest,
+        ) -> EngineResult<crate::llm::transport::ChunkStream> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Err(EngineError::ConnectFailed {
+                origin: self.origin.clone(),
+                message: "dns lookup failed".into(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct HostFailTransport {
+        name: String,
+        code: String,
+        hits: Arc<AtomicU32>,
+    }
+
+    impl HostFailTransport {
+        fn new(name: &str, code: &str, hits: Arc<AtomicU32>) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                code: code.into(),
+                hits,
+            })
+        }
+    }
+
+    impl LlmTransport for HostFailTransport {
+        async fn request_stream(
+            &self,
+            _req: &ConversationRequest,
+        ) -> EngineResult<crate::llm::transport::ChunkStream> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Err(EngineError::HostUnavailable {
+                code: self.code.clone(),
+                scope: "provider".into(),
+                before_output: true,
+                message: self.code.clone(),
+            })
         }
 
         fn name(&self) -> &str {
@@ -2105,6 +2205,127 @@ mod tests {
             },
             when_exhausted: ExhaustionPolicy::ProbeEarliest,
         }
+    }
+
+    fn host_provider(id: &str, model: &str, caps: ProviderCapabilities) -> ProviderTarget {
+        let mut t = ProviderTarget::http(id, "host://llama-rn", "", model);
+        t.api_key.clear();
+        t.base_url = "host://llama-rn".into();
+        t.capabilities = caps;
+        t
+    }
+
+    fn caps_with(tools: Option<bool>, structured: Option<bool>) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_tools: tools,
+            supports_structured_output: structured,
+            ..Default::default()
+        }
+    }
+
+    fn local_member(id: &str, order: u32) -> PoolMember {
+        PoolMember {
+            provider_id: id.into(),
+            routing_group: "local".into(),
+            base_score: 5,
+            order,
+            enabled: true,
+            fallback_tier: 1,
+        }
+    }
+
+    fn two_host_client(
+        a_id: &str,
+        a_caps: ProviderCapabilities,
+        a: Arc<dyn LlmTransportObj>,
+        b_id: &str,
+        b_caps: ProviderCapabilities,
+        b: Arc<dyn LlmTransportObj>,
+    ) -> LlmClient {
+        let mut pools = BTreeMap::new();
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: vec![local_member(a_id, 0), local_member(b_id, 1)],
+                retry: RetryPolicy {
+                    failover_max_attempts: 1,
+                    max_retries: 1,
+                },
+                when_exhausted: ExhaustionPolicy::FailFast,
+            },
+        );
+        let routing = LlmRoutingConfig {
+            providers: vec![
+                host_provider(a_id, "m-a", a_caps),
+                host_provider(b_id, "m-b", b_caps),
+            ],
+            pools,
+            health: Default::default(),
+        };
+        let router = LlmRouter::in_memory(routing).unwrap();
+        LlmClient::from_router_with_transports(
+            router,
+            MAIN_POOL_ID,
+            HashMap::from([(a_id.into(), a), (b_id.into(), b)]),
+        )
+        .unwrap()
+    }
+
+    fn tool_req() -> ConversationRequest {
+        let mut r = req();
+        r.tools = Some(vec![ToolDefinitionWire {
+            kind: "function".into(),
+            function: FunctionDefinitionWire {
+                name: "echo".into(),
+                description: Some("echo".into()),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }]);
+        r
+    }
+
+    fn format_req(format: ResponseFormat) -> ConversationRequest {
+        let mut r = req();
+        r.response_format = Some(format);
+        r
+    }
+
+    fn json_schema_format() -> ResponseFormat {
+        ResponseFormat::JsonSchema {
+            name: "item".into(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: None,
+        }
+    }
+
+    fn http_members_client(
+        members: Vec<(&str, &str, Arc<dyn LlmTransportObj>)>,
+        retry: RetryPolicy,
+    ) -> LlmClient {
+        let mut pools = BTreeMap::new();
+        let mut providers = Vec::new();
+        let mut pool_members = Vec::new();
+        let mut transports = HashMap::new();
+        for (i, (id, url, transport)) in members.into_iter().enumerate() {
+            providers.push(target(id, url, "m"));
+            pool_members.push(member(id, i as u32));
+            transports.insert(id.to_string(), transport);
+        }
+        pools.insert(
+            MAIN_POOL_ID.into(),
+            ProviderPool {
+                members: pool_members,
+                retry,
+                when_exhausted: ExhaustionPolicy::ProbeEarliest,
+            },
+        );
+        let router = LlmRouter::in_memory(LlmRoutingConfig {
+            providers,
+            pools,
+            health: Default::default(),
+        })
+        .unwrap();
+        LlmClient::from_router_with_transports(router, MAIN_POOL_ID, transports).unwrap()
     }
 
     #[tokio::test]
@@ -3212,12 +3433,8 @@ mod tests {
     }
 
     fn mixed_routing() -> LlmRoutingConfig {
-        let mut cloud = ProviderTarget::http(
-            "cloud/a",
-            "https://api.example.com/v1",
-            "k",
-            "grok-4.6",
-        );
+        let mut cloud =
+            ProviderTarget::http("cloud/a", "https://api.example.com/v1", "k", "grok-4.6");
         cloud.connect_timeout_ms = Some(3_000);
         let mut local = ProviderTarget::http(
             "local/apus-model-0.8b",
@@ -3354,5 +3571,357 @@ mod tests {
         assert_eq!(turn.text, "local-ok");
         assert_eq!(turn.provider_id, "local/apus-model-0.8b");
         assert!(hits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn host_without_tools_is_skipped_when_request_has_tools() {
+        let skipped_hits = Arc::new(AtomicU32::new(0));
+        let ok_hits = Arc::new(AtomicU32::new(0));
+        let skipped = ScriptedTransport::failing("no-tools", 0, "", skipped_hits.clone());
+        let ok = ScriptedTransport::failing("ok", 0, "", ok_hits.clone());
+        let client = two_host_client(
+            "local/no-tools",
+            caps_with(Some(false), None),
+            skipped as Arc<dyn LlmTransportObj>,
+            "local/ok",
+            caps_with(None, None),
+            ok as Arc<dyn LlmTransportObj>,
+        );
+        let turn = client
+            .complete(&tool_req(), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(turn.provider_id, "local/ok");
+        assert_eq!(skipped_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(ok_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn host_without_structured_output_is_skipped_for_non_text_formats() {
+        for format in [ResponseFormat::JsonObject, json_schema_format()] {
+            let skipped_hits = Arc::new(AtomicU32::new(0));
+            let ok_hits = Arc::new(AtomicU32::new(0));
+            let skipped = ScriptedTransport::failing("no-schema", 0, "", skipped_hits.clone());
+            let ok = ScriptedTransport::failing("ok", 0, "", ok_hits.clone());
+            let client = two_host_client(
+                "local/no-schema",
+                caps_with(None, Some(false)),
+                skipped as Arc<dyn LlmTransportObj>,
+                "local/ok",
+                caps_with(None, None),
+                ok as Arc<dyn LlmTransportObj>,
+            );
+            let turn = client
+                .complete(&format_req(format.clone()), &RecordingObserver::new())
+                .await
+                .unwrap();
+            assert_eq!(turn.text, "ok", "format={format:?}");
+            assert_eq!(turn.provider_id, "local/ok", "format={format:?}");
+            assert_eq!(skipped_hits.load(Ordering::SeqCst), 0, "format={format:?}");
+            assert_eq!(ok_hits.load(Ordering::SeqCst), 1, "format={format:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_capability_fields_do_not_reject_tools_or_schema() {
+        let first_hits = Arc::new(AtomicU32::new(0));
+        let second_hits = Arc::new(AtomicU32::new(0));
+        let first = ScriptedTransport::failing("first", 0, "", first_hits.clone());
+        let second = ScriptedTransport::failing("second", 0, "", second_hits.clone());
+        let client = two_host_client(
+            "local/unspecified",
+            ProviderCapabilities::default(),
+            first as Arc<dyn LlmTransportObj>,
+            "local/backup",
+            ProviderCapabilities::default(),
+            second as Arc<dyn LlmTransportObj>,
+        );
+        let mut request = tool_req();
+        request.response_format = Some(json_schema_format());
+        let turn = client
+            .complete(&request, &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(turn.provider_id, "local/unspecified");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn text_response_format_is_allowed_when_structured_output_unsupported() {
+        let first_hits = Arc::new(AtomicU32::new(0));
+        let second_hits = Arc::new(AtomicU32::new(0));
+        let first = ScriptedTransport::failing("first", 0, "", first_hits.clone());
+        let second = ScriptedTransport::failing("second", 0, "", second_hits.clone());
+        let client = two_host_client(
+            "local/no-schema",
+            caps_with(None, Some(false)),
+            first as Arc<dyn LlmTransportObj>,
+            "local/ok",
+            caps_with(None, Some(true)),
+            second as Arc<dyn LlmTransportObj>,
+        );
+        let turn = client
+            .complete(&format_req(ResponseFormat::Text), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.provider_id, "local/no-schema");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_skips_remaining_retries_on_same_origin() {
+        let origin = crate::llm::router::http_origin_key("https://same.example/v1").unwrap();
+        let a_hits = Arc::new(AtomicU32::new(0));
+        let b_hits = Arc::new(AtomicU32::new(0));
+        let c_hits = Arc::new(AtomicU32::new(0));
+        let a = ConnectFailTransport::new("a", &origin, a_hits.clone());
+        let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
+        let c = ScriptedTransport::failing("c", 0, "", c_hits.clone());
+        let client = http_members_client(
+            vec![
+                (
+                    "p-a",
+                    "https://same.example/v1",
+                    a as Arc<dyn LlmTransportObj>,
+                ),
+                (
+                    "p-b",
+                    "https://same.example/v1",
+                    b as Arc<dyn LlmTransportObj>,
+                ),
+                (
+                    "p-c",
+                    "https://other.example/v1",
+                    c as Arc<dyn LlmTransportObj>,
+                ),
+            ],
+            RetryPolicy {
+                failover_max_attempts: 3,
+                max_retries: 5,
+            },
+        );
+        let turn = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(turn.provider_id, "p-c");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(c_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn http_5xx_does_not_origin_skip() {
+        tokio::time::pause();
+        let a_hits = Arc::new(AtomicU32::new(0));
+        let b_hits = Arc::new(AtomicU32::new(0));
+        let a = ScriptedTransport::failing("a", u32::MAX, "status=503 busy", a_hits.clone());
+        let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
+        let client = http_members_client(
+            vec![
+                (
+                    "p-a",
+                    "https://same.example/v1",
+                    a as Arc<dyn LlmTransportObj>,
+                ),
+                (
+                    "p-b",
+                    "https://same.example/v1",
+                    b as Arc<dyn LlmTransportObj>,
+                ),
+            ],
+            RetryPolicy {
+                failover_max_attempts: 3,
+                max_retries: 5,
+            },
+        );
+        let turn = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(turn.provider_id, "p-b");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn http_429_does_not_origin_skip() {
+        tokio::time::pause();
+        let a_hits = Arc::new(AtomicU32::new(0));
+        let b_hits = Arc::new(AtomicU32::new(0));
+        let a =
+            ScriptedTransport::failing("a", u32::MAX, "status=429 retry-after=1", a_hits.clone());
+        let b = ScriptedTransport::failing("b", 0, "", b_hits.clone());
+        let client = http_members_client(
+            vec![
+                (
+                    "p-a",
+                    "https://same.example/v1",
+                    a as Arc<dyn LlmTransportObj>,
+                ),
+                (
+                    "p-b",
+                    "https://same.example/v1",
+                    b as Arc<dyn LlmTransportObj>,
+                ),
+            ],
+            RetryPolicy {
+                failover_max_attempts: 3,
+                max_retries: 5,
+            },
+        );
+        let turn = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text, "ok");
+        assert_eq!(turn.provider_id, "p-b");
+        assert!(a_hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn published_cloud_output_does_not_failover_to_local() {
+        let cloud_hits = Arc::new(AtomicU32::new(0));
+        let local_hits = Arc::new(AtomicU32::new(0));
+        let cloud = Arc::new(AlwaysIdleAfterText {
+            name: "cloud".into(),
+            hits: cloud_hits.clone(),
+            text: "Hello ".into(),
+        });
+        let local = ScriptedTransport::failing("local", 0, "", local_hits.clone());
+        let mut routing = mixed_routing();
+        routing.providers[0].base_url = "https://cloud.example/v1".into();
+        let router = LlmRouter::in_memory(routing).unwrap();
+        let client = LlmClient::from_router_with_transports(
+            router,
+            MAIN_POOL_ID,
+            HashMap::from([
+                ("cloud/a".into(), cloud as Arc<dyn LlmTransportObj>),
+                (
+                    "local/apus-model-0.8b".into(),
+                    local as Arc<dyn LlmTransportObj>,
+                ),
+            ]),
+        )
+        .unwrap();
+        let observer = RecordingObserver::new();
+        let err = client.complete(&req(), &observer).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::StreamIdleTimeout(_)),
+            "got {err}"
+        );
+        assert!(cloud_hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(local_hits.load(Ordering::SeqCst), 0);
+        assert!(!observer
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })));
+    }
+
+    #[tokio::test]
+    async fn local_exhaustion_does_not_wrap_back_to_cooled_cloud() {
+        let cloud_hits = Arc::new(AtomicU32::new(0));
+        let local_hits = Arc::new(AtomicU32::new(0));
+        let cloud = ScriptedTransport::failing("cloud", 0, "", cloud_hits.clone());
+        let local =
+            HostFailTransport::new("local", "local_memory_insufficient", local_hits.clone());
+        let mut routing = mixed_routing();
+        routing.providers[0].base_url = "https://cloud.example/v1".into();
+        routing.pools.get_mut(MAIN_POOL_ID).unwrap().when_exhausted =
+            ExhaustionPolicy::ProbeEarliest;
+        let router = LlmRouter::in_memory(routing).unwrap();
+        router.record_trip("pre", "cloud/a", FailureClass::RetryableHttp, None);
+        let client = LlmClient::from_router_with_transports(
+            router,
+            MAIN_POOL_ID,
+            HashMap::from([
+                ("cloud/a".into(), cloud as Arc<dyn LlmTransportObj>),
+                (
+                    "local/apus-model-0.8b".into(),
+                    local as Arc<dyn LlmTransportObj>,
+                ),
+            ]),
+        )
+        .unwrap();
+        let err = client
+            .complete(&req(), &RecordingObserver::new())
+            .await
+            .unwrap_err();
+        match err {
+            EngineError::LocalFallbackUnavailable {
+                pool_id,
+                candidate_codes,
+                ..
+            } => {
+                assert_eq!(pool_id, MAIN_POOL_ID);
+                assert!(
+                    candidate_codes
+                        .iter()
+                        .any(|c| c == "local_memory_insufficient"),
+                    "{candidate_codes:?}"
+                );
+            }
+            other => panic!("expected LocalFallbackUnavailable, got {other}"),
+        }
+        assert_eq!(local_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cloud_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rewrite_request_for_returns_provider_scoped_unsupported() {
+        let client = two_host_client(
+            "local/no-tools",
+            caps_with(Some(false), Some(false)),
+            ScriptedTransport::failing("no-tools", 0, "", Arc::new(AtomicU32::new(0)))
+                as Arc<dyn LlmTransportObj>,
+            "local/ok",
+            ProviderCapabilities::default(),
+            ScriptedTransport::failing("ok", 0, "", Arc::new(AtomicU32::new(0)))
+                as Arc<dyn LlmTransportObj>,
+        );
+        let captured = client.capture_operation().unwrap();
+        let slot = captured.providers.get("local/no-tools").unwrap();
+        match client.rewrite_request_for(&tool_req(), slot, &captured.primary_compat_key) {
+            Err(EngineError::HostUnavailable {
+                code,
+                scope,
+                before_output,
+                ..
+            }) => {
+                assert_eq!(code, "local_request_unsupported");
+                assert_eq!(scope, "provider");
+                assert!(before_output);
+            }
+            other => panic!("expected HostUnavailable, got {other:?}"),
+        }
+        match client.rewrite_request_for(
+            &format_req(json_schema_format()),
+            slot,
+            &captured.primary_compat_key,
+        ) {
+            Err(EngineError::HostUnavailable { code, scope, .. }) => {
+                assert_eq!(code, "local_request_unsupported");
+                assert_eq!(scope, "provider");
+            }
+            other => panic!("expected HostUnavailable, got {other:?}"),
+        }
+        let empty_tools = {
+            let mut r = tool_req();
+            r.tools = Some(Vec::new());
+            r
+        };
+        client
+            .rewrite_request_for(&empty_tools, slot, &captured.primary_compat_key)
+            .expect("empty tools must not reject");
+        client
+            .rewrite_request_for(&req(), slot, &captured.primary_compat_key)
+            .expect("plain text must not reject");
     }
 }
